@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "target": "ES2020",
+    "lib": [
+      "ES2020",
+      "DOM"
+    ],
+    "types": [
+      "node"
+    ],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowSyntheticDefaultImports": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": [
+        "./src/*"
+      ]
+    },
+    "tsBuildInfoFile": "../../Build-Output/Windows Manager/types/tsconfig.node.json.tsbuildinfo",
+    "outDir": "../../Build-Output/Windows Manager/types"
+  },
+  "include": [
+    "vite.config.ts"
+  ]
+}

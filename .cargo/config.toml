@@ -1,0 +1,2 @@
+[build]
+target-dir = "../Build-Output/Windows Manager/cargo"
