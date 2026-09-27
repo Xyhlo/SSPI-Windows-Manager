@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +23,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <time.h>
 #include <ps5/kernel.h>
 #ifndef MNT_UPDATE
 #define MNT_UPDATE 0x00000010
@@ -32,7 +34,7 @@
 #define IOVEC_ENTRY(x) { (void *)(x), (x) ? strlen(x) + 1 : 0 }
 #define IOVEC_SIZE(x) (sizeof(x) / sizeof(struct iovec))
 
-#define VERSION "1.0.3"
+#define VERSION "1.0.5"
 #define DEFAULT_PORT 9114
 #define MAX_FRAME (8u * 1024u * 1024u)
 #define MAX_PATH_BYTES 2048
@@ -53,6 +55,8 @@
 #define CMD_SET_PORT 0x54
 #define CMD_VERIFY_FILE 0x55
 #define CMD_INSTALL_PREFLIGHT 0x56
+#define CMD_TITLE_CONTEXT 0x57
+#define CMD_PROGRESS_NOTIFICATION 0x58
 #define RESP_OK 0x01
 #define RESP_ERROR 0x02
 #define RESP_DATA 0x03
@@ -62,8 +66,17 @@
 #define O_NOFOLLOW 0
 #endif
 
-typedef struct { char ignored[45]; char message[3075]; } Notification;
+/* PS5 notification ABI: message +0x2d, icon URI +0x42d, total 0xc30. */
+typedef struct {
+    int32_t type, request_id, priority, message_id, target_id, user_id;
+    int32_t unknown1, unknown2, app_id, error_number, unknown3;
+    char use_icon_uri;
+    char message[1024], uri[1024], reserved[1024];
+} Notification;
+_Static_assert(sizeof(Notification) == 0xc30, "notification ABI size");
+_Static_assert(offsetof(Notification, uri) == 0x42d, "notification icon offset");
 extern int sceKernelSendNotificationRequest(int, Notification *, size_t, int);
+extern int sceNotificationSend(int user_id, bool is_logged, const char *payload);
 
 /* Layouts and entry points follow the public etaHEN DirectPKGInstaller ABI. */
 typedef char content_id_t[0x30];
@@ -111,11 +124,22 @@ static bool g_hold_system_authid;
 static int g_port = DEFAULT_PORT;
 static pthread_mutex_t g_notify_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_last_incoming[16];
+static char g_delivery_title[256];
+static char g_delivery_icon[1024];
 
 static uint64_t read_u64le(const uint8_t *p) { uint64_t v = 0; for (unsigned i = 0; i < 8; ++i) v |= (uint64_t)p[i] << (i * 8); return v; }
 static uint32_t read_u32le(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
 static void write_u32le(uint8_t *p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
-static void notify(const char *message) { Notification n; memset(&n, 0, sizeof(n)); strncpy(n.message, message, sizeof(n.message) - 1); sceKernelSendNotificationRequest(0, &n, sizeof(n), 0); }
+static void notify(const char *message) {
+    Notification n; memset(&n, 0, sizeof(n));
+    n.target_id = -1;
+    n.use_icon_uri = 1;
+    pthread_mutex_lock(&g_notify_lock);
+    snprintf(n.message, sizeof(n.message), "%s%s%s", message, g_delivery_title[0] ? "\n" : "", g_delivery_title);
+    snprintf(n.uri, sizeof(n.uri), "%s", g_delivery_icon[0] ? g_delivery_icon : "cxml://psnotification/tex_icon_system");
+    pthread_mutex_unlock(&g_notify_lock);
+    sceKernelSendNotificationRequest(0, &n, sizeof(n), 0);
+}
 static void trace_mark(const char *tag, const char *detail);
 static void trace_resources(const char *tag) {
     char detail[128];
@@ -608,12 +632,23 @@ static int handle_end(int fd, Lane *lane) {
     return text_reply(fd, RESP_OK, "OK");
 }
 
+static bool valid_package_fd(int fd, uint64_t size) {
+    uint8_t header[0x80];
+    if (size < sizeof(header) || pread(fd, header, sizeof(header), 0) != (ssize_t)sizeof(header)) return false;
+    if (!memcmp(header, "\x7f" "FIH", 4)) {
+        uint64_t image = read_u64le(header + 0x10), length = read_u64le(header + 0x18), cnt = read_u64le(header + 0x58);
+        if (image < 0x10000 || !length || image > size || length > size - image || cnt < image + length || cnt > size || size - cnt < sizeof(header)) return false;
+        if (pread(fd, header, sizeof(header), (off_t)cnt) != (ssize_t)sizeof(header)) return false;
+    }
+    return memcmp(header, "\x7f" "CNT", 4) == 0;
+}
+
 static int handle_verify(int fd, const char *path) {
     if (!allowed_path(path)) return text_reply(fd, RESP_ERROR, "path rejected");
     pthread_mutex_lock(&g_transfer_lock);
     Transfer *t = find_transfer(path); struct stat st; bool is_package_path = !strncmp(path, "/user/data/tmp/upload_", 22);
     if (!t || t->active_lanes != 0 || t->completed != t->total || fstat(t->fd, &st) || !S_ISREG(st.st_mode) || (uint64_t)st.st_size != t->total) { pthread_mutex_unlock(&g_transfer_lock); return text_reply(fd, RESP_ERROR, "file unavailable or transfer incomplete"); }
-    if (is_package_path) { uint8_t magic[4]; if (pread(t->fd, magic, sizeof(magic), 0) != 4 || magic[0] != 0x7f || magic[1] != 0x43 || magic[2] != 0x4e || magic[3] != 0x54) { pthread_mutex_unlock(&g_transfer_lock); return text_reply(fd, RESP_ERROR, "PKG magic failed"); } t->verified = true; }
+    if (is_package_path) { if (!valid_package_fd(t->fd, t->total)) { pthread_mutex_unlock(&g_transfer_lock); return text_reply(fd, RESP_ERROR, "PKG magic failed"); } t->verified = true; }
     if (!is_package_path && fsync(t->fd) != 0) {
         pthread_mutex_unlock(&g_transfer_lock);
         return text_reply(fd, RESP_ERROR, "dump fsync failed");
@@ -639,8 +674,8 @@ static int handle_install(int fd, const char *path) {
     if (ready_rc) return install_error_reply(fd, ready_rc, g_authid_rc ? "system AuthID preparation failed" : "AppInst initialization failed", path);
     pthread_mutex_lock(&g_transfer_lock);
     Transfer *verified = find_transfer(path);
-    struct stat st; uint8_t magic[4];
-    if (!verified || !verified->verified || verified->active_lanes || fstat(verified->fd, &st) || !S_ISREG(st.st_mode) || pread(verified->fd, magic, sizeof(magic), 0) != 4 || magic[0] != 0x7f || magic[1] != 0x43 || magic[2] != 0x4e || magic[3] != 0x54) {
+    struct stat st;
+    if (!verified || !verified->verified || verified->active_lanes || fstat(verified->fd, &st) || !S_ISREG(st.st_mode) || !valid_package_fd(verified->fd, (uint64_t)st.st_size)) {
         pthread_mutex_unlock(&g_transfer_lock);
         return install_error_reply(fd, -1, "PKG was not verified", path);
     }
@@ -649,7 +684,7 @@ static int handle_install(int fd, const char *path) {
     int auth_rc = prepare_appinst_authid(&saved_authid);
     if (auth_rc) { pthread_mutex_unlock(&g_install_lock); pthread_mutex_unlock(&g_transfer_lock); return install_error_reply(fd, auth_rc, "system AuthID preparation failed", path); }
     MetaInfo meta; memset(&meta, 0, sizeof(meta));
-    meta.uri = path; meta.ex_uri = ""; meta.playgo_scenario_id = ""; meta.content_id = ""; meta.content_name = "Simple PS5 Installer"; meta.icon_url = "";
+    meta.uri = path; meta.ex_uri = ""; meta.playgo_scenario_id = ""; meta.content_id = ""; meta.content_name = g_delivery_title[0] ? g_delivery_title : "SSPI"; meta.icon_url = g_delivery_icon;
     memset(&g_last_pkg, 0, sizeof(g_last_pkg)); memset(&g_last_playgo, 0, sizeof(g_last_playgo));
     g_install_success_notified = false; g_install_failure_notified = false;
     int rc = sceAppInstUtilInstallByPackage(&meta, &g_last_pkg, &g_last_playgo);
@@ -679,11 +714,12 @@ static int handle_status(int fd, const char *id) {
     int rc = sceAppInstUtilGetInstallStatus(content, &status);
     int install_error = status.error_info.error_code;
     bool failed = install_error != 0;
-    const char *state = failed ? "failed" : (!strcmp(status.status, "installed") || !strcmp(status.status, "complete") || !strcmp(status.status, "playable") ? "complete" : "installing");
     uint32_t progress = status.promote_progress;
     if (status.local_copy_percent > 0 && (uint32_t)status.local_copy_percent > progress) progress = (uint32_t)status.local_copy_percent;
     if (status.total_size && status.downloaded_size <= status.total_size) { uint32_t downloaded = (uint32_t)((status.downloaded_size * 100) / status.total_size); if (downloaded > progress) progress = downloaded; }
     if (progress > 100) progress = 100;
+    bool complete = !rc && (!strcmp(status.status, "installed") || !strcmp(status.status, "complete") || (!strcmp(status.status, "playable") && progress == 100));
+    const char *state = failed ? "failed" : (complete ? "complete" : "installing");
     int restore_rc = 0;
     if (failed || !strcmp(state, "complete")) {
         restore_rc = restore_appinst_authid(g_original_authid ? g_original_authid : saved_authid);
@@ -699,6 +735,80 @@ static int handle_status(int fd, const char *id) {
     if (send_success) notify("SSPI install complete");
     if (send_failure) notify("SSPI install failed");
     return text_reply(fd, response_code ? RESP_ERROR : RESP_DATA, reply_text);
+}
+
+static int handle_title_context(int fd, const uint8_t *body, uint32_t size) {
+    if (!body || size < 12) return text_reply(fd, RESP_ERROR, "invalid title context");
+    const char *id = (const char *)body;
+    const uint8_t *id_end = memchr(body, 0, size);
+    if (!id_end || (size_t)(id_end - body) != 9 || !is_tid(id)) return text_reply(fd, RESP_ERROR, "invalid title id");
+    const uint8_t *name = id_end + 1;
+    size_t remaining = size - (size_t)(name - body);
+    const uint8_t *name_end = memchr(name, 0, remaining);
+    if (!name_end || name_end == name || name_end - name >= 220) return text_reply(fd, RESP_ERROR, "invalid title name");
+    const uint8_t *icon = name_end + 1;
+    remaining = size - (size_t)(icon - body);
+    const uint8_t *icon_end = memchr(icon, 0, remaining);
+    if (!icon_end || icon_end != body + size - 1 || icon_end - icon >= 1000) return text_reply(fd, RESP_ERROR, "invalid icon URI");
+    if (*icon && strncmp((const char *)icon, "https://", 8) && strncmp((const char *)icon, "http://", 7)) return text_reply(fd, RESP_ERROR, "icon URI must be HTTP(S)");
+    pthread_mutex_lock(&g_install_lock);
+    if (g_hold_system_authid) { pthread_mutex_unlock(&g_install_lock); return text_reply(fd, RESP_ERROR, "installation is active"); }
+    pthread_mutex_lock(&g_notify_lock);
+    snprintf(g_delivery_title, sizeof(g_delivery_title), "%s [%s]", (const char *)name, id);
+    snprintf(g_delivery_icon, sizeof(g_delivery_icon), "%s", (const char *)icon);
+    g_last_incoming[0] = 0;
+    pthread_mutex_unlock(&g_notify_lock);
+    pthread_mutex_unlock(&g_install_lock);
+    return text_reply(fd, RESP_OK, "OK");
+}
+
+/* Native notification JSON follows the public payload SDK notification ABI.
+ * Progress is never logged in Notification Center; only completion is retained. */
+static int handle_progress_notification(int fd, const uint8_t *body, uint32_t size) {
+    if (!body || size < 18 || body[0] > 1 || body[10] != 0 || !is_tid((const char *)body + 1))
+        return text_reply(fd, RESP_ERROR, "invalid notification identity");
+    uint32_t image_size = read_u32le(body + 11);
+    if (image_size > 512u * 1024u || image_size > size - 17)
+        return text_reply(fd, RESP_ERROR, "invalid notification artwork size");
+    const uint8_t *image = body + 15;
+    const char *json = (const char *)(image + image_size);
+    size_t json_size = size - 15 - image_size;
+    if (json_size > 16384 || json[0] != '{' || json[json_size - 1] != 0 || memchr(json, 0, json_size - 1))
+        return text_reply(fd, RESP_ERROR, "invalid notification payload");
+    if (image_size) {
+        bool png = image_size >= 8 && !memcmp(image, "\x89PNG\r\n\x1a\n", 8);
+        bool jpeg = image_size >= 3 && image[0] == 0xff && image[1] == 0xd8 && image[2] == 0xff;
+        if (!png && !jpeg) return text_reply(fd, RESP_ERROR, "unsupported notification artwork");
+        mkdir("/data/SSPI/artwork", 0775);
+        char path[96], temporary[104];
+        snprintf(path, sizeof(path), "/data/SSPI/artwork/%.9s.png", (const char *)body + 1);
+        snprintf(temporary, sizeof(temporary), "%s.next", path);
+        pthread_mutex_lock(&g_notify_lock);
+        int output = open(temporary, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0664);
+        size_t written = 0;
+        if (output >= 0) {
+            while (written < image_size) {
+                ssize_t count = write(output, image + written, image_size - written);
+                if (count < 0 && errno == EINTR) continue;
+                if (count <= 0) break;
+                written += (size_t)count;
+            }
+            close(output);
+        }
+        int saved = written == image_size ? rename(temporary, path) : -1;
+        if (saved) unlink(temporary);
+        pthread_mutex_unlock(&g_notify_lock);
+        if (saved) return text_reply(fd, RESP_ERROR, "could not cache notification artwork");
+    }
+    time_t now = time(NULL);
+    struct tm utc;
+    char timestamp[40], dated_payload[16500];
+    if (!gmtime_r(&now, &utc) || !strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S.000Z", &utc))
+        return text_reply(fd, RESP_ERROR, "notification timestamp unavailable");
+    snprintf(dated_payload, sizeof(dated_payload), "{\"createdDateTime\":\"%s\",%s", timestamp, json + 1);
+    int rc = sceNotificationSend(0xfe, body[0] == 1, dated_payload);
+    if (rc) { char error[80]; snprintf(error, sizeof(error), "notification API returned %d", rc); return text_reply(fd, RESP_ERROR, error); }
+    return text_reply(fd, RESP_OK, "OK");
 }
 
 static void *client_thread(void *argument) {
@@ -726,11 +836,13 @@ static void *client_thread(void *argument) {
             case CMD_START_UPLOAD: result = handle_start(fd, body, size, &lane); break;
             case CMD_END_UPLOAD: result = size ? text_reply(fd, RESP_ERROR, "END must be empty") : handle_end(fd, &lane); break;
             case CMD_VERIFY_FILE: result = handle_verify(fd, (char *)body); break;
+            case CMD_TITLE_CONTEXT: result = handle_title_context(fd, body, size); break;
+            case CMD_PROGRESS_NOTIFICATION: result = handle_progress_notification(fd, body, size); break;
             case CMD_INSTALL_PREFLIGHT: result = handle_preflight(fd); break;
             case CMD_INSTALL_PKG: result = handle_install(fd, (char *)body); break;
             case CMD_INSTALL_STATUS: result = handle_status(fd, (char *)body); break;
             case CMD_MOUNT_GAME: result = handle_mount_game(fd, (char *)body); break;
-            case CMD_GET_CONFIG: { const char *appinst = "untried", *authid = "untried"; char appinst_error[32], authid_error[32]; pthread_mutex_lock(&g_install_lock); if (g_appinst_init_attempted) { if (g_appinst_init_rc) { snprintf(appinst_error, sizeof(appinst_error), "unavailable:%d", g_appinst_init_rc); appinst = appinst_error; } else appinst = "ready"; } if (g_authid_attempted) { if (g_authid_rc) { snprintf(authid_error, sizeof(authid_error), "unavailable:%d", g_authid_rc); authid = authid_error; } else authid = "system-install"; } pthread_mutex_unlock(&g_install_lock); char config[260]; snprintf(config, sizeof(config), "{\"port\":%d,\"version\":\"%s\",\"authid\":\"%s\",\"appinst\":\"%s\",\"capabilities\":[\"pkg-preflight\",\"pkg-install\",\"parallel-upload\",\"verify\",\"extracted-upload\",\"dump-mount\"]}", g_port, VERSION, authid, appinst); result = text_reply(fd, RESP_DATA, config); break; }
+            case CMD_GET_CONFIG: { const char *appinst = "untried", *authid = "untried"; char appinst_error[32], authid_error[32]; pthread_mutex_lock(&g_install_lock); if (g_appinst_init_attempted) { if (g_appinst_init_rc) { snprintf(appinst_error, sizeof(appinst_error), "unavailable:%d", g_appinst_init_rc); appinst = appinst_error; } else appinst = "ready"; } if (g_authid_attempted) { if (g_authid_rc) { snprintf(authid_error, sizeof(authid_error), "unavailable:%d", g_authid_rc); authid = authid_error; } else authid = "system-install"; } pthread_mutex_unlock(&g_install_lock); char config[384]; snprintf(config, sizeof(config), "{\"port\":%d,\"version\":\"%s\",\"authid\":\"%s\",\"appinst\":\"%s\",\"capabilities\":[\"pkg-preflight\",\"pkg-install\",\"parallel-upload\",\"verify\",\"extracted-upload\",\"dump-mount\",\"fih-install\",\"title-context\",\"progress-notifications\"]}", g_port, VERSION, authid, appinst); result = text_reply(fd, RESP_DATA, config); break; }
             case CMD_SET_PORT: { char *end = NULL; long port = body ? strtol((char *)body, &end, 10) : 0; result = end && *end == 0 && port >= 1024 && port <= 65535 && config_save((int)port) == 0 ? text_reply(fd, RESP_OK, "OK restart required") : text_reply(fd, RESP_ERROR, "invalid port or config write failed"); break; }
             default: result = text_reply(fd, RESP_ERROR, "unsupported command"); break;
         }

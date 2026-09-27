@@ -1,19 +1,23 @@
 import type { DeliveryJob } from "../types"
 
-const terminal = new Set(["complete", "failed", "cancelled", "monitoring-ended"])
+const terminal = new Set(["complete", "delivered", "failed", "cancelled", "monitoring-ended"])
 export const activeTransfer = (job: DeliveryJob) => !terminal.has(job.stage)
-export const transferPhases = ["Download", "Extract", "Upload", "Install"] as const
+export const transferPhases = ["Download", "Extract", "Package", "Upload", "Install"] as const
 
 export function phaseOf(stage: string) {
   if (["unlocking", "downloading"].includes(stage)) return 0
   if (stage === "extracting") return 1
-  if (stage === "uploading") return 2
-  if (["submitting", "installing", "mounting", "monitoring-ended"].includes(stage)) return 3
+  if (stage === "packaging") return 2
+  if (stage === "uploading") return 3
+  if (["submitting", "installing", "mounting", "handoff", "monitoring-ended"].includes(stage)) return 4
   return -1
 }
 
 export function kindOf(job: DeliveryJob) {
+  if (job.components?.some(c => c.kind === "base") && job.components.some(c => c.kind === "backport")) return "combined"
+  if (job.packageKind === "base" && /\+\s*backport\b/i.test(job.packageLabel || "")) return "combined"
   const explicit = job.packageKind?.toLowerCase()
+  if (["update", "patch"].includes(explicit || "") && /\bback[ -]?port(?:ed)?\b/i.test(job.packageLabel || "")) return "backport"
   if (explicit) return explicit === "patch" ? "update" : explicit
   const label = job.packageLabel || job.message
   if (/\bbackport\b/i.test(label)) return "backport"
@@ -27,15 +31,36 @@ export function titleIdOf(job: DeliveryJob) {
   return `${job.titleId || ""} ${job.packageLabel || ""} ${job.title || ""} ${job.message}`.match(/\b(?:CUSA|PPSA)\d{5}\b/i)?.[0].toUpperCase()
 }
 
-export const kindLabel = (kind: string) => ({base: "Base package", update: "Game update", dlc: "DLC", backport: "Backport", batch: "Manual batch"}[kind] || "Package")
+export const kindLabel = (kind: string) => ({base: "Base package", combined: "Base + backport", update: "Game update", dlc: "DLC", backport: "Backport", batch: "Manual batch"}[kind] || "Package")
+
+export function jobControls(job: Pick<DeliveryJob, "stage" | "retryable">) {
+  const terminal = ["complete", "delivered", "failed", "cancelled", "monitoring-ended"].includes(job.stage)
+  const consoleOwned = ["submitting", "installing", "mounting", "handoff"].includes(job.stage)
+  return {
+    retry: !!job.retryable && ["failed", "cancelled", "monitoring-ended"].includes(job.stage),
+    pause: !terminal && !consoleOwned,
+    cancel: !terminal && !consoleOwned,
+    remove: terminal,
+  }
+}
 
 export function stageLabel(job: DeliveryJob) {
   if (job.paused) return "Paused"
-  return ({queued: "Queued", unlocking: "Preparing link", downloading: "Downloading", extracting: "Extracting", uploading: "Uploading", submitting: "Submitting to console", installing: "Installing", mounting: "Mounting", complete: "Complete", failed: "Needs attention", cancelled: "Cancelled", "monitoring-ended": "Check console"}[job.stage] || job.stage)
+  if (job.target === "ps4") {
+    return ({
+      uploading: "Sending to PS4",
+      installing: "Installing on PS4",
+      complete: "Installed",
+      handoff: "Waiting for PS4",
+      delivered: "Delivered to PS4",
+      "monitoring-ended": "Check PS4",
+    }[job.stage] || ({queued: "Queued", unlocking: "Preparing link", downloading: "Downloading", extracting: "Extracting", packaging: "Packaging FPKG", submitting: "Submitting to console", mounting: "Mounting", failed: "Needs attention", cancelled: "Cancelled"}[job.stage] || job.stage))
+  }
+  return ({queued: "Queued", unlocking: "Preparing link", downloading: "Downloading", extracting: "Extracting", packaging: "Packaging FPKG", uploading: "Uploading", submitting: "Submitting to console", installing: "Installing", mounting: "Mounting", complete: "Complete", handoff: "Waiting for console", delivered: "Delivered", failed: "Needs attention", cancelled: "Cancelled", "monitoring-ended": "Check console"}[job.stage] || job.stage)
 }
 
 export function transferPercent(job: DeliveryJob) {
-  if (job.stage === "complete") return 100
+  if (["complete", "delivered"].includes(job.stage)) return 100
   const progress = Number.isFinite(job.progress) ? Math.max(0, job.progress) * 100 : 0
   const bytes = job.bytesTotal && job.bytesTotal > 0 ? Math.max(0, job.bytesDone || 0) / job.bytesTotal * 100 : null
   return Math.round(Math.max(0, Math.min(99, bytes == null ? progress : progress > 0 ? Math.min(bytes, progress) : bytes)))
@@ -58,19 +83,21 @@ export function groupDownloads(jobs: DeliveryJob[]): DownloadGroup[] {
       key, titleId: titleIdOf(primary), title: identity.title || titleIdOf(primary) || "Local package",
       icon: rows.find(j => j.icon)?.icon, primary,
       jobs: [...rows].sort((a, b) => (order[kindOf(a)] ?? 4) - (order[kindOf(b)] ?? 4) || (a.createdAt || 0) - (b.createdAt || 0) || a.jobId.localeCompare(b.jobId)),
-      kinds: [...new Set(rows.map(kindOf))], createdAt: Math.max(...rows.map(j => j.createdAt || 0)),
+      kinds: [...new Set(rows.flatMap(j => kindOf(j) === "combined" ? ["base", "backport"] : [kindOf(j)]))], createdAt: Math.max(...rows.map(j => j.createdAt || 0)),
     }
   }).sort((a, b) => b.createdAt - a.createdAt || a.key.localeCompare(b.key))
 }
 
 export function phaseState(job: DeliveryJob, index: number): "done" | "current" | "failed" | "skipped" | "pending" {
+  if (job.localPkg && job.target === "ps4" && job.stage === "complete" && index === 4) return "done"
   const seen: number[] = (job.stageHistory || []).map(phaseOf).filter(i => i >= 0)
   const current = phaseOf(job.stage)
   const last = current >= 0 ? current : seen[seen.length - 1] ?? -1
+  const succeeded = ["complete", "delivered"].includes(job.stage)
   if (["failed", "cancelled"].includes(job.stage) && last === index) return "failed"
-  if (job.stage !== "complete" && last === index) return "current"
-  if (seen.includes(index) && (job.stage === "complete" || last > index)) return "done"
-  if (job.stage === "complete" || last > index) return "skipped"
+  if (!succeeded && last === index) return "current"
+  if (seen.includes(index) && (succeeded || last > index)) return "done"
+  if (succeeded || last > index) return "skipped"
   return "pending"
 }
 
@@ -78,6 +105,26 @@ export function transferSize(bytes: number) {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B"
   const unit = Math.min(3, Math.floor(Math.log(bytes) / Math.log(1024)))
   return `${(bytes / 1024 ** unit).toFixed(unit > 0 ? 1 : 0)} ${["B", "KB", "MB", "GB"][unit]}`
+}
+
+export function transferStats(job: DeliveryJob, upload?: UploadState | null) {
+  const detail = phaseDetail(job)
+  const tracked = job.stage === "uploading" ? upload : null
+  const done = tracked ? tracked.bytesDone : job.bytesDone || 0
+  const total = tracked ? tracked.bytesTotal : job.bytesTotal
+  const transferred = !!total && done >= total
+  let label = total ? `${transferSize(done)} / ${transferSize(total)}`
+    : job.stage === "extracting" ? detail.doneBytes != null ? `${transferSize(detail.doneBytes)} so far · ${detail.label}` : detail.label
+    : stageLabel(job)
+  if (job.stage === "extracting" && detail.phase === "finalization") label = detail.label
+  if (job.target === "ps4" && job.stage === "installing") label = transferred ? "Transfer complete · installing on PS4" : "Installing on PS4"
+  if (job.target === "ps4" && job.stage === "monitoring-ended") label = transferred ? "Transfer complete · installation unconfirmed" : "Installation confirmation unavailable"
+  const byteWork = !job.paused && activeTransfer(job) && !transferred &&
+    (job.stage === "downloading" || job.stage === "uploading" || (job.stage === "extracting" && detail.phase === "extraction"))
+  const rate = tracked ? tracked.speedBps : job.speedBps
+  const speedBps = byteWork && Number.isFinite(rate) && (rate > 0 || (job.stage === "extracting" && done > 0)) ? Math.max(0, rate) : null
+  const eta = tracked && rate > 0 ? Math.ceil((tracked.bytesTotal - tracked.bytesDone) / rate) : tracked ? null : job.etaSeconds
+  return { label, speedBps, etaSeconds: byteWork && eta != null && Number.isFinite(eta) && eta > 0 ? eta : null }
 }
 
 // ---------------------------------------------------------------------------
@@ -174,13 +221,14 @@ export function retainJobPaths(prev: JobPaths | undefined, next: JobPaths): JobP
   }
 }
 
-export type WorkPhase = "inspection" | "extraction" | "finalization" | "cleanup" | "staging" | "upload" | "unknown"
+export type WorkPhase = "inspection" | "extraction" | "finalization" | "packaging" | "cleanup" | "staging" | "upload" | "unknown"
 
 type JobSnapshot = Pick<DeliveryJob, "stage" | "progress" | "bytesDone" | "bytesTotal" | "message" | "packageLabel"> & { stageHistory?: string[] }
 
 /** Recovers the failing phase from a tagged backend error ("extraction/inspection: …", "cleanup: …"); "unknown" for untagged errors rather than guessing. */
 export function errorWorkPhase(message: string): WorkPhase {
   const text = message || ""
+  if (/^packaging(?:[/:]|\b)/i.test(text)) return "packaging"
   const tagged = /^extraction\/(inspection|extraction|finalization)/i.exec(text)?.[1].toLowerCase()
   if (tagged === "inspection" || tagged === "extraction" || tagged === "finalization") return tagged
   if (/^cleanup:/i.test(text)) return "cleanup"
@@ -199,6 +247,7 @@ const retryHintFor = (phase: WorkPhase): string => {
   if (phase === "inspection" || phase === "extraction" || phase === "finalization") return "Archive kept for retry."
   if (phase === "cleanup") return "Extracted outputs kept — retry cleanup."
   if (phase === "staging") return "Inputs kept — retry download."
+  if (phase === "packaging") return "Extracted dump kept — retry packaging."
   if (phase === "upload") return "Extracted outputs kept — retry upload."
   return ""
 }
@@ -212,6 +261,7 @@ export function errorContext(job: JobSnapshot): ErrorContext | null {
   if (phase === "unknown") {
     if (["unlocking", "downloading", "queued"].includes(origin)) phase = "staging"
     else if (origin === "extracting") phase = "extraction"
+    else if (origin === "packaging") phase = "packaging"
     else if (["uploading", "submitting", "installing", "mounting"].includes(origin)) phase = "upload"
   }
   return {
@@ -229,9 +279,9 @@ const MB = 1024 ** 2
 
 /** Measured extraction bytes from backend messages ("Extracting 1.23 / 4.56 GB · 78.9 MB/s"); null when the message carries no measurement. Unknown totals stay null (indeterminate), never invented. */
 export function parseExtractionProgress(message: string): ByteProgress | null {
-  const match = /extracting\s+([\d.]+)\s*(GB|MB)?\s*(?:\/\s*([\d.]+)\s*(GB|MB))?/i.exec(message || "")
+  const match = /extracting\s+(?:(?:base game|backport)\s*:\s*)?([\d.]+)\s*(Gi?B|Mi?B)?\s*(?:\/\s*([\d.]+)\s*(Gi?B|Mi?B))?/i.exec(message || "")
   if (!match || (!match[2] && !match[4])) return null
-  const scale = (unit: string) => (unit.toUpperCase() === "GB" ? GB : MB)
+  const scale = (unit: string) => (unit.toUpperCase().startsWith("G") ? GB : MB)
   const doneBytes = Math.round(parseFloat(match[1]) * scale(match[2] || match[4]))
   if (!Number.isFinite(doneBytes)) return null
   if (!match[3]) return { doneBytes, totalBytes: null }
@@ -245,22 +295,34 @@ export type PhaseDetail =
 /** Explicit pipeline phase for a job snapshot: inspection → extraction → finalization → cleanup/staging/upload. Unknown totals report counts + indeterminate progress. */
 export function phaseDetail(job: JobSnapshot): PhaseDetail {
   if (job.stage === "extracting") {
+    if (/^waiting for another extraction/i.test(job.message || "")) {
+      return { phase: "extraction", label: "Waiting for another extraction on this drive", indeterminate: false }
+    }
     const extracted = /extracted\s+(\d+)\s+pkgs?/i.exec(job.message || "")
     if (extracted) {
       const files = Number(extracted[1])
       return { phase: "finalization", label: "Validating outputs", indeterminate: false, filesDone: files, filesTotal: files }
     }
-    const measured = parseExtractionProgress(job.message || "")
+    const measured = (job.bytesTotal || 0) > 0 || (job.bytesDone || 0) > 0
+      ? { doneBytes: job.bytesDone || 0, totalBytes: job.bytesTotal || null }
+      : parseExtractionProgress(job.message || "")
+    const label = /extracting base game/i.test(job.message || "") ? "Extracting base game" : /extracting backport/i.test(job.message || "") ? "Extracting backport" : "Extracting"
+    if (measured && measured.totalBytes && measured.doneBytes >= measured.totalBytes) {
+      return { phase: "finalization", label: "Finishing extraction", indeterminate: true, doneBytes: measured.doneBytes, totalBytes: measured.totalBytes }
+    }
     if (measured && measured.totalBytes) {
-      return { phase: "extraction", label: "Extracting", indeterminate: false, doneBytes: measured.doneBytes, totalBytes: measured.totalBytes }
+      return { phase: "extraction", label, indeterminate: false, doneBytes: measured.doneBytes, totalBytes: measured.totalBytes }
     }
     if (measured) {
-      return { phase: "extraction", label: "Extracting", indeterminate: true, doneBytes: measured.doneBytes, totalBytes: null }
+      return { phase: "extraction", label, indeterminate: true, doneBytes: measured.doneBytes, totalBytes: null }
     }
     if (/cleanup:/i.test(job.message || "")) {
       return { phase: "cleanup", label: "Retrying cleanup", indeterminate: true }
     }
     return { phase: "inspection", label: "Inspecting archive", indeterminate: true }
+  }
+  if (job.stage === "packaging") {
+    return { phase: "packaging", label: "Packaging FPKG", indeterminate: !(job.progress > 0) }
   }
   if (job.stage === "uploading") {
     if (/retrying/i.test(job.message || "")) return { phase: "upload", label: "Retrying upload", indeterminate: !(job.bytesTotal || 0) }
@@ -404,7 +466,7 @@ export class UploadTracker {
 
 /** Display percent: tracker-backed while sending (bounded, 100 only when complete), legacy otherwise. */
 export function honestPercent(job: DeliveryJob, tracker?: UploadState | null): number {
-  if (job.stage === "complete") return 100
+  if (["complete", "delivered"].includes(job.stage)) return 100
   if (tracker && job.bytesTotal && job.bytesTotal > 0) return Math.round(tracker.fraction * 100)
   return transferPercent(job)
 }

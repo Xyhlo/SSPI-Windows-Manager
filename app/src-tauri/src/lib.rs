@@ -1,5 +1,24 @@
+mod rar_control;
+use job_store::resume_checkpoint;
+mod job_store;
+mod receiver_notifications;
+mod storage;
 mod package_sources;
 mod archives;
+mod fpkg;
+mod fpkg_doctor;
+mod ampr_index;
+mod backport;
+mod debrid;
+mod package_details;
+mod static_catalog;
+mod ps4_protocol;
+mod ps4_inbox;
+mod ps4_receiver;
+mod pkg_meta;
+mod pkg_server;
+#[cfg(test)]
+mod ps4_fake_ftp;
 use archives::safe_extraction_path;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -31,10 +50,43 @@ use url::Url;
 use uuid::Uuid;
 
 const CONFIG_NAME: &str = "settings.json";
-const RECEIVER_VERSION: &str = "1.0.3";
+const RECEIVER_VERSION: &str = "1.0.5";
+const PS4_RECEIVER_VERSION: &str = "1.0.3";
+
+#[derive(Debug, Clone)]
+struct ReceiverEndpoint {
+    console: &'static str,
+    host: String,
+    port: u16,
+    expected_version: &'static str,
+    pkg_dir: &'static str,
+    dump_prefix: Option<&'static str>,
+    required_capabilities: &'static [&'static str],
+}
+impl ReceiverEndpoint {
+    fn redact(&self, error: impl ToString) -> String {
+        redact_delivery_error(error, if self.console == "PS4" { "ps4" } else { "ps5" })
+    }
+    fn ps5(s: &Settings) -> Self {
+        Self { console: "PS5", host: s.ps5_host.clone(), port: s.ps5_port, expected_version: RECEIVER_VERSION,
+            pkg_dir: "/user/data/tmp", dump_prefix: Some("/data/homebrew"), required_capabilities: &[] }
+    }
+    fn ps4(s: &Settings) -> Self {
+        Self { console: "PS4", host: s.ps4_host.clone(), port: s.ps4_receiver_port, expected_version: PS4_RECEIVER_VERSION,
+            pkg_dir: "/user/data/sspi-receiver/upload", dump_prefix: None,
+            required_capabilities: &["pkg-preflight", "pkg-install", "url-install", "parallel-upload", "verify", "title-context", "progress-notifications", "install-control", "stop", "ps4", "installed-library-v1"] }
+    }
+    fn path_body(&self, path: &str) -> Vec<u8> {
+        let mut body = path.as_bytes().to_vec();
+        if self.console == "PS4" { body.push(0); }
+        body
+    }
+}
+
 // The receiver owns one AppInst status slot; serialize console deliveries, while
 // downloads/extraction and the lanes within each delivery remain concurrent.
 static CONSOLE_DELIVERY: AsyncMutex<()> = AsyncMutex::const_new(());
+static PACKAGING_WORK: AsyncMutex<()> = AsyncMutex::const_new(());
 
 async fn console_delivery_slot(cancel: &watch::Receiver<bool>) -> Result<tokio::sync::MutexGuard<'static, ()>, String> {
     if *cancel.borrow() { return Err("cancelled".into()); }
@@ -54,50 +106,122 @@ fn retryable_upload_error(error: &str) -> bool {
      "connection aborted", "still closing", "capacity busy", "timed out",
      "os error 10053", "os error 10054", "os error 10060"].iter().any(|part| error.contains(part))
 }
-const PACKAGES_CACHE: &str = "packages-v3";
+const PACKAGES_CACHE: &str = "packages-v5";
 const SECRET_SERVICE: &str = "SimplePs5Installer.GameSearch";
 const CHUNK: usize = 8 * 1024 * 1024;
 const MAX_COVER_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_COVER_CACHE: u64 = 500 * 1024 * 1024;
 const RECEIVER_ELF: &[u8] = include_bytes!("../../../../Build-Output/Windows Manager/sspi_receiver.elf");
+const PS4_RECEIVER_ELF: &[u8] = include_bytes!("../../../../Build-Output/Windows Manager/sspi_ps4_receiver.elf");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Settings {
     ps5_host: String,
     ps5_port: u16,
+    #[serde(default = "default_console")] active_console: String,
+    #[serde(default)] ps4_host: String,
+    #[serde(default = "default_ps4_transport")] ps4_transport: String,
+    #[serde(default = "default_receiver_port")] ps4_receiver_port: u16,
+    #[serde(default = "default_ps4_loader_port")] ps4_loader_port: u16,
+    #[serde(default = "default_ps4_serve_port")] ps4_serve_port: u16,
+    #[serde(default = "default_ps4_port")] ps4_ftp_port: u16,
+    #[serde(default)] ps4_ftp_user: String,
+    #[serde(default)] ps4_ftp_password_configured: bool,
+    #[serde(default = "default_ps4_archive_mode")] ps4_archive_mode: String,
+    #[serde(default = "default_keep_packages")] ps4_remove_after_install: bool,
     resolver_base_url: String,
     download_dir: String,
     onboarding_complete: bool,
     real_debrid_enabled: bool,
     real_debrid_configured: bool,
+    #[serde(default)] torbox_enabled: bool,
+    #[serde(default)] torbox_configured: bool,
+    #[serde(default)] alldebrid_enabled: bool,
+    #[serde(default)] alldebrid_configured: bool,
     theme: String,
     reduce_motion: bool,
     #[serde(default = "default_transfer_mode")]
     transfer_mode: String,
     #[serde(default = "default_upload_lanes")]
     upload_lanes: u32,
+    /// Package extracted game dumps into a single FPKG before delivery.
+    #[serde(default)]
+    package_dumps: bool,
+    #[serde(default)] download_package_only: bool,
+    #[serde(default)] keep_archives: bool,
+    #[serde(default)] keep_extractions: bool,
+    #[serde(default = "default_keep_packages")] keep_packages: bool,
+    /// Speed/size preset: fast | standard | smallest.
+    #[serde(default = "default_fpkg_preset")]
+    fpkg_preset: String,
+    #[serde(default)]
+    fpkg_compression_level: Option<u8>,
+    #[serde(default)]
+    fpkg_doctor: bool,
+    /// PFS filesystem version: 2 is safe everywhere, 3 needs FW >= 7.00.
+    #[serde(default = "default_pfs_version")]
+    fpkg_pfs_version: u8,
+    /// Optional explicit path to the packaging engine executable.
+    #[serde(default)]
+    fpkg_engine_path: String,
+    /// Target console firmware, used to gate PFS v3 and report readiness.
+    #[serde(default)]
+    target_fw: String,
+    /// Legacy preference; downloaded dumps are now removed only after confirmed installation.
+    #[serde(default)]
+    fpkg_cleanup_source: bool,
 }
+fn default_keep_packages() -> bool { true }
+fn default_console() -> String { "ps5".into() }
+fn default_ps4_transport() -> String { "receiver".into() }
+fn default_receiver_port() -> u16 { 9114 }
+fn default_ps4_loader_port() -> u16 { 9090 }
+fn default_ps4_serve_port() -> u16 { 9115 }
+fn default_ps4_port() -> u16 { 2121 }
+fn default_ps4_archive_mode() -> String { "pc".into() }
 fn default_transfer_mode() -> String {
     "balanced".into()
 }
 fn default_upload_lanes() -> u32 {
     4
 }
+fn default_fpkg_preset() -> String {
+    "fast".into()
+}
+fn default_pfs_version() -> u8 {
+    2
+}
 impl Default for Settings {
     fn default() -> Self {
         Self {
             ps5_host: String::new(),
             ps5_port: 9114,
+            active_console: default_console(), ps4_host: String::new(), ps4_ftp_port: default_ps4_port(),
+            ps4_transport: default_ps4_transport(), ps4_receiver_port: default_receiver_port(),
+            ps4_loader_port: default_ps4_loader_port(), ps4_serve_port: default_ps4_serve_port(),
+            ps4_ftp_user: String::new(), ps4_ftp_password_configured: false,
+            ps4_archive_mode: default_ps4_archive_mode(), ps4_remove_after_install: true,
             resolver_base_url: String::new(),
             download_dir: dirs(),
             onboarding_complete: false,
             real_debrid_enabled: false,
             real_debrid_configured: false,
+            torbox_enabled: false, torbox_configured: false,
+            alldebrid_enabled: false, alldebrid_configured: false,
             theme: "dark".into(),
             reduce_motion: false,
             transfer_mode: default_transfer_mode(),
             upload_lanes: default_upload_lanes(),
+            package_dumps: false,
+            download_package_only: false, keep_archives: false, keep_extractions: false, keep_packages: true,
+            fpkg_preset: default_fpkg_preset(),
+            fpkg_compression_level: None,
+            fpkg_doctor: false,
+            fpkg_pfs_version: default_pfs_version(),
+            fpkg_engine_path: String::new(),
+            target_fw: String::new(),
+            fpkg_cleanup_source: false,
         }
     }
 }
@@ -111,13 +235,45 @@ struct AppState {
     settings: Arc<Mutex<Settings>>,
     cancel: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
     jobs: Arc<Mutex<HashMap<String, Progress>>>,
+    retry: Arc<Mutex<job_store::Store>>,
     http: Client,
     // B3: per-title serialization for concurrent resolves; waiters re-check fresh cache.
     resolving: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
+struct PackagingInfo {
+    preset: String,
+    #[serde(default)]
+    compression_level: u8,
+    #[serde(default)]
+    doctor: Option<fpkg_doctor::DoctorReport>,
+    #[serde(default)]
+    doctor_applied: bool,
+    pfs_version: u8,
+    threads: u16,
+    input_bytes: u64,
+    file_count: u64,
+    output_bytes: u64,
+    output_path: String,
+    elapsed_seconds: f64,
+    log: Vec<String>,
+    #[serde(default)] activity: String,
+    #[serde(default)] phase_progress: Option<f64>,
+    #[serde(default)] compression_input_bytes: Option<u64>,
+    #[serde(default)] compression_output_bytes: Option<u64>,
+    #[serde(default)] speed_bps: Option<f64>,
+    #[serde(default)] last_activity_seconds: Option<f64>,
+    #[serde(default)] heartbeat: bool,
+}
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default, rename_all = "camelCase")]
 struct Progress {
+    target: String,
+    package_only: bool,
+    removed: bool,
+    components: Vec<job_store::Component>,
+    work_paths: Vec<PathBuf>,
     job_id: String,
     stage: String,
     progress: f64,
@@ -134,13 +290,23 @@ struct Progress {
     package_kind: String,
     package_label: String,
     package_version: String,
+    #[serde(default)]
+    local_pkg: bool,
     created_at: u64,
     stage_history: Vec<String>,
     paused: bool,
+    packaging: Option<PackagingInfo>,
+    retryable: bool,
+    space: Option<storage::SpacePlan>,
 }
 impl Default for Progress {
     fn default() -> Self {
         Self {
+            target: String::new(),
+            package_only: false,
+            removed: false,
+            components: Vec::new(),
+            work_paths: Vec::new(),
             job_id: String::new(),
             stage: String::new(),
             progress: 0.,
@@ -155,9 +321,13 @@ impl Default for Progress {
             package_kind: String::new(),
             package_label: String::new(),
             package_version: String::new(),
+            local_pkg: false,
             created_at: 0,
             stage_history: Vec::new(),
             paused: false,
+            packaging: None,
+            retryable: false,
+            space: None,
         }
     }
 }
@@ -187,7 +357,7 @@ struct GameCatalog {
     cached: bool,
     source: String,
 }
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 struct Package {
     kind: String,
@@ -246,13 +416,125 @@ struct LocalPackage {
     number: usize,
     path: String,
     name: String,
+    file_name: String,
     kind: String,
     size: u64,
     title_id: Option<String>,
+    package_kind: Option<String>,
+    version: Option<String>,
+    icon: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalPkgMetadata {
+    title_id: String,
+    title: Option<String>,
+    package_kind: Option<String>,
+    version: Option<String>,
+    icon: Option<String>,
+    file_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalJobSeed {
+    name: String,
+    title_id: Option<String>,
+    package_kind: String,
+    version: String,
+    icon: Option<String>,
+    file_name: String,
+    file_size: u64,
+    local_pkg: bool,
+}
+
+fn read_local_pkg_metadata(path: &Path) -> Option<LocalPkgMetadata> {
+    let meta = pkg_meta::read(path).ok()?;
+    Some(LocalPkgMetadata {
+        title_id: meta.title_id,
+        title: meta.title.filter(|value| !value.trim().is_empty()),
+        package_kind: matches!(meta.kind.as_str(), "base" | "update" | "dlc").then_some(meta.kind),
+        version: meta.version.filter(|value| !value.trim().is_empty()),
+        icon: meta.icon0.map(|bytes| format!("data:image/png;base64,{}", BASE64.encode(bytes))),
+        file_size: meta.file_size,
+    })
+}
+
+fn local_job_seed(
+    path: &Path,
+    metadata: Option<LocalPkgMetadata>,
+    kind_override: Option<String>,
+    title_override: Option<String>,
+) -> LocalJobSeed {
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let (fallback_name, fallback_version, fallback_icon) = if metadata.is_some() {
+        (file_name.clone(), String::new(), None)
+    } else {
+        manual_metadata(path)
+    };
+    let package_kind = kind_override
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| metadata.as_ref().and_then(|meta| meta.package_kind.clone()))
+        .unwrap_or_else(|| manual_kind_for_name(&file_name).to_owned());
+    let title_id = title_override
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| metadata.as_ref().map(|meta| meta.title_id.clone()))
+        .or_else(|| dump_title_id(path))
+        .or_else(|| pkg_content_id(path).and_then(|cid| {
+            cid.split(|c: char| !c.is_ascii_alphanumeric())
+                .find(|value| title_id(value))
+                .map(str::to_owned)
+        }))
+        .or_else(|| title_from_path(path));
+    let file_size = metadata.as_ref().map(|meta| meta.file_size)
+        .or_else(|| std::fs::metadata(path).ok().map(|stat| stat.len()))
+        .unwrap_or_else(|| if path.is_dir() { dir_bytes(path) } else { 0 });
+    LocalJobSeed {
+        name: metadata.as_ref().and_then(|meta| meta.title.clone()).unwrap_or(fallback_name),
+        title_id,
+        package_kind,
+        version: metadata.as_ref().and_then(|meta| meta.version.clone()).unwrap_or(fallback_version),
+        icon: metadata.and_then(|meta| meta.icon).or(fallback_icon),
+        file_name,
+        file_size,
+        local_pkg: path.is_file() && fpkg::package_magic(&read_magic_sync(path).unwrap_or([0; 8])),
+    }
+}
+
+fn local_package_from_path(path: &Path, number: usize) -> LocalPackage {
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let metadata = read_local_pkg_metadata(path);
+    let title_id = metadata.as_ref().map(|meta| meta.title_id.clone()).or_else(|| {
+        file_name.split(|c: char| !c.is_ascii_alphanumeric())
+            .find(|value| title_id(&value.to_ascii_uppercase()))
+            .map(|value| value.to_ascii_uppercase())
+    });
+    LocalPackage {
+        number,
+        path: path.display().to_string(),
+        name: metadata.as_ref().and_then(|meta| meta.title.clone()).unwrap_or_else(|| file_name.clone()),
+        file_name,
+        kind: "pkg".into(),
+        size: metadata.as_ref().map(|meta| meta.file_size).or_else(|| std::fs::metadata(path).ok().map(|stat| stat.len())).unwrap_or(0),
+        title_id,
+        package_kind: metadata.as_ref().and_then(|meta| meta.package_kind.clone()),
+        version: metadata.as_ref().and_then(|meta| meta.version.clone()),
+        icon: metadata.and_then(|meta| meta.icon),
+    }
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SaveSettings {
+    #[serde(default)] active_console: Option<String>,
+    #[serde(default)] ps4_host: Option<String>,
+    #[serde(default)] ps4_transport: Option<String>,
+    #[serde(default)] ps4_receiver_port: Option<u16>,
+    #[serde(default)] ps4_loader_port: Option<u16>,
+    #[serde(default)] ps4_serve_port: Option<u16>,
+    #[serde(default)] ps4_ftp_port: Option<u16>,
+    #[serde(default)] ps4_ftp_user: Option<String>,
+    #[serde(default)] ps4_ftp_password: Option<String>,
+    #[serde(default)] ps4_archive_mode: Option<String>,
+    #[serde(default)] ps4_remove_after_install: Option<bool>,
     ps5_host: String,
     ps5_port: u16,
     resolver_base_url: String,
@@ -262,14 +544,41 @@ struct SaveSettings {
     theme: String,
     reduce_motion: bool,
     real_debrid_token: Option<String>,
+    #[serde(default)] torbox_token: Option<String>,
+    #[serde(default)] alldebrid_token: Option<String>,
+    #[serde(default)] torbox_enabled: Option<bool>,
+    #[serde(default)] alldebrid_enabled: Option<bool>,
     #[serde(default)]
     transfer_mode: Option<String>,
     #[serde(default)]
     upload_lanes: Option<u32>,
+    #[serde(default)]
+    package_dumps: Option<bool>,
+    #[serde(default)] download_package_only: Option<bool>,
+    #[serde(default)] keep_archives: Option<bool>,
+    #[serde(default)] keep_extractions: Option<bool>,
+    #[serde(default)] keep_packages: Option<bool>,
+
+    #[serde(default)]
+    fpkg_preset: Option<String>,
+    #[serde(default)]
+    fpkg_compression_level: Option<u8>,
+    #[serde(default)]
+    fpkg_doctor: Option<bool>,
+    #[serde(default)]
+    fpkg_pfs_version: Option<u8>,
+    #[serde(default)]
+    fpkg_engine_path: Option<String>,
+    #[serde(default)]
+    target_fw: Option<String>,
+    #[serde(default)]
+    fpkg_cleanup_source: Option<bool>,
 }
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DeliveryRequest {
+    #[serde(default)] target: Option<String>,
+    #[serde(default)] transport: Option<String>,
     package: Package,
     title_id: Option<String>,
     #[serde(default)]
@@ -278,6 +587,45 @@ struct DeliveryRequest {
     icon: Option<String>,
     #[serde(default)]
     archive_parts: Vec<Package>,
+    #[serde(default)]
+    backport: Option<BackportInput>,
+    #[serde(default)] provider: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct BackportInput { package: Package, #[serde(default)] parts: Vec<Package> }
+
+fn delivery_target(target: Option<&str>) -> Result<&str, String> {
+    match target.unwrap_or("ps5") {
+        "ps5" => Ok("ps5"), "ps4" => Ok("ps4"),
+        _ => Err("Console must be ps5 or ps4.".into()),
+    }
+}
+fn ps4_transport(request: &DeliveryRequest) -> &str { request.transport.as_deref().unwrap_or("inbox") }
+fn snapshot_transport(request: &mut DeliveryRequest, settings: &Settings, retry: bool) -> Result<(), String> {
+    if request.target.as_deref() == Some("ps4") {
+        if !retry { request.transport = Some(settings.ps4_transport.clone()); }
+        if !matches!(ps4_transport(request), "receiver" | "inbox") { return Err("PS4 transport must be receiver or inbox.".into()); }
+    }
+    Ok(())
+}
+fn ps4_receiver_job(app: &AppHandle, job: &str) -> bool {
+    app.try_state::<AppState>().is_some_and(|state| state.retry.lock().unwrap().records.get(job)
+        .and_then(|record| record.request.as_ref()).is_some_and(|r| r.target.as_deref() == Some("ps4") && ps4_transport(r) == "receiver"))
+}
+
+fn validate_delivery_target(request: &DeliveryRequest, package_only: bool, dump: bool) -> Result<&'static str, String> {
+    if package_only { return Ok(""); }
+    if delivery_target(request.target.as_deref())? == "ps5" { return Ok("ps5"); }
+    if request.title_id.as_deref().unwrap_or("").to_ascii_uppercase().contains("PPSA")
+        || request.package.expected_content_id.to_ascii_uppercase().contains("PPSA") {
+        return Err("PS5 games can't be installed on a PS4.".into());
+    }
+    if request.backport.is_some() || request.package.kind.eq_ignore_ascii_case("backport") {
+        return Err("Backports apply to PS5 games only.".into());
+    }
+    if dump { return Err("PS4 delivery takes PKG files. Game folders can only be sent to a PS5.".into()); }
+    Ok("ps4")
 }
 
 fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -330,11 +678,14 @@ fn secret(name: &str) -> Result<Entry, String> {
     Entry::new(SECRET_SERVICE, name).map_err(|e| e.to_string())
 }
 fn redact(error: impl ToString) -> String {
+    redact_delivery_error(error, "ps5")
+}
+fn redact_delivery_error(error: impl ToString, target: &str) -> String {
     let s = error.to_string();
     let s = s.replace("Bearer ", "Bearer [redacted]");
-    if s.to_ascii_lowercase().contains("early eof")
+    if target == "ps5" && (s.to_ascii_lowercase().contains("early eof")
         || s.contains("UnexpectedEof")
-        || s.contains("connection reset")
+        || s.contains("connection reset"))
     {
         format!("PS5 closed the socket (receiver timed out or died). Reload the ELF and retry. [{s}]")
     } else {
@@ -721,23 +1072,55 @@ fn packages_from_value(value: &Value) -> Result<Vec<Package>, String> {
     }
 }
 fn inherit_progress_context(p: &mut Progress, prev: &Progress) {
+    if p.target.is_empty() { p.target = prev.target.clone(); }
+    if p.components.is_empty() { p.components = prev.components.clone(); }
+    for path in &prev.work_paths { if !p.work_paths.contains(path) { p.work_paths.push(path.clone()); } }
     if p.title.is_empty() { p.title = prev.title.clone(); }
     if p.icon.is_none() { p.icon = prev.icon.clone(); }
     if p.title_id.is_empty() { p.title_id = prev.title_id.clone(); }
     if p.package_kind.is_empty() { p.package_kind = prev.package_kind.clone(); }
     if p.package_label.is_empty() { p.package_label = prev.package_label.clone(); }
     if p.package_version.is_empty() { p.package_version = prev.package_version.clone(); }
+    p.local_pkg |= prev.local_pkg;
+    if p.space.is_none() { p.space = prev.space.clone(); }
+    p.retryable = prev.retryable;
+    if p.packaging.is_none() { p.packaging = prev.packaging.clone(); }
+    if let Some(details) = p.packaging.as_mut() {
+        if let Some(old) = prev.packaging.as_ref() { details.log = old.log.clone(); }
+    }
+    if p.stage == "packaging" && prev.stage == "packaging" && p.progress == 0. { p.progress = prev.progress; }
     p.created_at = prev.created_at;
     p.stage_history = prev.stage_history.clone();
     p.paused = prev.paused && !terminal_stage(&p.stage);
+    if p.target == "ps4" && matches!(p.stage.as_str(), "handoff" | "installing") { p.paused = false; }
 }
 
 fn emit(app: &AppHandle, mut p: Progress) {
+    if p.bytes_done > 0 && matches!(p.stage.as_str(), "downloading" | "extracting" | "uploading") && p.progress < 1. {
+        static METERS: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> = std::sync::OnceLock::new();
+        let mut meters = METERS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+        let key = format!("{}:{}:{}", p.job_id, p.stage, p.paused);
+        if meters.get(&key).is_some_and(|last| last.elapsed() < Duration::from_millis(200)) { return; }
+        if meters.len() > 1024 { meters.retain(|_, time| time.elapsed() < Duration::from_secs(60)); }
+        meters.insert(key, Instant::now());
+    }
     let terminal = terminal_stage(&p.stage);
     if let Some(state) = app.try_state::<AppState>() {
         let mut jobs = state.jobs.lock().unwrap();
+        if state.retry.lock().unwrap().records.get(&p.job_id).is_some_and(|record| record.progress.removed) { return; }
         if let Some(prev) = jobs.get(&p.job_id) {
             inherit_progress_context(&mut p, prev);
+            if terminal && p.stage != "complete" && p.bytes_total == 0 {
+                p.bytes_done = prev.bytes_done;
+                p.bytes_total = prev.bytes_total;
+                p.progress = prev.progress;
+            }
+        }
+        if p.stage == "packaging" {
+            if let Some(info) = p.packaging.as_mut() {
+                if !info.heartbeat && info.log.last() != Some(&p.message) { info.log.push(p.message.clone()); }
+                if info.log.len() > 40 { info.log.remove(0); }
+            }
         }
         if p.created_at == 0 {
             p.created_at = std::time::SystemTime::now()
@@ -746,11 +1129,22 @@ fn emit(app: &AppHandle, mut p: Progress) {
         if !terminal && !p.stage_history.contains(&p.stage) {
             p.stage_history.push(p.stage.clone());
         }
+        {
+            let mut store = state.retry.lock().unwrap();
+            if let Some(record) = store.records.get_mut(&p.job_id) {
+                p.package_only = record.package_only;
+                p.retryable = true;
+                let persist = record.progress.stage != p.stage || record.progress.work_paths != p.work_paths || terminal;
+                record.progress = p.clone();
+                if persist { if let Err(error) = store.save(&p.job_id) { eprintln!("Retry journal: {error}"); } }
+            }
+        }
         jobs.insert(p.job_id.clone(), p.clone());
         if terminal {
             state.cancel.lock().unwrap().remove(&p.job_id);
         }
     }
+    if p.target != "ps4" || ps4_receiver_job(app, &p.job_id) { receiver_notifications::observe(app, &p); }
     let _ = app.emit("delivery-progress", p);
 }
 
@@ -768,7 +1162,9 @@ mod download_context_tests {
         assert!(!next.paused);
         assert!(pausable_stage("downloading"));
         assert!(pausable_stage("uploading"));
-        for stage in ["extracting", "submitting", "installing", "mounting", "complete"] { assert!(!pausable_stage(stage)); }
+        assert!(pausable_stage("extracting"));
+        assert!(pausable_stage("packaging"));
+        for stage in ["submitting", "installing", "mounting", "complete"] { assert!(!pausable_stage(stage)); }
     }
 
 
@@ -796,12 +1192,14 @@ mod download_context_tests {
 fn terminal_stage(stage: &str) -> bool {
     matches!(
         stage,
-        "complete" | "failed" | "cancelled" | "monitoring-ended"
+        "complete" | "failed" | "cancelled" | "monitoring-ended" | "delivered"
     )
 }
 
 fn job_error_stage(error: &str) -> &'static str {
-    if error == "cancelled" {
+    if error.starts_with(ps4_receiver::MONITORING_ENDED) {
+        "monitoring-ended"
+    } else if error == "cancelled" || error.ends_with(": cancelled") {
         "cancelled"
     } else if error == "Install remains in progress; check receiver status later" {
         "monitoring-ended"
@@ -867,12 +1265,16 @@ fn install_decision(value: &Value) -> Result<InstallDecision, String> {
     let status = value["status"].as_str().unwrap_or(state);
     let error = value["error"].as_str().unwrap_or("");
     let error_code = value["error_code"].as_i64().unwrap_or(0);
-    if state == "failed" {
+    if state == "failed" || error_code != 0 {
         return Err(format!(
             "Install failed: {status} {error} ({error_code})"
         ));
     }
-    if state == "complete" && matches!(status, "playable" | "installed" | "complete") {
+    let api_ok = ["api_code", "status_api_code", "auth_restore_code"].iter()
+        .all(|key| value[*key].as_i64().unwrap_or(0) == 0);
+    let fully_installed = matches!(status, "installed" | "complete")
+        || (status == "playable" && value["progress"].as_f64().unwrap_or(0.) >= 100.);
+    if state == "complete" && fully_installed && api_ok && error.is_empty() {
         return Ok(InstallDecision::Complete);
     }
     Ok(InstallDecision::Installing {
@@ -902,7 +1304,7 @@ fn extract_zip_pkgs(source: &Path, cache: &Path) -> Result<Vec<PathBuf>, String>
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 enum ArtifactKind {
     Pkg,
     Zip,
@@ -912,7 +1314,7 @@ enum ArtifactKind {
 }
 
 fn artifact_kind(header: &[u8], name: &str, content_type: &str) -> ArtifactKind {
-    if header.starts_with(&[0x7f, 0x43, 0x4e, 0x54]) {
+    if fpkg::package_magic(header) {
         return ArtifactKind::Pkg;
     }
     if header.starts_with(b"PK") {
@@ -985,7 +1387,7 @@ fn urlencoding_fallback(value: &str) -> String {
         .unwrap_or(out)
 }
 
-const RAR_PASSWORDS: [&[u8]; 5] = [b"", b"[DLPSGAME.COM]", b"DLPSGAME.COM", b"[dlpsgame.com]", b"dlpsgame.com"];
+const RAR_PASSWORDS: [&[u8]; 7] = [b"", b"[DLPSGAME.COM]", b"DLPSGAME.COM", b"www.DLPSGAME.COM", b"[dlpsgame.com]", b"dlpsgame.com", b"www.dlpsgame.com"];
 
 fn archive_passwords(password: Option<&str>) -> Vec<&[u8]> {
     let mut candidates = Vec::new();
@@ -1033,6 +1435,7 @@ fn free_space(path: &Path) -> Option<u64> {
 }
 
 fn rar_list_size(path: &Path, password: &[u8]) -> Result<u64, String> {
+    let _library = rar_control::library_lock(&|| Ok(()))?;
     let archive = if password.is_empty() {
         unrar::Archive::new(path)
     } else {
@@ -1049,38 +1452,7 @@ fn rar_list_size(path: &Path, password: &[u8]) -> Result<u64, String> {
 }
 
 fn rar_extract_to(path: &Path, dest: &Path, password: &[u8]) -> Result<u64, String> {
-    std::fs::create_dir_all(dest).map_err(redact)?;
-    let archive = if password.is_empty() {
-        unrar::Archive::new(path)
-    } else {
-        unrar::Archive::with_password(path, password)
-    };
-    let mut archive = archive
-        .open_for_processing()
-        .map_err(|error| error.to_string())?;
-    let mut files = 0u64;
-    loop {
-        let Some(header) = archive.read_header().map_err(|error| error.to_string())? else {
-            break;
-        };
-        let entry_path = &header.entry().filename;
-        if !safe_extraction_path(entry_path) { return Err("RAR contains an unsafe path".into()); }
-        archive = if header.entry().is_file() {
-            files += 1;
-            header
-                .extract_with_base(dest)
-                .map_err(|error| error.to_string())?
-        } else {
-            header.skip().map_err(|error| error.to_string())?
-        };
-    }
-    if files == 0 {
-        return Err(
-            "archive produced no files (opened on a non-first volume or all entries are split continuations)"
-                .into(),
-        );
-    }
-    Ok(files)
+    rar_control::extract(path, dest, password, &|| Ok(()))
 }
 
 fn extract_rar_builtin(
@@ -1088,6 +1460,7 @@ fn extract_rar_builtin(
     dest: &Path,
     password: Option<&str>,
     progress: std::sync::Arc<dyn Fn(u64, u64, f64) + Send + Sync>,
+    checkpoint: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
 ) -> Result<(), String> {
     let guessed = unrar::Archive::new(source)
         .as_first_part()
@@ -1107,6 +1480,7 @@ fn extract_rar_builtin(
         ));
     };
     for password in archive_passwords(password) {
+        let _library = rar_control::library_lock(checkpoint.as_ref())?;
         let probe = if password.is_empty() {
             unrar::Archive::new(&path)
         } else {
@@ -1123,8 +1497,8 @@ fn extract_rar_builtin(
         }
     }
     std::fs::create_dir_all(dest).map_err(redact)?;
-    // E1/E2: know the total up front (header walk, not extraction) and poll at
-    // 1 Hz instead of re-walking a 100 GB tree four times a second.
+    // File lengths include UnRAR's preallocation. Only PROCESSDATA callbacks
+    // measure decompressed bytes; never scan the destination to infer progress.
     let mut listed = 0u64;
     for password in archive_passwords(password) {
         if let Ok(size) = rar_list_size(&path, password) {
@@ -1133,30 +1507,31 @@ fn extract_rar_builtin(
         }
     }
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let dest_watch = dest.to_path_buf();
+    let processed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let processed_watch = processed.clone();
     let stop_watch = stop.clone();
     let progress_watch = progress.clone();
-    let started = Instant::now();
     let poller = std::thread::spawn(move || {
+        let mut previous = 0u64;
+        let mut sampled_at = Instant::now();
         while !stop_watch.load(Ordering::Relaxed) {
-            let done = dir_bytes(&dest_watch);
-            let speed = done as f64 / started.elapsed().as_secs_f64().max(0.01);
-            if listed > 0 {
-                progress_watch(done.min(listed), listed, speed);
-            } else {
-                progress_watch(done, 0, speed);
-            }
-            std::thread::sleep(Duration::from_millis(1000));
+            let done = processed_watch.load(Ordering::Relaxed);
+            let speed = done.saturating_sub(previous) as f64 / sampled_at.elapsed().as_secs_f64().max(0.01);
+            previous = done;
+            sampled_at = Instant::now();
+            progress_watch(if listed > 0 { done.min(listed) } else { done }, listed, speed);
+            std::thread::sleep(Duration::from_millis(500));
         }
     });
     let mut last = "Unable to extract RAR; check the password and all archive volumes.".to_string();
     let result = (|| {
         for password in archive_passwords(password) {
-            let _ = std::fs::remove_dir_all(dest);
-            std::fs::create_dir_all(dest).map_err(redact)?;
-            match rar_extract_to(&path, dest, password) {
+            checkpoint()?;
+            processed.store(0, Ordering::Relaxed);
+            match rar_control::extract_measured(&path, dest, password, checkpoint.as_ref(), &processed) {
                 Ok(_) => return Ok(()),
-                Err(error) => last = error,
+                Err(error) if error.starts_with("RAR password error") => last = error,
+                Err(error) => return Err(error),
             }
         }
         Err(last)
@@ -1164,7 +1539,7 @@ fn extract_rar_builtin(
     stop.store(true, Ordering::Relaxed);
     let _ = poller.join();
     if result.is_ok() {
-        let done = dir_bytes(dest);
+        let done = processed.load(Ordering::Relaxed);
         progress(done, done.max(1), 0.);
     }
     result
@@ -1272,7 +1647,7 @@ fn collect_extracted_pkgs(root: &Path) -> Result<Vec<PathBuf>, String> {
             let mut magic = [0; 4];
             let mut file = std::fs::File::open(&path).map_err(redact)?;
             use std::io::Read;
-            if file.read(&mut magic).unwrap_or(0) == 4 && magic == [0x7f, 0x43, 0x4e, 0x54] {
+            if file.read(&mut magic).unwrap_or(0) == 4 && fpkg::package_magic(&magic) {
                 found.push(path);
             }
         }
@@ -1280,28 +1655,7 @@ fn collect_extracted_pkgs(root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(found)
 }
 
-fn pkg_content_id(path: &Path) -> Option<String> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut header = [0u8; 0x54];
-    file.read_exact(&mut header).ok()?;
-    if header[..4] != [0x7f, 0x43, 0x4e, 0x54] {
-        return None;
-    }
-    for offset in [0x30usize, 0x40] {
-        let end = offset + 0x24;
-        if end > header.len() {
-            continue;
-        }
-        let raw = std::str::from_utf8(&header[offset..end]).ok()?;
-        let id = raw.trim_end_matches('\0').trim();
-        let upper = id.to_ascii_uppercase();
-        if id.len() >= 16 && (upper.contains("-CUSA") || upper.contains("-PPSA")) {
-            return Some(id.to_owned());
-        }
-    }
-    None
-}
+fn pkg_content_id(path: &Path) -> Option<String> { fpkg::package_identity(path).ok() }
 
 fn pkg_role(path: &Path) -> u8 {
     let name = path
@@ -1372,7 +1726,7 @@ fn finish_pkg_install(
                 bytes_total: total,
                 speed_bps: 0.,
                 eta_seconds: None,
-                message: format!("{label} submitted to AppInst"),
+                message: format!("{label} installation confirmed"),
                 ..Default::default()
             },
         );
@@ -1382,6 +1736,11 @@ fn finish_pkg_install(
 
 fn is_game_dump(root: &Path) -> bool {
     root.join("eboot.bin").is_file() && root.join("sce_sys").is_dir()
+}
+
+fn is_doctor_dump(root: &Path) -> bool {
+    root.join("sce_sys/param.json").is_file()
+        && (root.join("decrypted/eboot.bin.esbak").is_file() || root.join("eboot.bin.esbak").is_file())
 }
 
 fn dump_title_id(root: &Path) -> Option<String> {
@@ -1406,13 +1765,13 @@ fn dump_title_id(root: &Path) -> Option<String> {
 }
 
 fn find_dump_root(root: &Path) -> Option<PathBuf> {
-    if is_game_dump(root) {
+    if is_game_dump(root) || is_doctor_dump(root) {
         return Some(root.to_path_buf());
     }
     let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        if is_game_dump(&dir) {
+        if is_game_dump(&dir) || is_doctor_dump(&dir) {
             found.push(dir);
             continue;
         }
@@ -1747,7 +2106,86 @@ async fn file_header(path: &Path) -> Result<([u8; 8], usize, u64), String> {
 
 #[tauri::command]
 fn get_settings(state: State<AppState>) -> Settings {
-    state.settings.lock().unwrap().clone()
+    let mut settings = state.settings.lock().unwrap().clone();
+    settings.ps4_ftp_password_configured = provider_configured("ps4-ftp");
+    settings
+}
+
+#[cfg(test)]
+mod console_target_tests {
+    use super::*;
+    #[test]
+    fn delivery_errors_only_show_receiver_socket_hint_for_ps5() {
+        for cause in ["early eof", "UnexpectedEof", "connection reset"] {
+            let error = format!("FTP: {cause}; Bearer test-token");
+            let ps4 = redact_delivery_error(&error, "ps4");
+            assert_eq!(ps4, error.replace("Bearer ", "Bearer [redacted]"));
+            assert!(!ps4.contains("PS5")); assert!(!ps4.contains("ELF"));
+            let ps5 = redact_delivery_error(&error, "ps5");
+            assert_eq!(ps5, format!("PS5 closed the socket (receiver timed out or died). Reload the ELF and retry. [{ps4}]"));
+            assert_eq!(redact(&error), ps5);
+            assert_eq!(redact_delivery_error(&error, ""), ps4);
+        }
+    }
+    fn request(target: Option<&str>) -> DeliveryRequest {
+        DeliveryRequest { transport: None, target: target.map(str::to_string), package: Package { kind: "base".into(), ..Default::default() },
+            title_id: Some("CUSA12345".into()), title_name: None, icon: None, archive_parts: vec![], backport: None, provider: None }
+    }
+    #[test]
+    fn ps4_rejects_ps5_titles_backports_and_folders() {
+        let mut request = request(Some("ps4")); request.title_id = Some("PPSA12345".into());
+        assert_eq!(validate_delivery_target(&request, false, false).unwrap_err(), "PS5 games can't be installed on a PS4.");
+        request.title_id = Some("CUSA12345".into()); request.package.kind = "backport".into();
+        assert_eq!(validate_delivery_target(&request, false, false).unwrap_err(), "Backports apply to PS5 games only.");
+        request.package.kind = "base".into(); request.backport = Some(BackportInput { package: Package::default(), parts: vec![] });
+        assert_eq!(validate_delivery_target(&request, false, false).unwrap_err(), "Backports apply to PS5 games only.");
+        request.backport = None;
+        assert_eq!(validate_delivery_target(&request, false, true).unwrap_err(), "PS4 delivery takes PKG files. Game folders can only be sent to a PS5.");
+        assert_eq!(validate_delivery_target(&request, false, false).unwrap(), "ps4");
+        request.package.expected_content_id = "UP0000-PPSA12345_00-TEST000000000000".into();
+        assert_eq!(validate_delivery_target(&request, false, false).unwrap_err(), "PS5 games can't be installed on a PS4.");
+    }
+    #[test]
+    fn ps5_defaults_and_package_only_keep_existing_routes() {
+        for target in [None, Some("ps5")] {
+            let mut request = request(target); request.title_id = Some("PPSA12345".into()); request.package.kind = "backport".into();
+            assert_eq!(validate_delivery_target(&request, false, true).unwrap(), "ps5");
+        }
+        let request = request(Some("unknown"));
+        assert!(validate_delivery_target(&request, false, false).is_err());
+        assert_eq!(validate_delivery_target(&request, true, true).unwrap(), "");
+    }
+    #[test]
+    fn old_settings_requests_and_progress_deserialize_with_console_defaults() {
+        let mut settings = serde_json::to_value(Settings::default()).unwrap();
+        let fields: Vec<_> = settings.as_object().unwrap().keys().filter(|k| k.starts_with("ps4") || *k == "activeConsole").cloned().collect();
+        for field in fields { settings.as_object_mut().unwrap().remove(&field); }
+        let restored: Settings = serde_json::from_value(settings).unwrap();
+        assert_eq!(restored.active_console, "ps5"); assert_eq!(restored.ps4_ftp_port, 2121);
+        assert_eq!(restored.ps4_archive_mode, "pc"); assert!(restored.ps4_remove_after_install);
+        let mut request = serde_json::to_value(request(None)).unwrap(); request.as_object_mut().unwrap().remove("target");
+        let restored: DeliveryRequest = serde_json::from_value(request).unwrap();
+        assert_eq!(delivery_target(restored.target.as_deref()).unwrap(), "ps5");
+        let progress: Progress = serde_json::from_value(json!({"stage":"installing"})).unwrap(); assert!(progress.target.is_empty());
+        let previous = Progress { target: "ps4".into(), ..Default::default() };
+        let mut next = Progress { stage: "handoff".into(), ..Default::default() }; inherit_progress_context(&mut next, &previous);
+        assert_eq!(next.target, "ps4"); assert!(terminal_stage("delivered")); assert!(!terminal_stage("handoff")); assert!(!pausable_stage("handoff"));
+    }
+}
+#[tauri::command]
+fn set_active_console(app: AppHandle, state: State<AppState>, console: String) -> Result<Settings, String> {
+    delivery_target(Some(&console))?;
+    let mut current = state.settings.lock().unwrap();
+    let mut next = current.clone();
+    next.active_console = console;
+    next.ps4_ftp_password_configured = provider_configured("ps4-ftp");
+    write_settings(&app, &next)?;
+    *current = next.clone();
+    Ok(next)
+}
+#[tauri::command]
+async fn test_ps4(host: String, port: u16, user: Option<String>, password: Option<String>) -> Result<ps4_inbox::Ps4Probe, String> {
+    ps4_inbox::probe(host, port, user, password).await
 }
 #[tauri::command]
 fn save_settings(
@@ -1755,6 +2193,12 @@ fn save_settings(
     state: State<AppState>,
     input: SaveSettings,
 ) -> Result<Settings, String> {
+    if let Some(console) = &input.active_console { delivery_target(Some(console))?; }
+    ps4_receiver::validate_settings(input.ps4_transport.as_deref(), input.ps4_receiver_port, input.ps4_loader_port, input.ps4_serve_port)?;
+    if input.ps4_ftp_port == Some(0) { return Err("PS4 FTP port must be between 1 and 65535.".into()); }
+    if input.ps4_archive_mode.as_deref().is_some_and(|mode| !matches!(mode, "pc" | "ps4")) {
+        return Err("PS4 archive mode must be pc or ps4.".into());
+    }
     if !input.ps5_host.trim().is_empty() {
         validate_receiver_candidate(&input.ps5_host, input.ps5_port)?;
     }
@@ -1764,17 +2208,41 @@ fn save_settings(
     if input.download_dir.trim().is_empty() {
         return Err("Download folder is required".into());
     }
+    if input.fpkg_compression_level.is_some_and(|level| !(1..=9).contains(&level)) {
+        return Err("Kraken compression level must be between 1 and 9".into());
+    }
     if let Some(v) = input.real_debrid_token.filter(|v| !v.trim().is_empty()) {
         secret("real-debrid")?.set_password(&v).map_err(redact)?;
     }
+    for (provider, token) in [("torbox", input.torbox_token), ("alldebrid", input.alldebrid_token)] {
+        if let Some(token) = token.filter(|t| !t.trim().is_empty()) { secret(provider)?.set_password(token.trim()).map_err(redact)?; }
+    }
     let mut s = state.settings.lock().unwrap();
+    if let Some(password) = input.ps4_ftp_password.filter(|v| !v.trim().is_empty()) {
+        secret("ps4-ftp")?.set_password(&password).map_err(redact)?;
+    }
     *s = Settings {
+        active_console: input.active_console.unwrap_or_else(|| s.active_console.clone()),
+        ps4_host: input.ps4_host.map(|v| v.trim().to_string()).unwrap_or_else(|| s.ps4_host.clone()),
+        ps4_transport: input.ps4_transport.unwrap_or_else(|| s.ps4_transport.clone()),
+        ps4_receiver_port: input.ps4_receiver_port.unwrap_or(s.ps4_receiver_port),
+        ps4_loader_port: input.ps4_loader_port.unwrap_or(s.ps4_loader_port),
+        ps4_serve_port: input.ps4_serve_port.unwrap_or(s.ps4_serve_port),
+        ps4_ftp_port: input.ps4_ftp_port.unwrap_or(s.ps4_ftp_port),
+        ps4_ftp_user: input.ps4_ftp_user.map(|v| v.trim().to_string()).unwrap_or_else(|| s.ps4_ftp_user.clone()),
+        ps4_ftp_password_configured: provider_configured("ps4-ftp"),
+        ps4_archive_mode: input.ps4_archive_mode.unwrap_or_else(|| s.ps4_archive_mode.clone()),
+        ps4_remove_after_install: input.ps4_remove_after_install.unwrap_or(s.ps4_remove_after_install),
         ps5_host: input.ps5_host.trim().into(),
         ps5_port: input.ps5_port,
         resolver_base_url: input.resolver_base_url.trim_end_matches('/').into(),
         download_dir: input.download_dir.trim().into(),
         onboarding_complete: input.onboarding_complete,
         real_debrid_enabled: input.real_debrid_enabled,
+        torbox_enabled: input.torbox_enabled.unwrap_or(s.torbox_enabled),
+        torbox_configured: provider_configured("torbox"),
+        alldebrid_enabled: input.alldebrid_enabled.unwrap_or(s.alldebrid_enabled),
+        alldebrid_configured: provider_configured("alldebrid"),
         real_debrid_configured: secret("real-debrid")
             .ok()
             .and_then(|x| x.get_password().ok())
@@ -1786,9 +2254,40 @@ fn save_settings(
             .unwrap_or_else(default_transfer_mode)
             .to_ascii_lowercase(),
         upload_lanes: input.upload_lanes.unwrap_or_else(default_upload_lanes).clamp(1, 12),
+        package_dumps: input.package_dumps.unwrap_or(false),
+        download_package_only: input.download_package_only.unwrap_or(s.download_package_only),
+        keep_archives: input.keep_archives.unwrap_or(s.keep_archives),
+        keep_extractions: input.keep_extractions.unwrap_or(s.keep_extractions),
+        keep_packages: input.keep_packages.unwrap_or(s.keep_packages),
+
+        fpkg_preset: input
+            .fpkg_preset
+            .unwrap_or_else(default_fpkg_preset)
+            .to_ascii_lowercase(),
+        fpkg_compression_level: input.fpkg_compression_level,
+        fpkg_doctor: input.fpkg_doctor.unwrap_or(false),
+        fpkg_pfs_version: match input.fpkg_pfs_version.unwrap_or_else(default_pfs_version) {
+            3 => 3,
+            _ => 2,
+        },
+        fpkg_engine_path: input.fpkg_engine_path.unwrap_or_default().trim().to_string(),
+        target_fw: input.target_fw.unwrap_or_default().trim().to_string(),
+        fpkg_cleanup_source: input.fpkg_cleanup_source.unwrap_or(false),
     };
     write_settings(&app, &s)?;
     Ok(s.clone())
+}
+
+#[tauri::command]
+async fn inspect_package_dump(path: String) -> Result<fpkg_doctor::DoctorReport, String> {
+    tokio::task::spawn_blocking(move || {
+        let mut report = fpkg_doctor::inspect(Path::new(&path), &|| Ok(()))?;
+        match ampr_index::validate(Path::new(&path), &|| Ok(())) {
+            Ok(warnings) => for message in warnings { report.issues.push(fpkg_doctor::DoctorIssue { path: "ampr_emu.index".into(), severity: "warning".into(), message }); },
+            Err(message) => report.issues.push(fpkg_doctor::DoctorIssue { path: "ampr_emu.index".into(), severity: "error".into(), message }),
+        }
+        Ok(report)
+    }).await.map_err(redact)?
 }
 
 #[tauri::command]
@@ -1861,8 +2360,9 @@ async fn test_ps5(host: String, port: u16) -> Result<String, String> {
         ps5_port: port,
         ..Settings::default()
     };
-    ping(&settings).await?;
-    let mut stream = connect_ps5(&settings, "receiver version").await?;
+    let endpoint = ReceiverEndpoint::ps5(&settings);
+    ping(&endpoint).await?;
+    let mut stream = connect_receiver(&endpoint, "receiver version").await?;
     stream.set_nodelay(true).ok();
     let (code, body) = frame(&mut stream, 0x53, &[]).await?;
     let text = String::from_utf8_lossy(&body);
@@ -1908,6 +2408,19 @@ async fn test_resolver(state: State<'_, AppState>, base_url: String) -> Result<S
     }
     Err("Resolver did not answer a supported health endpoint".into())
 }
+fn provider_configured(provider: &str) -> bool { secret(provider).ok().and_then(|entry| entry.get_password().ok()).is_some_and(|token| !token.trim().is_empty()) }
+
+#[tauri::command]
+async fn get_provider_hosts(state: State<'_, AppState>) -> Result<Vec<debrid::ProviderHosts>, String> {
+    let settings = state.settings.lock().unwrap().clone();
+    Ok(debrid::hosts(&state.http, &settings).await)
+}
+
+#[tauri::command]
+async fn verify_provider(state: State<'_, AppState>, provider: String, token: Option<String>) -> Result<String, String> {
+    debrid::verify(&state.http, &provider, token).await
+}
+
 #[tauri::command]
 async fn verify_real_debrid(
     state: State<'_, AppState>,
@@ -1974,7 +2487,7 @@ async fn search_games(
             source_version: title.source_version,
         }));
         let mut seen = std::collections::HashSet::new();
-        merged.retain(|game| seen.insert(format!("{}:{}", game.title_id, game.region)));
+        merged.retain(|game| seen.insert(format!("{}:{}:{}", game.title_id, game.region, game.source_id)));
         return if merged.is_empty() {
             Err("No titles matched in enabled Package Sources.".into())
         } else {
@@ -2011,7 +2524,7 @@ async fn search_games(
     merged.extend(patch_site_search(&state.http, "https://prosperopatches.com", query).await);
     merged.extend(patch_site_search(&state.http, "https://orbispatches.com", query).await);
     let mut seen = std::collections::HashSet::new();
-    merged.retain(|game| seen.insert(format!("{}:{}", game.title_id, game.region)));
+    merged.retain(|game| seen.insert(format!("{}:{}:{}", game.title_id, game.region, game.source_id)));
     if merged.is_empty() {
         Err("No matching PS5 or PS4 titles were returned".into())
     } else {
@@ -2028,7 +2541,7 @@ async fn load_catalog(
     state: State<'_, AppState>,
     refresh: Option<bool>,
 ) -> Result<GameCatalog, String> {
-    let cache_path = cache_root(&app).ok().map(|root| root.join("catalog-v3.json"));
+    let cache_path = cache_root(&app).ok().map(|root| root.join("catalog-v4.json"));
     if !refresh.unwrap_or(false) {
         if let Some(path) = cache_path.as_ref() {
             if let Some(mut catalog) = read_cache_json::<GameCatalog>(path, 30 * 60) {
@@ -2038,7 +2551,9 @@ async fn load_catalog(
         }
     }
     if package_sources::has_enabled(&app) {
-        match package_sources::search(&app, "", 40).await {
+        let local = package_sources::home_titles(&app)?;
+        let titles = if local.is_empty() { package_sources::search(&app, "", 100).await } else { Ok(local) };
+        match titles {
             Ok(titles) if !titles.is_empty() => {
                 let games = titles
                     .into_iter()
@@ -2054,11 +2569,11 @@ async fn load_catalog(
                     })
                     .collect::<Vec<_>>();
                 let catalog = GameCatalog {
-                    sections: vec![CatalogSection {
-                        id: "package_sources".into(),
-                        title: "Latest titles".into(),
-                        games,
-                    }],
+                    sections: [ ("ps4", "PS4 catalog", "CUSA"), ("ps5", "PS5 catalog", "PPSA") ]
+                        .into_iter().map(|(id, title, prefix)| CatalogSection {
+                            id: id.into(), title: title.into(), games: games.iter()
+                                .filter(|g| g.title_id.starts_with(prefix)).cloned().collect(),
+                        }).collect(),
                     cached: false,
                     source: "Package Sources".into(),
                 };
@@ -2704,32 +3219,36 @@ async fn frame(stream: &mut TcpStream, cmd: u8, body: &[u8]) -> Result<(u8, Vec<
         .map_err(|_| format!("Receiver command 0x{cmd:02x} timed out"))?
 }
 async fn frame_io(stream: &mut TcpStream, cmd: u8, body: &[u8]) -> Result<(u8, Vec<u8>), String> {
+    frame_io_target(stream, cmd, body, "ps5").await
+}
+async fn frame_io_target(stream: &mut TcpStream, cmd: u8, body: &[u8], target: &str) -> Result<(u8, Vec<u8>), String> {
     if body.len() > CHUNK {
         return Err("frame exceeds 8 MiB".into());
     }
     let mut h = vec![cmd];
     h.extend((body.len() as u32).to_le_bytes());
-    stream.write_all(&h).await.map_err(redact)?;
-    stream.write_all(body).await.map_err(redact)?;
+    stream.write_all(&h).await.map_err(|e| redact_delivery_error(e, target))?;
+    stream.write_all(body).await.map_err(|e| redact_delivery_error(e, target))?;
     let mut rh = [0; 5];
-    stream.read_exact(&mut rh).await.map_err(redact)?;
+    stream.read_exact(&mut rh).await.map_err(|e| redact_delivery_error(e, target))?;
     let n = u32::from_le_bytes(rh[1..5].try_into().unwrap()) as usize;
     if n > CHUNK {
         return Err("receiver frame exceeds 8 MiB".into());
     }
     let mut b = vec![0; n];
-    stream.read_exact(&mut b).await.map_err(redact)?;
+    stream.read_exact(&mut b).await.map_err(|e| redact_delivery_error(e, target))?;
     Ok((rh[0], b))
 }
-async fn ping(s: &Settings) -> Result<(), String> {
+async fn ping(endpoint: &ReceiverEndpoint) -> Result<(), String> {
     let mut x = tokio::time::timeout(
         Duration::from_secs(10),
-        TcpStream::connect((s.ps5_host.as_str(), s.ps5_port)),
+        TcpStream::connect((endpoint.host.as_str(), endpoint.port)),
     )
     .await
-    .map_err(|_| "PS5 connection timed out".to_string())?
-    .map_err(redact)?;
-    let (r, b) = tokio::time::timeout(Duration::from_secs(10), frame(&mut x, 1, &[]))
+    .map_err(|_| format!("{} connection timed out", endpoint.console))?
+    .map_err(|e| endpoint.redact(e))?;
+    let target = if endpoint.console == "PS4" { "ps4" } else { "ps5" };
+    let (r, b) = tokio::time::timeout(Duration::from_secs(10), frame_io_target(&mut x, 1, &[], target))
         .await.map_err(|_| "Receiver PING timed out".to_string())??;
     if r == 1 && b == b"SSPI" {
         Ok(())
@@ -2740,12 +3259,12 @@ async fn ping(s: &Settings) -> Result<(), String> {
 
 /// Connect with a few retries; a dead/refusing receiver becomes a clear
 /// reload-the-ELF message instead of a raw OS 10061 at whatever stage called.
-async fn connect_ps5(s: &Settings, what: &str) -> Result<TcpStream, String> {
+async fn connect_receiver(endpoint: &ReceiverEndpoint, what: &str) -> Result<TcpStream, String> {
     let mut last = String::new();
     for attempt in 0..3u32 {
         match tokio::time::timeout(
             Duration::from_secs(5),
-            TcpStream::connect((s.ps5_host.as_str(), s.ps5_port)),
+            TcpStream::connect((endpoint.host.as_str(), endpoint.port)),
         )
         .await
         {
@@ -2753,16 +3272,17 @@ async fn connect_ps5(s: &Settings, what: &str) -> Result<TcpStream, String> {
                 tcp.set_nodelay(true).ok();
                 return Ok(tcp);
             }
-            Ok(Err(e)) => last = redact(e),
+            Ok(Err(e)) => last = endpoint.redact(e),
             Err(_) => last = format!("{what} timed out"),
         }
         sleep(Duration::from_secs(1 + u64::from(attempt))).await;
     }
-    Err(format!("PS5 receiver is not answering ({what}; last: {last}). Reload the ELF on the console and retry."))
+    Err(format!("{} receiver is not answering ({what}; last: {last}). Reload the ELF on the console and retry.", endpoint.console))
 }
-fn remote(id: Option<&str>) -> String {
+fn remote(endpoint: &ReceiverEndpoint, id: Option<&str>) -> String {
     format!(
-        "/user/data/tmp/upload_{}_{}.pkg",
+        "{}/upload_{}_{}.pkg",
+        endpoint.pkg_dir,
         id.filter(|x| title_id(x)).unwrap_or("PKG"),
         Uuid::new_v4().simple()
     )
@@ -2774,10 +3294,10 @@ fn title_from_path(path: &Path) -> Option<String> {
         .map(str::to_ascii_uppercase)
         .find(|x| title_id(x))
 }
-async fn create_remote_dir(s: &Settings, path: &str) -> Result<(), String> {
-    let mut tcp = connect_ps5(s, "CREATE_DIR").await?;
+async fn create_remote_dir(endpoint: &ReceiverEndpoint, path: &str) -> Result<(), String> {
+    let mut tcp = connect_receiver(endpoint, "CREATE_DIR").await?;
     tcp.set_nodelay(true).ok();
-    let (r, body) = tokio::time::timeout(Duration::from_secs(20), frame(&mut tcp, 0x04, path.as_bytes()))
+    let (r, body) = tokio::time::timeout(Duration::from_secs(20), frame(&mut tcp, 0x04, &endpoint.path_body(path)))
         .await
         .map_err(|_| "CREATE_DIR timed out".to_string())??;
     if r != 1 {
@@ -2793,6 +3313,7 @@ async fn create_remote_dir(s: &Settings, path: &str) -> Result<(), String> {
 async fn send_file(
     app: &AppHandle,
     s: &Settings,
+    endpoint: &ReceiverEndpoint,
     path: &Path,
     remote: &str,
     job: &str,
@@ -2821,7 +3342,7 @@ async fn send_file(
     let mut settings = s.clone();
     for attempt in 0..4u32 {
         if *tx.borrow() { return Err("cancelled".into()); }
-        match send_file_once(app, &settings, path, remote, job, tx, message,
+        match send_file_once(Some(app), &settings, endpoint, path, remote, job, tx, message,
             overall_done, overall_total, job_bytes.clone()).await {
             Ok(()) => return Ok(()),
             Err(error) if attempt < 3 && retryable_upload_error(&error) => {
@@ -2842,8 +3363,9 @@ async fn send_file(
 }
 
 async fn send_file_once(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     s: &Settings,
+    endpoint: &ReceiverEndpoint,
     path: &Path,
     remote: &str,
     job: &str,
@@ -2855,7 +3377,7 @@ async fn send_file_once(
 ) -> Result<(), String> {
     let n = fs::metadata(path).await.map_err(redact)?.len();
     let overall_total = overall_total.max(n + overall_done).max(1);
-    let dump = remote.starts_with("/data/homebrew/");
+    let dump = endpoint.dump_prefix.is_some_and(|prefix| remote.starts_with(&format!("{prefix}/")));
     let requested = if s.transfer_mode.eq_ignore_ascii_case("max") {
         // 1 Gb LAN: up to 12 lanes per file; dump files cap lower so 8 parallel
         // files stay well under the receiver's connection budget.
@@ -2872,7 +3394,7 @@ async fn send_file_once(
     };
     let mut sockets = Vec::new();
     for (off, len) in split_ranges(n, u64::from(lanes)) {
-        let mut tcp = connect_ps5(s, "lane START_UPLOAD").await?;
+        let mut tcp = connect_receiver(endpoint, "lane START_UPLOAD").await?;
         tcp.set_nodelay(true).ok();
         let mut b = remote.as_bytes().to_vec();
         b.push(0);
@@ -2895,7 +3417,7 @@ async fn send_file_once(
     let source = path.to_path_buf();
     let mut copies = Vec::new();
     for (mut tcp, off, len) in sockets {
-        let app = app.clone();
+        let app = app.cloned();
         let job = job.to_string();
         let source = source.clone();
         let sent = sent.clone();
@@ -2919,7 +3441,7 @@ async fn send_file_once(
                 if *cancel.borrow() {
                     return Err("cancelled".to_string());
                 }
-                transfer_checkpoint(&app, &job, &cancel).await?;
+                if let Some(app) = &app { transfer_checkpoint(app, &job, &cancel).await?; }
                 let chunk_len = remain.min(buffer.len() as u64) as usize;
                 let chunk = &mut buffer[..chunk_len];
                 f.read_exact(chunk).await.map_err(redact)?;
@@ -2944,8 +3466,8 @@ async fn send_file_once(
                     }
                     None => done as f64 / started.elapsed().as_secs_f64().max(0.01),
                 };
-                emit(
-                    &app,
+                if let Some(app) = &app { emit(
+                    app,
                     Progress {
                         job_id: job.clone(),
                         stage: "uploading".into(),
@@ -2963,7 +3485,7 @@ async fn send_file_once(
                         message: message.clone(),
                         ..Default::default()
                     },
-                );
+                ); }
             }
             let (r, body) = frame(&mut tcp, 0x12, &[]).await?;
             if r != 1 {
@@ -2992,7 +3514,7 @@ async fn send_file_once(
     // VERIFY releases the receiver's file descriptor and transfer records for each
     // dump file before its upload permit can be reused for the next one.
     if failed.is_none() {
-        failed = verify_uploaded_file(s, remote, n).await.err();
+        failed = verify_uploaded_file(endpoint, remote, n).await.err();
     }
     // A retry re-sends the whole file, so take this attempt's bytes back out of
     // the shared set counter instead of double-counting them.
@@ -3019,9 +3541,9 @@ fn verified_upload_size(code: u8, body: &[u8], expected: u64) -> Result<(), Stri
     Ok(())
 }
 
-async fn verify_uploaded_file(s: &Settings, remote: &str, expected: u64) -> Result<(), String> {
-    let mut stream = connect_ps5(s, "uploaded file verify").await?;
-    let (code, body) = frame(&mut stream, 0x55, remote.as_bytes()).await?;
+async fn verify_uploaded_file(endpoint: &ReceiverEndpoint, remote: &str, expected: u64) -> Result<(), String> {
+    let mut stream = connect_receiver(endpoint, "uploaded file verify").await?;
+    let (code, body) = frame(&mut stream, 0x55, &endpoint.path_body(remote)).await?;
     verified_upload_size(code, &body, expected)
 }
 
@@ -3038,6 +3560,164 @@ fn validate_mountable_dump(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+async fn package_and_install_dump(
+    app: &AppHandle, s: &Settings, root: &Path, job: &str, title_id: Option<&str>,
+    kind: &str, title_name: &Option<String>, icon: &Option<String>,
+    tx: &mut watch::Receiver<bool>, cleanup: bool, cleanup_extra: &[PathBuf],
+) -> Result<(), String> {
+    if *tx.borrow() { return Err("cancelled".into()); }
+    emit(app, Progress { job_id: job.into(), stage: "packaging".into(), message: "Waiting for packaging worker".into(), ..Default::default() });
+    let mut queue_cancel = tx.clone();
+    let package_slot = tokio::select! { slot = PACKAGING_WORK.lock() => slot, _ = queue_cancel.changed() => return Err("cancelled".into()) };
+    let engine = fpkg::locate_engine(Some(&s.fpkg_engine_path))
+        .ok_or("Packaging engine unavailable. Reinstall the complete SSPI distribution or select an engine in Settings.")?;
+    let job_root = PathBuf::from(&s.download_dir).join("packaged").join(uuid::Uuid::new_v4().to_string());
+    emit(app, Progress { job_id: job.into(), stage: "packaging".into(), work_paths: vec![job_root.clone()], message: "Creating packaging workspace".into(), ..Default::default() });
+    let staging = job_root.join("source");
+    let source = root.to_path_buf();
+    let stage_copy = staging.clone();
+    emit(app, Progress { job_id: job.into(), stage: "packaging".into(),
+        message: "Preparing a package workspace; original dump retained".into(), ..Default::default() });
+    let source_probe = source.clone();
+    let (source_bytes, workspace_bytes) = tokio::task::spawn_blocking(move || fpkg::workspace_size(&source_probe)).await.map_err(redact)??;
+    storage::publish(app, job, storage::plan(Path::new(&s.download_dir), "packaging", 0, source_bytes,
+        workspace_bytes, true, source_bytes, false))?;
+    let app_control = app.clone(); let job_control = job.to_string(); let control_cancel = tx.clone();
+    let doctor_enabled = s.fpkg_doctor;
+    let package_download_dir = s.download_dir.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let began = Instant::now();
+        let last_report = std::cell::RefCell::new(Instant::now());
+        let control = || {
+            job_store::blocking_checkpoint(&app_control, &job_control, &control_cancel)?;
+            if last_report.borrow().elapsed() >= Duration::from_secs(1) {
+                *last_report.borrow_mut() = Instant::now();
+                emit(&app_control, Progress { job_id: job_control.clone(), stage: "packaging".into(), message: format!("Preparing and validating package workspace · {}s elapsed", began.elapsed().as_secs()), ..Default::default() });
+            }
+            Ok(())
+        };
+        let doctor = if doctor_enabled {
+            let report = fpkg_doctor::inspect(&source, &control)?;
+            emit(&app_control, Progress { job_id: job_control.clone(), stage: "packaging".into(),
+                message: format!("Doctor checked {} modules; {} repair candidates", report.scanned_modules, report.repairs.len()),
+                packaging: Some(PackagingInfo { doctor: Some(report.clone()), ..Default::default() }), ..Default::default() });
+            let blockers = report.blockers();
+            if !blockers.is_empty() { return Err(format!("packaging/doctor: {}", blockers.join("; "))); }
+            Some(report)
+        } else { None };
+        fpkg::stage_source_with_repairs(&source, &stage_copy, doctor.as_ref().map(|d| d.repairs.as_slice()).unwrap_or(&[]), &control)?;
+        for warning in ampr_index::prepare_staged(&stage_copy, &control).map_err(|error| format!("packaging/backport index: {error}"))? {
+            emit(&app_control, Progress { job_id: job_control.clone(), stage: "packaging".into(), message: warning, ..Default::default() });
+        }
+        let preflight = fpkg::preflight(&stage_copy, 2_000_000)?;
+        storage::publish(&app_control, &job_control, storage::plan(Path::new(&package_download_dir), "package output and temporary files", 0, preflight.total_bytes, 0, true, preflight.total_bytes, true))?;
+        if !preflight.ok() { return Err(format!("packaging/preflight: {}", preflight.blockers.join("; "))); }
+        Ok((doctor, preflight))
+    }).await.map_err(redact)?;
+    let (doctor_report, preflight) = match prepared {
+        Ok(value) => value,
+        Err(error) => {
+            let workspace = job_root.clone(); let download = PathBuf::from(&s.download_dir);
+            let _ = tokio::task::spawn_blocking(move || fpkg::cleanup_extracted(&workspace, &download)).await;
+            return Err(error);
+        }
+    };
+    let mut options = fpkg::PackageOptions::new(staging.clone(), job_root.join("output"));
+    options.title_id = dump_title_id(root).or_else(|| title_id.map(str::to_string));
+    options.kind = fpkg::PackageKind::from_label(kind);
+    options.preset = fpkg::PackagePreset::from_label(&s.fpkg_preset);
+    options.compression_level = s.fpkg_compression_level;
+    options.pfs_version = s.fpkg_pfs_version;
+    options.target_fw = Some(s.target_fw.clone()).filter(|fw| !fw.is_empty());
+    options.threads = Some((std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) / 2).clamp(1, 8) as u16);
+    let info = PackagingInfo { preset: s.fpkg_preset.clone(), compression_level: options.effective_compression_level()?,
+        doctor: doctor_report, doctor_applied: s.fpkg_doctor, pfs_version: options.effective_pfs_version(),
+        threads: options.threads.unwrap(), input_bytes: preflight.total_bytes, file_count: preflight.file_count,
+        ..Default::default() };
+    emit(app, Progress { job_id: job.into(), stage: "packaging".into(), packaging: Some(info.clone()),
+        title: title_name.clone().unwrap_or_default(), icon: icon.clone(),
+        message: format!("Packing {} files at Kraken {} with {} workers", info.file_count, info.compression_level, info.threads), ..Default::default() });
+    let app_event = app.clone(); let job_event = job.to_string(); let info_event = info.clone();
+    let started = Instant::now();
+    let pause_app = app.clone(); let pause_job = job.to_string(); let build_cancel = tx.clone();
+    let build = fpkg::build_controlled(&engine, &options, move |line| {
+        let value = serde_json::from_str::<Value>(&line).ok();
+        let message = value.as_ref().and_then(|v| v["message"].as_str()).unwrap_or(&line).to_string();
+        let mut info = info_event.clone();
+        info.elapsed_seconds = started.elapsed().as_secs_f64();
+        if let Some(v) = value.as_ref() {
+            info.activity = v["activity"].as_str().unwrap_or("Packaging").to_string();
+            info.phase_progress = v["phaseProgress"].as_f64();
+            info.compression_input_bytes = v["compressionInputBytes"].as_u64();
+            info.compression_output_bytes = v["compressionOutputBytes"].as_u64();
+            info.speed_bps = v["speedBps"].as_f64();
+            info.last_activity_seconds = v["lastActivitySeconds"].as_f64();
+            info.heartbeat = v["heartbeat"].as_bool().unwrap_or(false);
+        }
+        emit(&app_event, Progress { job_id: job_event.clone(), stage: "packaging".into(),
+            progress: value.as_ref().and_then(|v| v["progress"].as_f64()).unwrap_or(0.),
+            message, packaging: Some(info), ..Default::default() });
+    }, |_, _| {}, move || {
+        if *build_cancel.borrow() { return Err("cancelled".into()); }
+        Ok(pause_app.state::<AppState>().jobs.lock().unwrap().get(&pause_job).is_some_and(|p| p.paused))
+    });
+    let outcome = match build.await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let workspace = job_root.clone(); let download = PathBuf::from(&s.download_dir);
+            let _ = tokio::task::spawn_blocking(move || fpkg::cleanup_extracted(&workspace, &download)).await;
+            return Err(if error == "cancelled" { error } else { format!("packaging: {error}") });
+        }
+    };
+    drop(package_slot);
+    let package = outcome.output;
+    let size = std::fs::metadata(&package).map_err(redact)?.len();
+    job_store::checkpoint(app, job, job_store::Checkpoint::Package { path: package.clone(), dump: Some(root.to_path_buf()), cleanup, backports_embedded: true, cleanup_extra: cleanup_extra.to_vec() })?;
+    transfer_checkpoint(app, job, tx).await?;
+    let mut info = info;
+    info.output_bytes = size; info.output_path = package.display().to_string(); info.elapsed_seconds = outcome.seconds;
+    emit(app, Progress { job_id: job.into(), stage: "packaging".into(), progress: 1., packaging: Some(info),
+        message: "Finalized FIH package verified".into(), ..Default::default() });
+    // Persist the verified package checkpoint before releasing downloaded inputs.
+    let mut disposable = vec![staging];
+    if !s.keep_extractions {
+        if cleanup { disposable.push(root.to_path_buf()); }
+        disposable.extend(cleanup_extra.iter().cloned());
+    }
+    let mut cleanup_note = job_store::release_packaged_inputs(s.download_dir.clone(), disposable).await;
+    if s.keep_extractions { cleanup_note = "Extracted files retained by settings.".into(); }
+    if job_store::package_only(app, job) {
+        emit(app, Progress { job_id: job.into(), stage: "complete".into(), progress: 1., bytes_done: size, bytes_total: size,
+            message: format!("FPKG ready: {}. {cleanup_note}", package.display()), ..Default::default() });
+        return Ok(());
+    }
+    emit(app, Progress { job_id: job.into(), stage: "packaging".into(), progress: 1., message: cleanup_note.clone(), ..Default::default() });
+    upload(app, s, &ReceiverEndpoint::ps5(s), &package, job, options.title_id.as_deref(), tx, "FPKG", false, 0, 0).await?;
+    let message = format!("FPKG installation confirmed. {cleanup_note}");
+    emit(app, Progress { job_id: job.into(), stage: "complete".into(), progress: 1.,
+        bytes_done: size, bytes_total: size, message, ..Default::default() });
+    Ok(())
+}
+
+async fn set_receiver_title(app: &AppHandle, endpoint: &ReceiverEndpoint, job: &str, title: Option<&str>, require_fih: bool) -> Result<(), String> {
+    let Some(id) = title.filter(|id| title_id(id)) else { return Ok(()); };
+    let mut socket = connect_receiver(endpoint, "receiver capabilities").await?;
+    let (_, body) = frame(&mut socket, 0x53, &[]).await?;
+    let config: Value = serde_json::from_slice(&body).map_err(redact)?;
+    let supports = |name: &str| config["capabilities"].as_array().is_some_and(|items| items.iter().any(|v| v == name));
+    if require_fih && !supports("fih-install") { return Err("Reload the new SSPI receiver ELF before installing a packaged PS5 dump (FIH support required)".into()); }
+    if !supports("title-context") { return Ok(()); }
+    let row = app.state::<AppState>().jobs.lock().unwrap().get(job).cloned();
+    let title = row.as_ref().map(|p| p.title.as_str()).filter(|s| !s.is_empty()).unwrap_or(id);
+    let name: String = title.chars().filter(|c| !c.is_control()).scan(0usize, |bytes, c| { *bytes += c.len_utf8(); (*bytes < 210).then_some(c) }).collect();
+    let icon = row.as_ref().and_then(|p| p.icon.as_deref()).filter(|s| valid_http(s) && s.len() < 1000).unwrap_or("");
+    let mut body = Vec::new();
+    for value in [id, name.as_str(), icon] { body.extend_from_slice(value.as_bytes()); body.push(0); }
+    let (code, reply) = frame(&mut socket, 0x57, &body).await?;
+    if code != 1 { return Err(format!("Receiver title metadata rejected: {}", String::from_utf8_lossy(&reply))); }
+    Ok(())
+}
+
 async fn upload_dump(
     app: &AppHandle,
     s: &Settings,
@@ -3047,11 +3727,13 @@ async fn upload_dump(
     kind: &str,
     tx: &watch::Receiver<bool>,
 ) -> Result<(), String> {
+    let endpoint = &ReceiverEndpoint::ps5(s);
     validate_mountable_dump(root)?;
     let _delivery = console_delivery_slot(tx).await?;
     test_ps5(s.ps5_host.clone(), s.ps5_port).await?;
     let title = dump_title_id(root)
         .or_else(|| title.map(str::to_ascii_uppercase).filter(|id| title_id(id)));
+    set_receiver_title(app, endpoint, job, title.as_deref(), false).await?;
     let remote_root = shadowmount_dir(title.as_deref(), kind)?;
     let files = dump_files(root)?;
     if !files
@@ -3068,7 +3750,7 @@ async fn upload_dump(
         .map(|(path, _)| std::fs::metadata(path).map(|m| m.len()).map_err(redact))
         .collect::<Result<_, _>>()?;
     let overall_total = sizes.iter().copied().sum::<u64>().max(1);
-    let mut control = connect_ps5(s, "dump preflight").await?;
+    let mut control = connect_receiver(endpoint, "dump preflight").await?;
     let (preflight, body) = frame(&mut control, 0x56, &[]).await?;
     require_preflight(preflight).map_err(|error| {
         format!("{error}: {}", String::from_utf8_lossy(&body))
@@ -3092,7 +3774,7 @@ async fn upload_dump(
             ));
         }
     }
-    create_remote_dir(s, &remote_root).await?;
+    create_remote_dir(endpoint, &remote_root).await?;
     let file_count = files.len();
     let transferred = Arc::new(AtomicU64::new(0));
     // Cap total concurrent sockets (~32) so the receiver isn't drowned right
@@ -3149,6 +3831,7 @@ async fn upload_dump(
             send_file(
                 &app,
                 &settings,
+                &ReceiverEndpoint::ps5(&settings),
                 &path,
                 &remote,
                 &job,
@@ -3205,7 +3888,7 @@ async fn upload_dump(
     );
     // Pre-mount liveness: never throw a mount at a dead receiver and report a
     // raw 10061. If the ELF died after upload, the files are still on the PS5.
-    if ping(s).await.is_err() {
+    if ping(endpoint).await.is_err() {
         return Err(format!("Receiver stopped answering after upload. Files are on the PS5 at {remote_root}. Reload the ELF on the console, then mount {remote_root} again."));
     }
     let mut mounted = String::new();
@@ -3249,7 +3932,7 @@ async fn upload_dump(
                     },
                 );
                 sleep(Duration::from_secs(5 + u64::from(attempt) * 5)).await;
-                if ping(s).await.is_err() {
+                if ping(endpoint).await.is_err() {
                     return Err(format!("Receiver stopped answering during mount. Files are on the PS5 at {remote_root}. Reload the ELF on the console, then mount {remote_root} again."));
                 }
             }
@@ -3276,7 +3959,8 @@ async fn upload_dump(
 }
 
 async fn mount_dump(s: &Settings, remote_root: &str) -> Result<String, String> {
-    let mut tcp = connect_ps5(s, "dump mount").await?;
+    let endpoint = &ReceiverEndpoint::ps5(s);
+    let mut tcp = connect_receiver(endpoint, "dump mount").await?;
     tcp.set_nodelay(true).ok();
     let (code, body) = tokio::time::timeout(
         Duration::from_secs(180),
@@ -3299,6 +3983,7 @@ async fn mount_dump(s: &Settings, remote_root: &str) -> Result<String, String> {
 async fn upload(
     app: &AppHandle,
     s: &Settings,
+    endpoint: &ReceiverEndpoint,
     path: &Path,
     job: &str,
     title: Option<&str>,
@@ -3309,13 +3994,20 @@ async fn upload(
     set_offset: u64,
     set_total: u64,
 ) -> Result<(), String> {
+    if job_store::package_only(app, job) {
+        let size = fs::metadata(path).await.map_err(redact)?.len();
+        if announce_complete { emit(app, Progress { job_id: job.into(), stage: "complete".into(), progress: 1., bytes_done: set_offset + size, bytes_total: set_total.max(set_offset + size), message: format!("Package saved locally: {}", path.display()), ..Default::default() }); }
+        return Ok(());
+    }
     let _delivery = console_delivery_slot(tx).await?;
-    test_ps5(s.ps5_host.clone(), s.ps5_port).await?;
+    test_ps5(endpoint.host.clone(), endpoint.port).await?;
+    let (header, _, _) = file_header(path).await?;
+    set_receiver_title(app, endpoint, job, title, header.starts_with(&[0x7f,b'F',b'I',b'H'])).await?;
     let n = fs::metadata(path).await.map_err(redact)?.len();
     let total = set_total.max(set_offset + n).max(1);
     let done = set_offset + n;
-    let target = remote(title);
-    let mut control = connect_ps5(s, "install preflight").await?;
+    let target = remote(endpoint, title);
+    let mut control = connect_receiver(endpoint, "install preflight").await?;
     let (preflight, body) = frame(&mut control, 0x56, &[]).await?;
     require_preflight(preflight).map_err(|error| {
         format!(
@@ -3326,11 +4018,12 @@ async fn upload(
     send_file(
         app,
         s,
+        endpoint,
         path,
         &target,
         job,
         tx,
-        &format!("Uploading {label} PKG to PS5"),
+        &format!("Uploading {label} PKG to {}", endpoint.console),
         0,
         n,
         None,
@@ -3355,7 +4048,7 @@ async fn upload(
             ..Default::default()
         },
     );
-    let mut submit = connect_ps5(s, "install submission").await?;
+    let mut submit = connect_receiver(endpoint, "install submission").await?;
     if *tx.borrow() { return Err("cancelled".into()); }
     let (_frame_code, v) = frame(&mut submit, 0x50, target.as_bytes()).await?;
     let parsed: Value = serde_json::from_slice(&v).map_err(|_| {
@@ -3389,7 +4082,7 @@ async fn upload(
             return Err("cancelled".into());
         }
         sleep(Duration::from_secs(2)).await;
-        let mut status_sock = connect_ps5(s, "install status").await?;
+        let mut status_sock = connect_receiver(endpoint, "install status").await?;
         let (_frame_code, v) = frame(&mut status_sock, 0x51, cid.as_bytes()).await?;
         let parsed = match serde_json::from_slice::<Value>(&v) {
             Ok(value) => value,
@@ -3423,6 +4116,7 @@ async fn upload(
         };
         match install_decision(&parsed)? {
             InstallDecision::Complete => {
+                if !s.keep_packages { job_store::cleanup_installed_package(app, job, path)?; }
                 return finish_pkg_install(app, job, done, total, &label, announce_complete);
             }
             InstallDecision::Installing { status, progress } => {
@@ -3494,6 +4188,7 @@ async fn upload(
 async fn upload_pkg_set(
     app: &AppHandle,
     s: &Settings,
+    endpoint: &ReceiverEndpoint,
     packages: Vec<PathBuf>,
     job: &str,
     title: Option<&str>,
@@ -3521,6 +4216,7 @@ async fn upload_pkg_set(
         upload(
             app,
             s,
+            endpoint,
             package,
             job,
             id.as_deref(),
@@ -3578,7 +4274,7 @@ fn rd_error_message(value: &Value, status: u16) -> String {
     let code = value["error_code"].as_i64().unwrap_or(0);
     match error {
         "hoster_not_free" => {
-            "Real-Debrid: 1fichier is not unlocked for this account (hoster_not_free). Re-verify the token in Settings, or the file needs the DLPS password.".into()
+            "Real-Debrid: 1fichier is not unlocked for this account (hoster_not_free). Re-verify the token in Settings, or the file needs its source password.".into()
         }
         "hoster_unavailable" | "hoster_temporarily_unavailable" => {
             "Real-Debrid: 1fichier is down right now. Retry in a minute.".into()
@@ -3607,9 +4303,9 @@ async fn unrestrict_hoster(
     if token.is_empty() {
         return Err("Real-Debrid token is not stored".into());
     }
-    let passwords = ["DLPSGAME.COM", "dlpsgame.com", ""];
     let mut last = "Unrestrict response did not contain an HTTP download".to_string();
-    for password in passwords {
+    for password in archive_passwords(Some("DLPSGAME.COM")) {
+        let password = std::str::from_utf8(password).map_err(redact)?;
         for attempt in 0..3u32 {
             let mut form = vec![("link", landing.to_string())];
             if !password.is_empty() {
@@ -3653,6 +4349,12 @@ async fn unrestrict_hoster(
     Err(last)
 }
 
+fn validate_download_range(existing: u64, content_range: &str) -> Result<(), String> {
+    let offset = content_range.strip_prefix("bytes ").and_then(|s| s.split('-').next()).and_then(|s| s.parse::<u64>().ok());
+    if offset != Some(existing) { return Err("Server returned the wrong resume range. Retained partial file was not changed.".into()); }
+    Ok(())
+}
+
 async fn download_url(
     http: &Client,
     url: &str,
@@ -3668,7 +4370,7 @@ async fn download_url(
     set_total: u64,
     set_started: Instant,
 ) -> Result<(Vec<u8>, String, Option<String>), String> {
-    let existing = fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
+    let mut existing = fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
     // D1: one model — bar and text both come from set-wide bytes.
     let set_fraction = |done: u64, total: u64| {
         if total > 0 {
@@ -3702,16 +4404,20 @@ async fn download_url(
     if existing > 0 {
         request = request.header(reqwest::header::RANGE, format!("bytes={existing}-"));
     }
-    let response = tokio::time::timeout(Duration::from_secs(45), request.send())
-        .await
+    let mut cancelled = rx.clone();
+    let response = tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(45), request.send()) => result,
+        _ = cancelled.changed() => return Err("cancelled".into()),
+    }
         .map_err(|_| network_error("Package download request timed out"))?
         .map_err(|_| network_error("Package download request"))?;
     if !(response.status().is_success() || response.status() == reqwest::StatusCode::PARTIAL_CONTENT)
     {
         return Err(format!("Download failed: HTTP {}", response.status()));
     }
-    if existing > 0 && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err("Origin does not support resume; remove the retained .part and retry".into());
+    if existing > 0 && response.status() == reqwest::StatusCode::OK { existing = 0; }
+    if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        validate_download_range(existing, response.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok()).unwrap_or(""))?;
     }
     let content_type = response
         .headers()
@@ -3726,25 +4432,41 @@ async fn download_url(
         .and_then(disposition_filename);
     let total = (response.content_length().unwrap_or(0) + existing).max(size_hint);
     let set_total = set_total.max(set_done + total);
+    let settings = app.state::<AppState>().settings.lock().unwrap().clone();
+    let plan = storage::download_plan(&settings, set_total, set_done + existing,
+        !filename.as_deref().unwrap_or(url).to_ascii_lowercase().ends_with(".pkg"));
+    storage::publish(app, job, plan)?;
     let mut file = fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .append(existing > 0)
+        .truncate(existing == 0)
         .open(part)
         .await
         .map_err(redact)?;
     let mut stream = response.bytes_stream();
     let mut done = existing;
+    let mut checked = existing;
     loop {
         if *rx.borrow() {
             return Err("cancelled".into());
         }
         transfer_checkpoint(app, job, rx).await?;
-        let chunk = match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+        let mut cancelled = rx.clone();
+        let next = tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(30), stream.next()) => result,
+            _ = cancelled.changed() => return Err("cancelled".into()),
+        };
+        let chunk = match next {
             Err(_) => return Err("Download stalled for 30 seconds. Cancel and retry.".into()),
             Ok(None) => break,
             Ok(Some(Ok(chunk))) => chunk,
             Ok(Some(Err(_))) => return Err(network_error("Package download stream")),
         };
+        if done.saturating_sub(checked) >= 64 * 1024 * 1024 || checked == existing {
+            storage::guard_bytes(part, total.saturating_sub(done).max(chunk.len() as u64), "download")?;
+            checked = done;
+        }
         file.write_all(&chunk).await.map_err(redact)?;
         done += chunk.len() as u64;
         let all = set_done + done;
@@ -3769,57 +4491,18 @@ async fn download_url(
         );
     }
     file.flush().await.map_err(redact)?;
+    if total > 0 && done < total { return Err(format!("Download incomplete ({done} of {total} bytes). Retry resumes the retained partial file.")); }
     let mut magic = [0; 8];
     let mut reader = fs::File::open(part).await.map_err(redact)?;
     let read = reader.read(&mut magic).await.map_err(redact)?;
     Ok((magic[..read].to_vec(), content_type, filename))
 }
 
-#[tauri::command]
-async fn start_delivery(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    request: DeliveryRequest,
-) -> Result<String, String> {
-    let parts = delivery_parts(&request)?;
+
+async fn download_delivery_inputs(app2: &AppHandle, s: &Settings, http: &Client, job2: &String, request: &DeliveryRequest, parts: Vec<Package>, resume: Option<&job_store::Record>, rx: &mut watch::Receiver<bool>, index_offset: usize, slot: &str) -> Result<(PathBuf, Vec<PathBuf>, ArtifactKind), String> {
     let archive_set = request.package.archive_set_id.is_some();
-    let s = state.settings.lock().unwrap().clone();
-    validate_receiver_candidate(&s.ps5_host, s.ps5_port).map_err(|_| {
-        "PS5 receiver is not configured. Open Settings or download the receiver ELF.".to_string()
-    })?;
-    ping(&s)
-        .await
-        .map_err(|error| format!("PS5 receiver is not ready: {error}"))?;
-    let job = Uuid::new_v4().to_string();
-    let (tx, mut rx) = watch::channel(false);
-    state.cancel.lock().unwrap().insert(job.clone(), tx);
-    let http = state.http.clone();
-    let app2 = app.clone();
-    let job2 = job.clone();
-    tauri::async_runtime::spawn(async move {
-        let job_title = request.title_name.clone().unwrap_or_default();
-        let job_icon = request.icon.clone();
-        emit(
-            &app2,
-            Progress {
-                job_id: job2.clone(),
-                stage: "queued".into(),
-                progress: 0.,
-                bytes_done: 0,
-                bytes_total: 0,
-                speed_bps: 0.,
-                eta_seconds: None,
-                message: "Starting download".into(),
-                title: job_title.clone(),
-                icon: job_icon.clone(),
-                title_id: request.title_id.clone().unwrap_or_default(),
-                package_kind: request.package.kind.clone(),
-                package_label: request.package.label.clone(),
-                package_version: request.package.version.clone(),
-                ..Default::default()
-            },
-        );
-        let res = async {
+    let job_title = request.title_name.clone().unwrap_or_default();
+    let job_icon = request.icon.clone();
             let dir = PathBuf::from(&s.download_dir);
             fs::create_dir_all(&dir).await.map_err(redact)?;
             let staging = if archive_set {
@@ -3837,11 +4520,13 @@ async fn start_delivery(
                         }
                     })
                     .collect::<String>();
-                let path = dir.join(format!("archive_{set}"));
+                let path = dir.join(format!("archive_{job2}_{slot}_{set}"));
                 fs::create_dir_all(&path).await.map_err(redact)?;
                 path
             } else {
-                dir.clone()
+                let path = dir.join(format!("archive_{job2}_{slot}"));
+                fs::create_dir_all(&path).await.map_err(redact)?;
+                path
             };
             let mut downloaded = Vec::new();
             let mut volume_names = Vec::new();
@@ -3849,7 +4534,17 @@ async fn start_delivery(
             let set_total: u64 = parts.iter().filter_map(|package| package.expected_size).sum();
             let mut set_done: u64 = 0;
             let set_started = Instant::now();
+            let initial = storage::download_plan(&s, set_total, 0, archive_set || !request.package.url.to_ascii_lowercase().ends_with(".pkg"));
+            storage::publish(&app2, &job2, initial)?;
             for (index, package) in parts.iter().enumerate() {
+                transfer_checkpoint(&app2, &job2, &rx).await?;
+                if let Some(saved) = resume.as_ref().and_then(|r| r.downloads.iter().find(|f| f.index == index + index_offset && f.complete && f.path.is_file())) {
+                    downloaded.push(saved.path.clone()); volume_names.push(saved.name.clone()); detected = saved.kind;
+                    set_done += std::fs::metadata(&saved.path).map_err(redact)?.len();
+                    emit(&app2, Progress { job_id: job2.clone(), stage: "downloading".into(), bytes_done: set_done,
+                        bytes_total: set_total, message: "Reusing completed download".into(), ..Default::default() });
+                    continue;
+                }
                 let access_type = package.access_type.to_ascii_lowercase();
                 let mut url = package.url.clone();
                 let needs_unlock = match access_type.as_str() {
@@ -3857,9 +4552,9 @@ async fn start_delivery(
                     "hosterlanding" | "hoster-landing" => true,
                     _ => !direct_package(&url),
                 };
-                if needs_unlock && !s.real_debrid_enabled {
+                if needs_unlock && debrid::enabled(s).is_empty() {
                     return Err(
-                        "This source returned a hoster link. Enable Real-Debrid in Settings before installing."
+                        "This source returned a hoster link. Enable and configure Real-Debrid, TorBox, or AllDebrid in Settings before installing."
                             .into(),
                     );
                 }
@@ -3886,7 +4581,10 @@ async fn start_delivery(
                             ..Default::default()
                         },
                     );
-                    let unrestricted = unrestrict_hoster(&http, &url).await?;
+                    let unrestricted = tokio::select! {
+                        result = debrid::resolve(http, s, &url, request.provider.as_deref()) => result?,
+                        _ = rx.changed() => return Err("cancelled".into()),
+                    };
                     url = unrestricted.0;
                     rd_name = unrestricted.1;
                     rd_size = unrestricted.2;
@@ -3903,6 +4601,8 @@ async fn start_delivery(
                         .map(|part| format!("_p{part:02}"))
                         .unwrap_or_default()
                 ));
+                let part_path = resume.as_ref().and_then(|r| r.downloads.iter().find(|f| f.index == index + index_offset && !f.complete && f.path.is_file())).map(|f| f.path.clone()).unwrap_or(part_path);
+                job_store::downloaded(&app2, &job2, job_store::DownloadedFile { index: index + index_offset, path: part_path.clone(), name: String::new(), kind: ArtifactKind::Unknown, complete: false })?;
                 let (header, content_type, disposition) = download_url(
                     &http,
                     &url,
@@ -3935,6 +4635,7 @@ async fn start_delivery(
                             .into(),
                     );
                 }
+                job_store::downloaded(&app2, &job2, job_store::DownloadedFile { index: index + index_offset, path: part_path.clone(), name: name.clone(), kind: detected, complete: true })?;
                 downloaded.push(part_path);
                 volume_names.push(name);
                 set_done += std::fs::metadata(downloaded.last().unwrap())
@@ -4001,7 +4702,132 @@ async fn start_delivery(
             } else {
                 consumed_inputs = downloaded.clone();
             }
+
+    Ok((primary, consumed_inputs, detected))
+}
+
+#[tauri::command]
+async fn start_delivery(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: DeliveryRequest,
+) -> Result<String, String> {
+    let settings = state.settings.lock().unwrap().clone();
+    validate_delivery_target(&request, settings.package_dumps && settings.download_package_only, false)?;
+    if let Some((id, resume)) = job_store::reuse_for_pair(&app, &request)? {
+        if !resume { return Ok(id); }
+        let request = job_store::record(&app, &id).and_then(|record| record.request).ok_or("Retained transfer request is missing")?;
+        return queue_delivery(app.clone(), &state, request, Some(id)).await;
+    }
+    queue_delivery(app.clone(), &state, request, None).await
+}
+
+async fn queue_delivery(app: AppHandle, state: &AppState, mut request: DeliveryRequest, retry_id: Option<String>) -> Result<String, String> {
+    let resume = retry_id.as_ref().and_then(|id| state.retry.lock().unwrap().records.get(id).cloned());
+    let archive_set = request.package.archive_set_id.is_some();
+    let mut s = state.settings.lock().unwrap().clone();
+    snapshot_transport(&mut request, &s, retry_id.is_some())?;
+    let receiver = request.target.as_deref() == Some("ps4") && ps4_transport(&request) == "receiver";
+    let package_only = if request.target.as_deref() == Some("ps4") {
+        resume.as_ref().map(|r| r.package_only).unwrap_or(s.package_dumps && s.download_package_only)
+    } else { resume.as_ref().is_some_and(|r| r.package_only) || (s.package_dumps && s.download_package_only) };
+    let target = validate_delivery_target(&request, package_only, false)?.to_string();
+    if target == "ps4" && !receiver {
+        if let Some(saved) = resume.as_ref().and_then(|record| record.ps4_delivery.as_ref()) { ps4_inbox::validate_delivery(saved)?; }
+    }
+    backport::validate_request(&request)?;
+    let parts = if resume.as_ref().is_some_and(|r| r.checkpoint.is_some()) { vec![] } else { delivery_parts(&request)? };
+    if package_only { s.package_dumps = true; }
+    if request.backport.is_some() && !s.package_dumps { return Err("Enable FPKG packaging to combine a base and backport".into()); }
+    if resume.is_none() {
+        let bytes = parts.iter().filter_map(|p| p.expected_size).fold(0u64, u64::saturating_add).saturating_add(request.backport.as_ref().map(|b| if b.parts.is_empty() { b.package.expected_size.unwrap_or(0) } else { b.parts.iter().filter_map(|p| p.expected_size).sum() }).unwrap_or(0));
+        let plan = storage::download_plan(&s, bytes, 0, archive_set || !request.package.url.to_ascii_lowercase().ends_with(".pkg"));
+        if !plan.enough { return Err(plan.message); }
+    }
+    if !package_only && target == "ps4" {
+        if receiver { ps4_receiver::ready(&ReceiverEndpoint::ps4(&s)).await?; }
+        else { ps4_inbox::ready(&s).await?; }
+    }
+    if !package_only && target == "ps5" { validate_receiver_candidate(&s.ps5_host, s.ps5_port).map_err(|_| {
+        "PS5 receiver is not configured. Open Settings or download the receiver ELF.".to_string()
+    })?;
+    ping(&ReceiverEndpoint::ps5(&s))
+        .await
+        .map_err(|error| format!("PS5 receiver is not ready: {error}"))?; }
+    let job = retry_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let (tx, mut rx) = watch::channel(false);
+    {
+        let mut jobs = state.jobs.lock().unwrap();
+        let mut store = state.retry.lock().unwrap();
+        if jobs.get(&job).is_some_and(|p| p.stage == "removing") || store.records.get(&job).is_some_and(|r| r.progress.removed) {
+            return Err("This entry is being removed or was already removed".into());
+        }
+        let mut active = state.cancel.lock().unwrap();
+        if active.contains_key(&job) { return Err("This job is already running".into()); }
+        if active.keys().any(|id| store.records.get(id).and_then(|record| record.request.as_ref()).is_some_and(|other| job_store::overlapping_delivery(&request, other))) {
+            return Err("This game already has an active transfer. Open Downloads to manage it. Use one Install with backport transfer to combine the base and backport.".into());
+        }
+        if !store.records.contains_key(&job) {
+            store.records.insert(job.clone(), job_store::Record { ps4_delivery: None, package_only, pairing_sealed: false, progress: Progress { job_id: job.clone(), target: target.clone(), ..Default::default() },
+                request: Some(request.clone()), checkpoint: None, downloads: vec![], download_dir: PathBuf::from(&s.download_dir) });
+        }
+        if let Some(record) = store.records.get_mut(&job) { record.pairing_sealed = false; record.package_only = package_only; }
+        if target == "ps4" {
+            if let Some(record) = store.records.get_mut(&job) {
+                record.progress.target = target.clone(); record.progress.stage = "queued".into();
+                record.progress.title_id = request.title_id.clone().unwrap_or_default();
+                record.progress.package_kind = request.package.kind.clone(); record.progress.paused = false;
+                jobs.insert(job.clone(), record.progress.clone());
+            }
+        }
+        store.save(&job)?;
+        active.insert(job.clone(), tx);
+    }
+    let http = state.http.clone();
+    let app2 = app.clone();
+    let job2 = job.clone();
+    tauri::async_runtime::spawn(async move {
+        let job_title = request.title_name.clone().unwrap_or_default();
+        let job_icon = request.icon.clone();
+        emit(
+            &app2,
+            Progress {
+                job_id: job2.clone(),
+                target: target.clone(),
+                stage: "queued".into(),
+                progress: 0.,
+                bytes_done: 0,
+                bytes_total: 0,
+                speed_bps: 0.,
+                eta_seconds: None,
+                message: "Starting download".into(),
+                title: job_title.clone(),
+                icon: job_icon.clone(),
+                title_id: request.title_id.clone().unwrap_or_default(),
+                package_kind: request.package.kind.clone(),
+                package_label: if request.backport.is_some() { format!("{} + Backport", request.package.label) } else { request.package.label.clone() },
+                package_version: request.package.version.clone(),
+                components: job_store::request_components(&request, &[]),
+                ..Default::default()
+            },
+        );
+        let res = async {
+            transfer_checkpoint(&app2, &job2, &rx).await?;
+            if target == "ps4" && !receiver && resume.as_ref().is_some_and(|r| r.ps4_delivery.is_some()) {
+                return ps4_inbox::deliver(&app2, &s, &job2, vec![], false, &rx).await;
+            }
+            if request.backport.is_some() && !resume.as_ref().is_some_and(|r| matches!(r.checkpoint, Some(job_store::Checkpoint::Package { .. }))) {
+                return backport::run(&app2, &s, &http, &job2, &request, &mut rx).await;
+            }
+            if let Some(checkpoint) = resume.as_ref().and_then(|r| r.checkpoint.clone()) {
+                return resume_checkpoint(&app2, &s, &job2, &request, checkpoint, &mut rx).await;
+            }
+            let dir = PathBuf::from(&s.download_dir);
+            let (primary, consumed_inputs, detected) = download_delivery_inputs(&app2, &s, &http, &job2, &request, parts, resume.as_ref(), &mut rx, 0, "base").await?;
             if detected == ArtifactKind::Pkg {
+                if job_store::pairing_before_packaging(&app2, &job2)?.is_some() {
+                    return Err("The base download is a prebuilt package. A backport can only be combined with an extracted game folder.".into());
+                }
                 let final_path = dir.join(format!(
                     "download_{}.pkg",
                     download_key(
@@ -4011,9 +4837,15 @@ async fn start_delivery(
                     )
                 ));
                 fs::rename(&primary, &final_path).await.map_err(redact)?;
+                job_store::checkpoint(&app2, &job2, job_store::Checkpoint::Package { path: final_path.clone(), dump: None, cleanup: false, backports_embedded: false, cleanup_extra: vec![] })?;
+                if target == "ps4" {
+                    return if receiver { ps4_receiver::deliver(&app2, &s, &job2, vec![final_path], &rx).await }
+                        else { ps4_inbox::deliver(&app2, &s, &job2, vec![final_path], false, &rx).await };
+                }
                 let result = upload(
                     &app2,
                     &s,
+                    &ReceiverEndpoint::ps5(&s),
                     &final_path,
                     &job2,
                     request.title_id.as_deref(),
@@ -4024,147 +4856,13 @@ async fn start_delivery(
                     0,
                 )
                 .await;
-                if result.is_ok() {
-                    archives::remove_consumed_inputs(&[final_path], &[])?;
-                }
+
                 return result;
             }
-            if matches!(
-                detected,
-                ArtifactKind::Rar | ArtifactKind::SevenZ | ArtifactKind::Zip
-            ) {
-                emit(
-                    &app2,
-                    Progress {
-                        job_id: job2.clone(),
-                        stage: "extracting".into(),
-                        progress: 0.,
-                        bytes_done: 0,
-                        bytes_total: 0,
-                        speed_bps: 0.,
-                        eta_seconds: None,
-                        message: "Extracting archive".into(),
-                        title: request.title_name.clone().unwrap_or_default(),
-                        icon: request.icon.clone(),
-                        ..Default::default()
-                    },
-                );
-                let cache = dir.join("extracted");
-                let app_extract = app2.clone();
-                let job_extract = job2.clone();
-                let extract_title = request.title_name.clone().unwrap_or_default();
-                let extract_icon = request.icon.clone();
-                let password = request.package.archive_password.clone();
-                let extracted = tokio::task::spawn_blocking(move || {
-                    archives::extract_content(&primary, &cache, detected, password.as_deref(), Arc::new(move |done, total, speed| {
-                        emit(
-                            &app_extract,
-                            Progress {
-                                job_id: job_extract.clone(),
-                                stage: "extracting".into(),
-                                progress: if total > 0 {
-                                    (done as f64 / total as f64).min(0.99)
-                                } else {
-                                    0.
-                                },
-                                bytes_done: done,
-                                bytes_total: total,
-                                speed_bps: speed,
-                                eta_seconds: (total > done && speed > 1.)
-                                    .then(|| ((total - done) as f64 / speed) as u64),
-                                message: if total > 0 {
-                                    format!(
-                                        "Extracting {:.2} / {:.2} GB · {:.1} MB/s",
-                                        done as f64 / 1_073_741_824.0,
-                                        total as f64 / 1_073_741_824.0,
-                                        speed / 1_048_576.0
-                                    )
-                                } else {
-                                    format!(
-                                        "Extracting {:.2} GB · {:.1} MB/s",
-                                        done as f64 / 1_073_741_824.0,
-                                        speed / 1_048_576.0
-                                    )
-                                },
-                                title: extract_title.clone(),
-                                icon: extract_icon.clone(),
-                                ..Default::default()
-                            },
-                        );
-                    }), 0)
-                })
-                .await
-                .map_err(redact)??;
-                let extracted_outputs = archives::extracted_outputs(&extracted);
-                archives::remove_consumed_inputs(&consumed_inputs, &extracted_outputs)?;
-                match extracted {
-                    ExtractedContent::Pkgs(packages) => {
-                        // F7: receipt — which files, what sizes, which identities.
-                        let receipt = packages
-                            .iter()
-                            .map(|p| {
-                                let name = p
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .into_owned();
-                                let size = std::fs::metadata(p)
-                                    .map(|m| m.len())
-                                    .unwrap_or(0);
-                                let cid = pkg_content_id(p).unwrap_or_else(|| "no-cid".into());
-                                format!(
-                                    "{name} ({} MB, {})",
-                                    size / 1_048_576,
-                                    cid
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("; ");
-                        emit(
-                            &app2,
-                            Progress {
-                                job_id: job2.clone(),
-                                stage: "extracting".into(),
-                                progress: 1.,
-                                bytes_done: 0,
-                                bytes_total: 0,
-                                speed_bps: 0.,
-                                eta_seconds: None,
-                                message: format!(
-                                    "Extracted {} PKG{}: {}",
-                                    packages.len(),
-                                    if packages.len() == 1 { "" } else { "s" },
-                                    receipt
-                                ),
-                                title: request.title_name.clone().unwrap_or_default(),
-                                icon: request.icon.clone(),
-                                ..Default::default()
-                            },
-                        );
-                        return upload_pkg_set(
-                            &app2,
-                            &s,
-                            packages,
-                            &job2,
-                            request.title_id.as_deref(),
-                            &mut rx,
-                        )
-                        .await;
-                    }
-                    ExtractedContent::Dump(root) => {
-                        let dump_id = request.title_id.clone().or_else(|| title_from_path(&root));
-                        return upload_dump(
-                            &app2,
-                            &s,
-                            &root,
-                            &job2,
-                            dump_id.as_deref(),
-                            &request.package.kind,
-                            &rx,
-                        )
-                        .await;
-                    }
-                }
+            if matches!(detected, ArtifactKind::Rar | ArtifactKind::SevenZ | ArtifactKind::Zip) {
+                let checkpoint = job_store::Checkpoint::Archive { primary, inputs: consumed_inputs, password: request.package.archive_password.clone() };
+                job_store::checkpoint(&app2, &job2, checkpoint.clone())?;
+                return resume_checkpoint(&app2, &s, &job2, &request, checkpoint, &mut rx).await;
             }
             Err("Downloaded file has unknown package magic".into())
         }
@@ -4182,7 +4880,7 @@ async fn start_delivery(
                     bytes_total: 0,
                     speed_bps: 0.,
                     eta_seconds: None,
-                    message: redact(e),
+                    message: redact_delivery_error(e, &target),
                     ..Default::default()
                 },
             )
@@ -4193,6 +4891,16 @@ async fn start_delivery(
 #[tauri::command]
 fn cancel_job(state: State<AppState>, job_id: String) -> Result<bool, String> {
     let jobs = state.jobs.lock().unwrap();
+    if let Some(p) = jobs.get(&job_id).filter(|p| p.target == "ps4") {
+        let receiver = state.retry.lock().unwrap().records.get(&job_id).and_then(|r| r.request.as_ref())
+            .is_some_and(|r| ps4_transport(r) == "receiver");
+        if !receiver && matches!(p.stage.as_str(), "handoff" | "installing") {
+            return Err("Installation is managed by SSPI on the PS4.".into());
+        }
+        if receiver && matches!(p.stage.as_str(), "submitting" | "installing") {
+            return Err("Installation is managed by the PS4 now; manage it on the console.".into());
+        }
+    }
     if jobs.get(&job_id).is_some_and(|p| matches!(p.stage.as_str(), "submitting" | "installing" | "mounting")) {
         return Err("Installation is managed by the PS5 now; manage it on the console.".into());
     }
@@ -4205,14 +4913,14 @@ fn cancel_job(state: State<AppState>, job_id: String) -> Result<bool, String> {
         .map(|x| x.send(true).is_ok())
         .unwrap_or(false))
 }
-fn pausable_stage(stage: &str) -> bool { matches!(stage, "downloading" | "uploading") }
+fn pausable_stage(stage: &str) -> bool { matches!(stage, "queued" | "unlocking" | "downloading" | "extracting" | "packaging" | "uploading") }
 
 #[tauri::command]
 fn pause_job(app: AppHandle, state: State<AppState>, job_id: String, paused: bool) -> Result<(), String> {
     let event = {
         let mut jobs = state.jobs.lock().unwrap();
         let job = jobs.get_mut(&job_id).ok_or("Transfer no longer exists")?;
-        if !pausable_stage(&job.stage) { return Err("Pause is available during download and upload. Console installation is managed by the PS5.".into()); }
+        if !pausable_stage(&job.stage) { return Err(format!("Pause is available while the PC is preparing or transferring files. Console installation is managed by the {}.", if job.target == "ps4" { "PS4" } else { "PS5" })); }
         job.paused = paused;
         job.clone()
     };
@@ -4246,7 +4954,7 @@ async fn transfer_checkpoint(app: &AppHandle, job: &str, cancel: &watch::Receive
 
 #[tauri::command]
 fn list_jobs(state: State<AppState>) -> Vec<Progress> {
-    state.jobs.lock().unwrap().values().cloned().collect()
+    state.jobs.lock().unwrap().values().filter(|p| !p.removed).cloned().collect()
 }
 
 #[tauri::command]
@@ -4264,16 +4972,14 @@ fn system_drive_prefix() -> Option<String> {
 async fn scan_local_packages(path: String) -> Result<Vec<LocalPackage>, String> {
     let supplied = PathBuf::from(&path);
     if supplied.is_file() {
-        let (b, n, size) = file_header(&supplied).await?;
+        let (b, n, _size) = file_header(&supplied).await?;
         if b[..n].starts_with(b"PK")
             || b[..n].starts_with(b"Rar!")
             || b[..n].starts_with(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C])
         {
             let source = supplied.clone();
-            let cache = supplied
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join("GameSearch Extracted");
+            let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../Build-Output/Windows Manager/local-import-cache");
             let kind = artifact_kind(&b[..n], &source.display().to_string(), "");
             let extracted = tokio::task::spawn_blocking(move || {
                 extract_any_archive(&source, &cache, kind, |_, _, _| {})
@@ -4281,67 +4987,34 @@ async fn scan_local_packages(path: String) -> Result<Vec<LocalPackage>, String> 
             .await
             .map_err(redact)??;
             return Ok(match extracted {
-                ExtractedContent::Pkgs(packages) => packages
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, p)| {
-                        let name = p
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned();
-                        let title_id = name
-                            .split(|c: char| !c.is_ascii_alphanumeric())
-                            .find(|x| title_id(&x.to_ascii_uppercase()))
-                            .map(|x| x.to_ascii_uppercase());
-                        let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                        LocalPackage {
-                            number: i + 1,
-                            path: p.display().to_string(),
-                            name,
-                            kind: "pkg".into(),
-                            size,
-                            title_id,
-                        }
-                    })
-                    .collect(),
-                ExtractedContent::Dump(root) => vec![LocalPackage {
-                    number: 1,
-                    path: root.display().to_string(),
-                    name: root
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
-                    kind: "dump".into(),
-                    size: 0,
-                    title_id: title_from_path(&root),
-                }],
+                ExtractedContent::Pkgs(packages) => tokio::task::spawn_blocking(move || {
+                    packages.iter().enumerate().map(|(i, pkg)| local_package_from_path(pkg, i + 1)).collect()
+                }).await.map_err(redact)?,
+                ExtractedContent::Dump(root) => {
+                    let name = root.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    vec![LocalPackage {
+                        number: 1,
+                        path: root.display().to_string(),
+                        name: name.clone(),
+                        file_name: name,
+                        kind: "dump".into(),
+                        size: 0,
+                        title_id: title_from_path(&root),
+                        package_kind: None,
+                        version: None,
+                        icon: None,
+                    }]
+                }
             });
         }
-        if !b[..n].starts_with(&[0x7f, 0x43, 0x4e, 0x54]) {
+        if !fpkg::package_magic(&b[..n]) {
             return Err("Selected file does not have PKG magic".into());
         }
-        let name = supplied
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        let title_id = name
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .find(|x| title_id(&x.to_ascii_uppercase()))
-            .map(|x| x.to_ascii_uppercase());
-        return Ok(vec![LocalPackage {
-            number: 1,
-            path,
-            name,
-            kind: "pkg".into(),
-            size,
-            title_id,
-        }]);
+        return tokio::task::spawn_blocking(move || vec![local_package_from_path(&supplied, 1)])
+            .await.map_err(redact);
     }
-    let mut out = vec![];
-    let mut q = vec![PathBuf::from(path)];
+    let mut packages = vec![];
+    let mut q = vec![supplied];
     while let Some(p) = q.pop() {
         let mut rd = fs::read_dir(&p).await.map_err(redact)?;
         while let Some(e) = rd.next_entry().await.map_err(redact)? {
@@ -4349,30 +5022,15 @@ async fn scan_local_packages(path: String) -> Result<Vec<LocalPackage>, String> 
             if p.is_dir() {
                 q.push(p)
             } else {
-                let (b, n, size) = file_header(&p).await?;
-                if b[..n].starts_with(&[0x7f, 0x43, 0x4e, 0x54]) {
-                    let name = p
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned();
-                    let id = name
-                        .split(|c: char| !c.is_ascii_alphanumeric())
-                        .find(|x| title_id(&x.to_ascii_uppercase()))
-                        .map(|x| x.to_ascii_uppercase());
-                    out.push(LocalPackage {
-                        number: out.len() + 1,
-                        path: p.display().to_string(),
-                        name,
-                        kind: "pkg".into(),
-                        size,
-                        title_id: id,
-                    })
+                let (b, n, _size) = file_header(&p).await?;
+                if fpkg::package_magic(&b[..n]) {
+                    packages.push(p)
                 }
             }
         }
     }
-    Ok(out)
+    tokio::task::spawn_blocking(move || packages.iter().enumerate().map(|(i, pkg)| local_package_from_path(pkg, i + 1)).collect())
+        .await.map_err(redact)
 }
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -4386,6 +5044,8 @@ struct ManualCandidate {
     title_id: Option<String>,
     size: u64,
     needs_title: bool,
+    version: String,
+    icon: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -4443,7 +5103,7 @@ fn classify_manual_file(path: &Path) -> Option<ManualCandidate> {
     let content = if lower.ends_with(".pkg") {
         // PKGs must carry real magic; anything else is junk with a pkg name.
         match read_magic_sync(path) {
-            Some(magic) if magic[..4] == [0x7f, 0x43, 0x4e, 0x54] => "pkg",
+            Some(magic) if fpkg::package_magic(&magic) => "pkg",
             _ => return None,
         }
     } else if lower.ends_with(".rar")
@@ -4455,13 +5115,18 @@ fn classify_manual_file(path: &Path) -> Option<ManualCandidate> {
     } else {
         return None;
     };
-    let title_id = manual_title_for(path);
+    let metadata = (content == "pkg").then(|| read_local_pkg_metadata(path)).flatten();
+    let title_id = metadata.as_ref().map(|meta| meta.title_id.clone()).or_else(|| manual_title_for(path));
+    let detected_kind = metadata.as_ref().and_then(|meta| meta.package_kind.as_deref()).unwrap_or_else(|| manual_kind_for_name(&name));
+    let display_name = metadata.as_ref().and_then(|meta| meta.title.clone()).unwrap_or_else(|| name.clone());
     Some(ManualCandidate {
         path: path.display().to_string(),
         size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
-        detected_kind: manual_kind_for_name(&name).into(),
+        detected_kind: detected_kind.into(),
         needs_title: false,
-        name,
+        version: metadata.as_ref().and_then(|meta| meta.version.clone()).unwrap_or_default(),
+        icon: metadata.and_then(|meta| meta.icon),
+        name: display_name,
         title_id,
         content: content.into(),
     })
@@ -4473,17 +5138,34 @@ fn is_loose_dump(root: &Path) -> bool {
     root.is_dir() && root.join("eboot.bin").is_file()
 }
 
+fn manual_metadata(root: &Path) -> (String, String, Option<String>) {
+    let param: Value = std::fs::read(root.join("sce_sys/param.json")).ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or(Value::Null);
+    let localized = &param["localizedParameters"];
+    let language = localized["defaultLanguage"].as_str().unwrap_or("en-US");
+    let name = localized[language]["titleName"].as_str().or_else(|| localized["en-US"]["titleName"].as_str())
+        .or_else(|| param["titleName"].as_str()).filter(|name| !name.trim().is_empty())
+        .map(str::to_owned).unwrap_or_else(|| root.file_name().unwrap_or_default().to_string_lossy().into_owned());
+    let version = param["contentVersion"].as_str().unwrap_or_default().to_owned();
+    let icon_path = root.join("sce_sys/icon0.png");
+    let icon = std::fs::metadata(&icon_path).ok().filter(|m| m.len() <= 1024 * 1024)
+        .and_then(|_| std::fs::read(icon_path).ok()).map(|bytes| format!("data:image/png;base64,{}", BASE64.encode(bytes)));
+    (name, version, icon)
+}
+
 fn manual_dump(root: &Path) -> ManualCandidate {
     let name = root
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("dump")
         .to_owned();
+    let detected_kind = manual_kind_for_name(&name).into();
+    let (name, version, icon) = manual_metadata(root);
     let title_id = dump_title_id(root).or_else(|| manual_title_for(root));
     ManualCandidate {
         path: root.display().to_string(),
         size: dir_bytes(root),
-        detected_kind: manual_kind_for_name(&name).into(),
+        detected_kind, version, icon,
         needs_title: title_id.is_none(),
         name,
         title_id,
@@ -4492,7 +5174,11 @@ fn manual_dump(root: &Path) -> ManualCandidate {
 }
 
 #[tauri::command]
-fn scan_manual_folder(path: String) -> Result<Vec<ManualCandidate>, String> {
+async fn scan_manual_folder(path: String) -> Result<Vec<ManualCandidate>, String> {
+    tokio::task::spawn_blocking(move || scan_manual_folder_sync(path)).await.map_err(redact)?
+}
+
+fn scan_manual_folder_sync(path: String) -> Result<Vec<ManualCandidate>, String> {
     let root = PathBuf::from(&path);
     if !root.exists() {
         return Err("Folder does not exist".into());
@@ -4502,7 +5188,7 @@ fn scan_manual_folder(path: String) -> Result<Vec<ManualCandidate>, String> {
         if let Some(candidate) = classify_manual_file(&root) {
             out.push(candidate);
         }
-    } else if is_game_dump(&root) || is_loose_dump(&root) {
+    } else if is_game_dump(&root) || is_loose_dump(&root) || is_doctor_dump(&root) {
         out.push(manual_dump(&root));
     } else {
         let mut stack = vec![root.clone()];
@@ -4514,7 +5200,7 @@ fn scan_manual_folder(path: String) -> Result<Vec<ManualCandidate>, String> {
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.is_dir() {
-                    if is_game_dump(&p) || is_loose_dump(&p) {
+                    if is_game_dump(&p) || is_loose_dump(&p) || is_doctor_dump(&p) {
                         out.push(manual_dump(&p));
                     } else {
                         stack.push(p);
@@ -4556,233 +5242,25 @@ fn scan_manual_folder(path: String) -> Result<Vec<ManualCandidate>, String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn install_manual_item(
-    app: &AppHandle,
-    s: &Settings,
-    item_path: &Path,
-    kind: &str,
-    title: Option<&str>,
-    tag: &str,
-    job: &str,
-    job_title: &str,
-    icon: &Option<String>,
-    rx: &mut watch::Receiver<bool>,
-    announce_complete: bool,
-) -> Result<(), String> {
-    if item_path.is_dir() {
-        return upload_dump(app, s, item_path, job, title, kind, rx).await;
-    }
-    let name = item_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
-    let header = read_magic_sync(item_path).unwrap_or([0; 8]);
-    let detected = artifact_kind(&header, &name, "");
-    if detected == ArtifactKind::Pkg {
-        return upload(
-            app, s, item_path, job, title, rx,
-            &format!("{tag} ({name})"), announce_complete, 0, 0,
-        )
-        .await;
-    }
-    if !matches!(
-        detected,
-        ArtifactKind::Rar | ArtifactKind::SevenZ | ArtifactKind::Zip
-    ) {
-        return Err(format!("{name} is not a PKG, dump, or supported archive"));
-    }
-    let cache = PathBuf::from(&s.download_dir).join("manual-extract");
-    let app_extract = app.clone();
-    let job_extract = job.to_string();
-    let extract_title = job_title.to_owned();
-    let extract_icon = icon.clone();
-    let extract_tag = tag.to_owned();
-    let extracted = tokio::task::spawn_blocking({
-        let source = item_path.to_path_buf();
-        let cache = cache.clone();
-        move || {
-            extract_any_archive(&source, &cache, detected, move |done, total, speed| {
-                emit(
-                    &app_extract,
-                    Progress {
-                        job_id: job_extract.clone(),
-                        stage: "extracting".into(),
-                        progress: if total > 0 {
-                            (done as f64 / total as f64).min(0.99)
-                        } else {
-                            0.
-                        },
-                        bytes_done: done,
-                        bytes_total: total,
-                        speed_bps: speed,
-                        eta_seconds: (total > done && speed > 1.)
-                            .then(|| ((total - done) as f64 / speed) as u64),
-                        message: format!("{extract_tag}: extracting {name}"),
-                        title: extract_title.clone(),
-                        icon: extract_icon.clone(),
-                        ..Default::default()
-                    },
-                );
-            })
-        }
-    })
-    .await
-    .map_err(redact)??;
-    match extracted {
-        ExtractedContent::Pkgs(packages) => {
-            let count = packages.len();
-            for (index, package) in packages.iter().enumerate() {
-                let role = pkg_role_label(package);
-                let pkg_name = package
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy();
-                let id = title_from_path(package).or_else(|| title.map(str::to_string));
-                upload(
-                    app, s, package, job, id.as_deref(), rx,
-                    &format!("{tag} · {}/{} {role} ({pkg_name})", index + 1, count),
-                    announce_complete && index + 1 == count,
-                    0, 0,
-                )
-                .await?;
-            }
-            Ok(())
-        }
-        ExtractedContent::Dump(root) => {
-            let dump_id = title
-                .map(str::to_string)
-                .or_else(|| title_from_path(&root));
-            upload_dump(app, s, &root, job, dump_id.as_deref(), kind, rx).await
-        }
-    }
-}
-
 #[tauri::command]
 async fn start_manual_install(
     app: AppHandle,
     state: State<'_, AppState>,
     items: Vec<ManualItem>,
+    package_only: Option<bool>,
+    target: Option<String>,
 ) -> Result<String, String> {
-    if items.is_empty() {
-        return Err("Nothing to install".into());
-    }
-    struct Job {
-        path: PathBuf,
-        kind: String,
-        title: Option<String>,
-        name: String,
-    }
-    let mut queue = Vec::new();
+    if items.is_empty() { return Err("Nothing to install".into()); }
     for item in &items {
-        let kind = item.kind.to_ascii_lowercase();
-        if !matches!(kind.as_str(), "base" | "update" | "dlc" | "backport") {
-            return Err(format!("Unknown kind for {}", item.path));
-        }
-        let path = PathBuf::from(&item.path);
-        if !path.exists() {
-            return Err(format!("Missing: {}", item.path));
-        }
-        let title = item
-            .title_id
-            .clone()
-            .map(|t| t.to_ascii_uppercase())
-            .filter(|t| title_id(t));
-        if path.is_dir() && (is_game_dump(&path) || is_loose_dump(&path)) && title.is_none() {
-            return Err(format!(
-                "{} is a game dump and needs a CUSA/PPSA title ID",
-                item.path
-            ));
-        }
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        queue.push(Job { path, kind, title, name });
+        if !matches!(item.kind.as_str(), "base" | "update" | "dlc" | "backport") { return Err("Unknown package kind".into()); }
+        if !Path::new(&item.path).exists() { return Err(format!("Missing local item: {}", item.path)); }
     }
-    let s = state.settings.lock().unwrap().clone();
-    validate_receiver_candidate(&s.ps5_host, s.ps5_port).map_err(|_| {
-        "PS5 receiver is not configured. Open Settings or download the receiver ELF.".to_string()
-    })?;
-    ping(&s)
-        .await
-        .map_err(|error| format!("PS5 receiver is not ready: {error}"))?;
-    let job = Uuid::new_v4().to_string();
-    let (tx, mut rx) = watch::channel(false);
-    state.cancel.lock().unwrap().insert(job.clone(), tx);
-    let job_title = if queue.len() == 1 {
-        queue[0].name.clone()
-    } else {
-        format!("Manual install ({} items)", queue.len())
-    };
-    let app2 = app.clone();
-    let job2 = job.clone();
-    tauri::async_runtime::spawn(async move {
-        emit(
-            &app2,
-            Progress {
-                job_id: job2.clone(),
-                stage: "queued".into(),
-                progress: 0.,
-                bytes_done: 0,
-                bytes_total: 0,
-                speed_bps: 0.,
-                eta_seconds: None,
-                message: format!("Manual install: {} item(s)", queue.len()),
-                title: job_title.clone(),
-                icon: None,
-                title_id: if queue.len() == 1 { queue[0].title.clone().unwrap_or_default() } else { String::new() },
-                package_kind: if queue.len() == 1 { queue[0].kind.clone() } else { "batch".into() },
-                package_label: job_title.clone(),
-                ..Default::default()
-            },
-        );
-        let total = queue.len();
-        let mut res: Result<(), String> = Ok(());
-        for (index, item) in queue.iter().enumerate() {
-            if *rx.borrow() {
-                res = Err("cancelled".into());
-                break;
-            }
-            let tag = format!("Manual {}/{} {} ({})", index + 1, total, item.kind, item.name);
-            res = install_manual_item(
-                &app2,
-                &s,
-                &item.path,
-                &item.kind,
-                item.title.as_deref(),
-                &tag,
-                &job2,
-                &job_title,
-                &None,
-                &mut rx,
-                index + 1 == total,
-            )
-            .await;
-            if res.is_err() {
-                break;
-            }
-        }
-        if let Err(e) = res {
-            let stage = job_error_stage(&e);
-            emit(
-                &app2,
-                Progress {
-                    job_id: job2,
-                    stage: stage.into(),
-                    progress: if stage == "monitoring-ended" { 0.95 } else { 0. },
-                    bytes_done: 0,
-                    bytes_total: 0,
-                    speed_bps: 0.,
-                    eta_seconds: None,
-                    message: redact(e),
-                    ..Default::default()
-                },
-            )
-        }
-    });
-    Ok(job)
+    let mut first = None;
+    for item in items {
+        let id = job_store::queue_local(app.clone(), &state, PathBuf::from(item.path), Some(item.kind), item.title_id, package_only.unwrap_or(false), target.clone()).await?;
+        first.get_or_insert(id);
+    }
+    first.ok_or_else(|| "Nothing was queued".into())
 }
 
 #[tauri::command]
@@ -4790,71 +5268,10 @@ async fn start_local_install(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
+    target: Option<String>,
 ) -> Result<String, String> {
-    let s = state.settings.lock().unwrap().clone();
-    validate_receiver_candidate(&s.ps5_host, s.ps5_port).map_err(|_| {
-        "PS5 receiver is not configured. Open Settings or download the receiver ELF.".to_string()
-    })?;
-    ping(&s)
-        .await
-        .map_err(|error| format!("PS5 receiver is not ready: {error}"))?;
-    let source = PathBuf::from(&path);
-    if !source.is_file() {
-        return Err("Local install requires a regular PKG file".into());
-    }
-    let (header, read, size) = file_header(&source).await?;
-    if size < 4 || !header[..read].starts_with(&[0x7f, 0x43, 0x4e, 0x54]) {
-        return Err("Local file does not have PKG magic".into());
-    }
-    let job = Uuid::new_v4().to_string();
-    let (tx, mut rx) = watch::channel(false);
-    state.cancel.lock().unwrap().insert(job.clone(), tx);
-    let a = app.clone();
-    let j = job.clone();
-    let local_id = pkg_content_id(&source)
-        .and_then(|id| id.split(|c: char| !c.is_ascii_alphanumeric()).find(|part| title_id(part)).map(str::to_string))
-        .or_else(|| title_from_path(&source)).unwrap_or_default();
-    emit(&app, Progress {
-        job_id: job.clone(), stage: "queued".into(),
-        title: source.file_stem().unwrap_or_default().to_string_lossy().into_owned(),
-        title_id: local_id, package_kind: pkg_role_label(&source).to_ascii_lowercase(),
-        package_label: source.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-        message: "Waiting to upload".into(), ..Default::default()
-    });
-    tauri::async_runtime::spawn(async move {
-        if let Err(e) = upload(
-            &a,
-            &s,
-            Path::new(&path),
-            &j,
-            title_from_path(Path::new(&path)).as_deref(),
-            &mut rx,
-            "PKG",
-            true,
-            0,
-            0,
-        )
-        .await
-        {
-            let stage = job_error_stage(&e);
-            emit(
-                &a,
-                Progress {
-                    job_id: j,
-                    stage: stage.into(),
-                    // F6: uncertain is never 100 % — 100 % means confirmed.
-                    progress: if stage == "monitoring-ended" { 0.95 } else { 0. },
-                    bytes_done: 0,
-                    bytes_total: 0,
-                    speed_bps: 0.,
-                    eta_seconds: None,
-                    message: redact(e),
-                    ..Default::default()
-                },
-            )
-        }
-    });
-    Ok(job)
+    let source = PathBuf::from(path);
+    job_store::queue_local(app.clone(), &state, source, None, None, false, target).await
 }
 
 pub fn run() {
@@ -4863,14 +5280,23 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             if let Err(error) = package_sources::migrate_bundled(&handle) { eprintln!("Source migration: {error}"); }
-            let settings = std::fs::read(config_path(&handle)?)
+            let launch_args: Vec<String> = std::env::args().collect();
+            for pair in launch_args.windows(2).filter(|pair| pair[0] == "--import-source") {
+                package_sources::install_from_path(&handle, &pair[1]).map_err(std::io::Error::other)?;
+                if let Ok(root) = cache_root(&handle) { let _ = std::fs::remove_file(root.join("catalog-v4.json")); }
+            }
+            let settings: Settings = std::fs::read(config_path(&handle)?)
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or_default();
+            let mut retry = job_store::Store::load(handle.path().app_config_dir()?.join("jobs"));
+            job_store::recover_legacy(&mut retry, Path::new(&settings.download_dir));
+            let restored_jobs = retry.records.iter().filter(|(_, r)| !r.progress.removed).map(|(id, r)| (id.clone(), r.progress.clone())).collect();
             app.manage(AppState {
                 settings: Arc::new(Mutex::new(settings)),
                 cancel: Arc::new(Mutex::new(HashMap::new())),
-                jobs: Arc::new(Mutex::new(HashMap::new())),
+                jobs: Arc::new(Mutex::new(restored_jobs)),
+                retry: Arc::new(Mutex::new(retry)),
                 resolving: Arc::new(AsyncMutex::new(HashMap::new())),
                 http: Client::builder()
                     .user_agent("GameSearch/0.1")
@@ -4883,6 +5309,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
+            inspect_package_dump,
             export_receiver_payload,
             list_package_sources,
             install_package_source,
@@ -4890,14 +5317,27 @@ pub fn run() {
             set_package_source_enabled,
             remove_package_source,
             test_ps5,
+            test_ps4,
+            ps4_receiver::test_ps4_receiver,
+            ps4_receiver::list_ps4_library,
+            ps4_receiver::load_ps4_receiver,
+            ps4_receiver::export_ps4_receiver_payload,
+            set_active_console,
             test_resolver,
             verify_real_debrid,
+            verify_provider,
+            get_provider_hosts,
             search_games,
             load_catalog,
             fetch_cover,
             get_game_details,
             resolve_packages,
             start_delivery,
+            job_store::retry_job,
+            job_store::remove_job,
+            package_details::inspect_package_sizes,
+            package_details::refresh_job_details,
+            storage::delivery_space,
             list_jobs,
             system_drive_prefix,
             cancel_job,
@@ -4981,7 +5421,7 @@ mod tests {
                 stream.write_all(body).await.unwrap();
             });
             let settings = Settings { ps5_host: "127.0.0.1".into(), ps5_port: port, ..Settings::default() };
-            verify_uploaded_file(&settings, "/data/homebrew/PPSA31246/data.bin", 4096).await.unwrap();
+            verify_uploaded_file(&ReceiverEndpoint::ps5(&settings), "/data/homebrew/PPSA31246/data.bin", 4096).await.unwrap();
             server.await.unwrap();
         });
     }
@@ -5006,7 +5446,7 @@ mod tests {
     #[test]
     fn manual_loose_dump_detected() {
         // Backport layout: eboot.bin + fakelib, no sce_sys.
-        let base = std::env::temp_dir().join(format!("gs-manual-test-{}", std::process::id()));
+        let base = test_output_root().join(format!("gs-manual-test-{}", std::process::id()));
         let root = base.join("RE9-BESTPIG-PPSA31246");
         std::fs::create_dir_all(root.join("fakelib")).unwrap();
         std::fs::write(root.join("eboot.bin"), b"fake").unwrap();
@@ -5017,6 +5457,20 @@ mod tests {
         assert_eq!(candidate.title_id.as_deref(), Some("PPSA31246"));
         assert!(!candidate.needs_title);
         std::fs::remove_dir_all(&base).ok();
+    }
+    #[test]
+    fn missing_eboot_with_known_backup_reaches_doctor_but_cannot_upload_as_folder() {
+        let root = test_output_root().join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(root.join("sce_sys")).unwrap();
+        std::fs::create_dir_all(root.join("decrypted")).unwrap();
+        std::fs::write(root.join("sce_sys/param.json"), br#"{"titleId":"PPSA99999"}"#).unwrap();
+        assert!(!is_doctor_dump(&root));
+        std::fs::write(root.join("decrypted/eboot.bin.esbak"), b"candidate; doctor still validates its bytes").unwrap();
+        assert!(is_doctor_dump(&root));
+        assert_eq!(find_dump_root(&root).unwrap(), root);
+        assert!(validate_mountable_dump(&root).is_err());
+        assert_eq!(manual_dump(&root).content, "dump");
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn manual_kind_guessing() {
@@ -5035,14 +5489,14 @@ mod tests {
             .components()
             .all(|c| !matches!(c, std::path::Component::ParentDir)));
         assert_eq!(
-            remote(Some("CUSA12345")).starts_with("/user/data/tmp/upload_CUSA12345_"),
+            remote(&ReceiverEndpoint::ps5(&Settings::default()), Some("CUSA12345")).starts_with("/user/data/tmp/upload_CUSA12345_"),
             true
         );
         assert_eq!(
             title_from_path(Path::new("Some Game CUSA54321 v1.00.pkg")).as_deref(),
             Some("CUSA54321")
         );
-        assert!(remote(Some("PPSA12345")).contains("upload_PPSA12345_"));
+        assert!(remote(&ReceiverEndpoint::ps5(&Settings::default()), Some("PPSA12345")).contains("upload_PPSA12345_"));
     }
     #[test]
     fn protocol_classification_and_ranges() {
@@ -5129,6 +5583,17 @@ mod tests {
             .collect();
         assert_eq!(x, vec![(0, 25), (25, 25), (50, 25), (75, 25)]);
     }
+    #[test]
+    fn cleanup_requires_confirmed_installation() {
+        for code in ["api_code", "status_api_code", "auth_restore_code"] {
+            let mut value = json!({"state":"complete", "status":"installed", "progress":100});
+            value[code] = json!(-7);
+            assert!(matches!(install_decision(&value).unwrap(), InstallDecision::Installing { .. }));
+        }
+        assert!(matches!(install_decision(&json!({"state":"complete", "status":"playable", "progress":20})).unwrap(), InstallDecision::Installing { .. }));
+        assert!(install_decision(&json!({"state":"complete", "status":"installed", "error_code":-7})).is_err());
+    }
+
     #[test]
     fn magic_and_redaction() {
         assert!([0x7f, 0x43, 0x4e, 0x54].starts_with(&[0x7f, 0x43, 0x4e, 0x54]));
@@ -5225,7 +5690,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             use tokio::io::AsyncWriteExt;
-            let path = std::env::temp_dir().join(format!("{}.pkg", Uuid::new_v4()));
+            let path = test_output_root().join(format!("{}.pkg", Uuid::new_v4()));
             let mut file = fs::File::create(&path).await.unwrap();
             file.write_all(&[0x7f, 0x43, 0x4e, 0x54]).await.unwrap();
             file.write_all(&vec![0xAA; 1024 * 1024]).await.unwrap();
@@ -5239,7 +5704,7 @@ mod tests {
     }
     pub(crate) fn make_zip(entries: Vec<(&str, Vec<u8>)>) -> (PathBuf, PathBuf) {
         use std::io::Write;
-        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let root = test_output_root().join(Uuid::new_v4().to_string());
         std::fs::create_dir_all(&root).unwrap();
         let source = root.join("input.zip");
         let file = std::fs::File::create(&source).unwrap();
@@ -5258,6 +5723,13 @@ mod tests {
         assert!(retryable_upload_error("Connection reset by peer"));
         assert!(!retryable_upload_error("preallocate failed (console storage full?)"));
         assert!(!retryable_upload_error("cancelled"));
+    }
+
+    #[test]
+    fn resumed_download_checks_the_returned_offset() {
+        assert!(validate_download_range(100, "bytes 100-199/200").is_ok());
+        assert!(validate_download_range(100, "bytes 0-99/200").is_err());
+        assert!(validate_download_range(100, "").is_err());
     }
     #[test]
     fn console_deliveries_wait_and_can_be_cancelled() {
@@ -5312,7 +5784,7 @@ mod tests {
             shadowmount_dir(Some("PPSA31246"), "backport").unwrap(),
             "/data/homebrew/backports/PPSA31246"
         );
-        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let root = test_output_root().join(Uuid::new_v4().to_string());
         std::fs::create_dir_all(root.join("sce_sys")).unwrap();
         std::fs::write(root.join("eboot.bin"), [1]).unwrap();
         std::fs::write(root.join("sce_sys").join("param.json"), "{}").unwrap();
@@ -5321,5 +5793,56 @@ mod tests {
         let files = dump_files(&root).unwrap();
         assert!(files.iter().any(|(_, relative)| relative == "eboot.bin"));
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+fn pkg_server_test_port() -> u16 {
+    // A process-wide server must outlive each individual #[tokio::test] runtime.
+    static SERVER: std::sync::OnceLock<(tokio::runtime::Runtime, u16)> = std::sync::OnceLock::new();
+    SERVER.get_or_init(|| std::thread::spawn(|| {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port(); drop(listener);
+        runtime.block_on(pkg_server::ensure_started(port)).unwrap();
+        (runtime, port)
+    }).join().unwrap()).1
+}
+
+#[cfg(test)]
+fn test_output_root() -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../Build-Output/Windows Manager/host-test-work");
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+#[cfg(test)]
+mod local_pkg_metadata_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires SSPI_TEST_LOCAL_PKG pointing at a valid local PKG"]
+    fn real_pkg_metadata_reaches_manual_candidate_and_job_seed() {
+        let path = PathBuf::from(std::env::var("SSPI_TEST_LOCAL_PKG").expect("SSPI_TEST_LOCAL_PKG"));
+        let metadata = read_local_pkg_metadata(&path).expect("PKG metadata should validate");
+        let title = metadata.title.clone().filter(|value| !value.trim().is_empty()).expect("SFO title");
+        let version = metadata.version.clone().filter(|value| !value.trim().is_empty()).expect("APP_VER");
+        let icon = metadata.icon.clone().expect("validated PKG icon");
+        assert!(metadata.title_id.starts_with("CUSA") || metadata.title_id.starts_with("PPSA"));
+        assert!(icon.starts_with("data:image/png;base64,"));
+
+        let manual = classify_manual_file(&path).expect("manual PKG candidate");
+        assert_eq!(manual.name, title);
+        assert_eq!(manual.title_id.as_deref(), Some(metadata.title_id.as_str()));
+        assert_eq!(manual.version, version);
+        assert_eq!(manual.icon.as_deref(), Some(icon.as_str()));
+
+        let job = local_job_seed(&path, Some(metadata), None, None);
+        assert_eq!(job.name, manual.name);
+        assert_eq!(job.title_id, manual.title_id);
+        assert_eq!(job.version, manual.version);
+        assert_eq!(job.icon, manual.icon);
+        assert_eq!(job.package_kind, manual.detected_kind);
+        assert!(job.local_pkg);
     }
 }

@@ -1,1 +1,19 @@
-{"identifier":"default","description":"Desktop package selection","windows":["main"],"permissions":["core:default","dialog:default","core:window:allow-close","core:window:allow-minimize","core:window:allow-toggle-maximize","core:window:allow-is-maximized","core:window:allow-start-dragging"]}
+{
+  "identifier": "default",
+  "description": "Desktop package selection",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-is-maximized",
+    "core:window:allow-start-dragging",
+    "core:menu:allow-new",
+    "core:menu:allow-popup",
+    "core:resources:allow-close"
+  ]
+}

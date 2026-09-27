@@ -1,6 +1,6 @@
 [package]
 name = "game-search"
-version = "0.2.2"
+version = "2.20.3"
 edition = "2021"
 
 [lib]
@@ -15,10 +15,12 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["net", "io-util", "time", "fs", "sync", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["net", "io-util", "time", "fs", "sync", "rt-multi-thread", "macros", "process"] }
+suppaftp = { version = "12", default-features = false, features = ["tokio"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures-util = "0.3"
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 keyring = { version = "3", features = ["windows-native"] }
 uuid = { version = "1", features = ["v4"] }
 url = "2"
@@ -28,3 +30,5 @@ regex = "1"
 scraper = "0.21"
 strsim = "0.11"
 unrar = "0.5"
+
+unrar_sys = "=0.5.8"

@@ -12,6 +12,16 @@ See `docs/PKG_PROVENANCE.json` for the machine-readable inventory and hashes.
 
 ## Reviewed components
 
+### suppaftp — Rust FTP client
+
+- Version: 12.1.0, pinned in `app/src-tauri/Cargo.lock`.
+- Source: https://github.com/veeso/suppaftp (crates.io package `suppaftp`).
+- Author: Christian Visintin, as stated in the crate metadata.
+- License: MIT OR Apache-2.0, verified from the crate metadata and README.
+  Upstream license texts: `LICENSE-MIT` and `LICENSE-APACHE` in the source repository.
+- Used by Windows Manager for plain passive FTP with the `tokio` feature; TLS features are disabled.
+- Preserve the applicable license and copyright notices in binary distributions.
+
 ### SDL2# / SDL2-CS — notice present, binary origin incomplete
 
 - Observed files: `SDL2-CS.dll` and source under
@@ -93,6 +103,57 @@ tools and are not copied into the PKG by `build-sdl.ps1`. They are nevertheless
 present in the repository. Their redistribution status was not established in
 this pass. Status: `BLOCKED` for inclusion in a public source archive; omit them
 or add verified provenance and notices.
+
+### OpenOrbis PS4 Toolchain — PS4 receiver build input
+
+- Local input: `SDK/openorbis-sdk/PS4Toolchain/` (not published in this repository).
+- Source: https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.
+- License: GPL-3.0, as stated in the local toolchain `LICENSE`.
+- Used to compile and link the standalone `sspi_ps4_receiver.elf` payload,
+  including the toolchain headers, startup object and C runtime.
+- Preserve the applicable license notices and satisfy the source obligations
+  for the components included in any distributed payload.
+
+### ps4-libjbc — PS4 receiver credential support, terms unconfirmed
+
+- Local input: `SDK/ps4-libjbc/` (not published in this repository).
+- Its C sources are compiled into the PS4 receiver for the startup credential
+  probe and conditional jailbreak operation. Generated build copies adapt GNU
+  assembly spelling and give its raw open/close syscalls private symbol names.
+- No license file is present in the local copy. No redistribution permission
+  is inferred from its availability or its use by another local product.
+- Status: `BLOCKED` for publication until the upstream revision, license terms,
+  and redistribution obligations have been confirmed.
+
+### image — Rust artwork decoding and normalization
+
+- Version: 0.25.10, pinned in `app/src-tauri/Cargo.lock`.
+- Source: https://github.com/image-rs/image (crates.io package `image`).
+- License: MIT OR Apache-2.0. Upstream license texts are `LICENSE-MIT`
+  and `LICENSE-APACHE` in the source repository.
+- Windows Manager enables PNG, JPEG and WebP decoders only to normalize
+  game artwork for PS4 notifications.
+- Preserve the applicable license and copyright notices in binary distributions.
+
+### three.js — interface rendering
+
+- Version: 0.170.0, pinned in `app/package-lock.json`.
+- Source: https://github.com/mrdoob/three.js (npm package `three`).
+- Copyright © 2010-2024 three.js authors. License: MIT, verified from the
+  package's `LICENSE` file.
+- Windows Manager 2.20 uses it for the backdrop, the 3D game cases and install
+  animations. It is bundled into the frontend build.
+- Preserve the MIT copyright and permission notice in binary distributions.
+
+### Geist — interface typeface
+
+- Version: 5.3.0 of `@fontsource-variable/geist`, pinned in `app/package-lock.json`.
+- Source: https://github.com/vercel/geist-font, packaged by Fontsource.
+- Copyright 2024 The Geist Project Authors. License: SIL Open Font License 1.1,
+  verified from the package's `LICENSE` file.
+- The variable font files are bundled into the frontend build. The OFL allows
+  bundling with software; the font may not be sold on its own, and the license
+  text must accompany redistributed copies.
 
 ## Release rule
 

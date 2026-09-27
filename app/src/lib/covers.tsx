@@ -7,6 +7,19 @@ import ps5Case from "@/assets/PS5.png"
 
 const coverCache = new Map<string, Promise<string>>()
 const plainCache = new Map<string, Promise<string>>()
+const renderedCasePrefix = "data:image/png;sspi-case=1;base64,"
+
+export function isRenderedCase(source: string) {
+  if (source.startsWith(renderedCasePrefix)) return true
+  // Older saved transfers contain unmarked 240 x 304 notification cases.
+  const prefix = "data:image/png;base64,"
+  if (!source.startsWith(prefix)) return false
+  try {
+    const header = atob(source.slice(prefix.length, prefix.length + 44))
+    const u32 = (offset: number) => ((header.charCodeAt(offset) << 24) | (header.charCodeAt(offset + 1) << 16) | (header.charCodeAt(offset + 2) << 8) | header.charCodeAt(offset + 3)) >>> 0
+    return header.startsWith("\x89PNG\r\n\x1a\n") && u32(16) === 240 && u32(20) === 304
+  } catch { return false }
+}
 
 const isCaseBlue = (r: number, g: number, b: number) => b > 90 && b > r + 25 && b > g + 15 && r < 140
 const isCaseWhite = (r: number, g: number, b: number) => {
@@ -33,7 +46,7 @@ function chromeRatio(data: Uint8ClampedArray, w: number, h: number, axis: "row" 
   return n ? chrome / n : 0
 }
 
-function cropBoxedCover(dataUrl: string) {
+export function cropBoxedCover(dataUrl: string) {
   const existing = plainCache.get(dataUrl)
   if (existing) return existing
   const request = new Promise<string>((resolve) => {
@@ -92,7 +105,7 @@ function cropBoxedCover(dataUrl: string) {
   return request
 }
 
-const fallbackArt = (title: string) => {
+export const fallbackArt = (title: string) => {
   const initials = title
     .split(/\s+/)
     .filter(Boolean)
@@ -102,7 +115,7 @@ const fallbackArt = (title: string) => {
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="600" height="850"><defs><linearGradient id="g" x2="1" y2="1"><stop stop-color="#111"/><stop offset="1" stop-color="#333"/></linearGradient></defs><rect width="600" height="850" fill="url(#g)"/><circle cx="470" cy="190" r="220" fill="#fff" fill-opacity=".08"/><path d="M40 600L560 180M40 700L560 280" stroke="#fff" stroke-opacity=".1" stroke-width="6"/><text x="300" y="455" text-anchor="middle" fill="#fff" font-family="Arial" font-size="128" font-weight="700">${initials}</text><text x="300" y="760" text-anchor="middle" fill="#fff" fill-opacity=".65" font-family="Arial" font-size="20" letter-spacing="6">GAME SEARCH</text></svg>`)}`
 }
 
-const resolveCover = (source?: string) => {
+export const resolveCover = (source?: string) => {
   if (!source) return Promise.reject(new Error("No cover"))
   if (source.startsWith("data:")) return Promise.resolve(source)
   const existing = coverCache.get(source)
@@ -141,21 +154,45 @@ export function platformOf(titleId?: string) {
   return "ps5" as const
 }
 
+export async function notificationCase(source: string | undefined, titleId: string): Promise<string | undefined> {
+  if (!source) return undefined
+  try {
+    const load = (url: string) => new Promise<HTMLImageElement>((resolve, reject) => {
+      const img = new Image(); img.onload = () => resolve(img); img.onerror = reject; img.src = url
+    })
+    const resolved = await resolveCover(source)
+    if (isRenderedCase(resolved)) return resolved
+    const plain = await cropBoxedCover(resolved)
+    const ps4 = platformOf(titleId) === "ps4"
+    const [art, shell] = await Promise.all([load(plain), load(ps4 ? ps4Case : ps5Case)])
+    const canvas = document.createElement("canvas"); canvas.width = 240; canvas.height = 304
+    const ctx = canvas.getContext("2d"); if (!ctx) return source
+    const x = 240 * .0215, y = 304 * (ps4 ? .145 : .1485), width = 240 * .9355, height = 304 - y - 304 * .037
+    const scale = Math.max(width / art.naturalWidth, height / art.naturalHeight)
+    ctx.drawImage(art, (art.naturalWidth - width / scale) / 2, (art.naturalHeight - height / scale) / 2, width / scale, height / scale, x, y, width, height)
+    ctx.drawImage(shell, 0, 0, 240, 304)
+    return canvas.toDataURL("image/png").replace("data:image/png;base64,", renderedCasePrefix)
+  } catch { return source }
+}
+
 export function CaseCover({ source, title, titleId, className }: { source?: string; title: string; titleId?: string; className?: string }) {
   const fetched = useCoverSource(source, title)
   const [art, setArt] = useState(fetched)
+  const rendered = isRenderedCase(fetched)
   useEffect(() => {
     let live = true
     setArt(fetched)
+    if (rendered) return () => { live = false }
     void cropBoxedCover(fetched).then((value) => {
       if (live) setArt(value)
     })
     return () => {
       live = false
     }
-  }, [fetched])
+  }, [fetched, rendered])
   const ps4 = platformOf(titleId) === "ps4"
   const shell = ps4 ? ps4Case : ps5Case
+  if (rendered) return <img src={fetched} alt={`${title} cover`} className={cn("case-shell", className)} draggable={false} />
   return (
     <>
       <div className="case-window" style={{ inset: ps4 ? "14.5% 4.3% 3.7% 2.15%" : "14.85% 4.3% 3.7% 2.15%" }}>

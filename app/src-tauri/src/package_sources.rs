@@ -1,4 +1,5 @@
 mod local_recipe;
+use crate::static_catalog;
 use local_recipe::{scoped_titles, scoped_packages, source_link, utf8_window};
 use regex::Regex;
 use reqwest::{redirect, Client};
@@ -17,10 +18,13 @@ use tauri::{AppHandle, Manager};
 use url::Url;
 use zip::ZipArchive;
 
-const MAX_ARCHIVE: usize = 4 * 1024 * 1024;
-const MAX_EXPANDED: u64 = 16 * 1024 * 1024;
+// Static catalogs (DLPS PS4 Static and friends) ship a full sharded catalog
+// inside the .gssource; they are read, not executed, and are verified file by
+// file at install time.
+const MAX_ARCHIVE: usize = 8 * 1024 * 1024;
+const MAX_EXPANDED: u64 = 64 * 1024 * 1024;
 const MAX_ENTRY: u64 = 4 * 1024 * 1024;
-const MAX_ENTRIES: usize = 64;
+const MAX_ENTRIES: usize = 256;
 const MAX_RESPONSE: usize = 2 * 1024 * 1024;
 const MAX_REQUESTS: usize = 32;
 const MAX_ITEMS: usize = 128;
@@ -351,7 +355,7 @@ fn validate_descriptor(descriptor: &Descriptor) -> Result<(), String> {
     }
     if !matches!(
         descriptor.engine.engine_type.as_str(),
-        "recipe-v1" | "recipe-v2" | "remote-api-v1"
+        "recipe-v1" | "recipe-v2" | "remote-api-v1" | "embedded-catalog-v1"
     ) {
         return Err("Package Source engine is unsupported".into());
     }
@@ -373,6 +377,15 @@ fn validate_descriptor(descriptor: &Descriptor) -> Result<(), String> {
                 &descriptor.maximum_api_version
             }
         ));
+    }
+    if descriptor.engine.engine_type == "embedded-catalog-v1" {
+        // Static catalogs are data-only: no search-time network origins.
+        // Package downloads go through the normal hoster/resolver pipeline.
+        let entry = descriptor.engine.entry.trim();
+        if entry.is_empty() || !entry.ends_with(".json") || !safe_archive_path(entry) {
+            return Err("Static catalog entry file is invalid".into());
+        }
+        return Ok(());
     }
     let network = origins(descriptor);
     if network.is_empty() || network.iter().any(|value| parse_origin(value).is_none()) {
@@ -426,11 +439,19 @@ fn version_cmp(left: &str, right: &str) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
+fn catalog_name(id: &str, name: &str) -> String {
+    let value = format!("{id} {name}").to_ascii_lowercase();
+    if value.contains("ps4") { "Global PS4".into() }
+    else if value.contains("ps5") { "Global PS5".into() }
+    else if value.contains("dlps") { "Global Catalog".into() }
+    else { name.into() }
+}
+
 fn summary(entry: &RegistryEntry) -> SourceSummary {
     SourceSummary {
         id: entry.id.clone(),
-        name: entry.name.clone(),
-        description: entry.description.clone(),
+        name: catalog_name(&entry.id, &entry.name),
+        description: if entry.engine_type == "embedded-catalog-v1" { "Global game catalog. Downloads use your connected services.".into() } else { entry.description.replace("DLPS", "Global").replace("dlps", "Global") },
         version: entry.version.clone(),
         engine_type: entry.engine_type.clone(),
         enabled: entry.enabled,
@@ -630,9 +651,20 @@ fn install_archive(
         fs::remove_dir_all(&staging).map_err(|error| error.to_string())?;
         return Err("Package Source destination already exists".into());
     }
+    if descriptor.engine.engine_type == "embedded-catalog-v1" {
+        // Data-only catalogs: every shard must match its declaration before
+        // the source becomes visible to search.
+        let declared: Vec<(String, u64, String)> = descriptor
+            .files
+            .iter()
+            .map(|item| (item.path.clone(), item.size, item.sha256.clone()))
+            .collect();
+        static_catalog::validate_installed(&staging, &declared)?;
+    }
     fs::create_dir_all(destination.parent().ok_or("Invalid source destination")?)
         .map_err(|error| error.to_string())?;
-    fs::rename(staging, destination).map_err(|error| error.to_string())?;
+    static_catalog::invalidate(&destination);
+    fs::rename(staging, &destination).map_err(|error| error.to_string())?;
     registry.sources.retain(|item| item.id != descriptor.id);
     registry.sources.push(RegistryEntry {
         id: descriptor.id,
@@ -861,7 +893,7 @@ async fn remote_search(
                 icon: Some(string_at(row, field(operation, "icon", "icon")))
                     .filter(|item| !item.is_empty()),
                 source_id: descriptor.id.clone(),
-                source_name: descriptor.name.clone(),
+                source_name: catalog_name(&descriptor.id, &descriptor.name),
                 source_version: descriptor.version.clone(),
             })
         })
@@ -925,7 +957,7 @@ fn package_from_remote(
         url,
         access_type: string_at(row, field(operation, "accessType", "access_type")),
         source_id: descriptor.id.clone(),
-        source_name: descriptor.name.clone(),
+        source_name: catalog_name(&descriptor.id, &descriptor.name),
         source_version: descriptor.version.clone(),
         candidate_id,
         group_id: string_at(row, field(operation, "groupId", "mirror_group")),
@@ -1117,7 +1149,7 @@ async fn recipe_search(
                 for item in items.iter().take(limit.min(MAX_RESULTS)) {
                     output.push(SourceTitle { title_id: item.title_id.clone(), name: item.name.clone(),
                         region: item.region.clone(), icon: Some(item.image.clone()).filter(|s|!s.is_empty()),
-                        source_id: descriptor.id.clone(), source_name: descriptor.name.clone(), source_version: descriptor.version.clone() });
+                        source_id: descriptor.id.clone(), source_name: catalog_name(&descriptor.id, &descriptor.name), source_version: descriptor.version.clone() });
                 }
             },
             "items.dedupe" => {
@@ -1167,7 +1199,7 @@ async fn recipe_search(
                         },
                         icon: Some(item.image.clone()).filter(|value| !value.is_empty()),
                         source_id: descriptor.id.clone(),
-                        source_name: descriptor.name.clone(),
+                        source_name: catalog_name(&descriptor.id, &descriptor.name),
                         source_version: descriptor.version.clone(),
                     });
                 }
@@ -2411,7 +2443,7 @@ fn emit_packages(
                 url: item.url,
                 access_type: normalize_access(access),
                 source_id: descriptor.id.clone(),
-                source_name: descriptor.name.clone(),
+                source_name: catalog_name(&descriptor.id, &descriptor.name),
                 source_version: descriptor.version.clone(),
                 candidate_id,
                 group_id: item.group_id,
@@ -2782,6 +2814,170 @@ fn normalize_access(value: &str) -> String {
     }
 }
 
+/// Search a static catalog (in-memory index; install validated every shard).
+fn static_search(
+    directory: &std::path::Path,
+    descriptor: &Descriptor,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SourceTitle>, String> {
+    let catalog = static_catalog::cached(directory)?;
+    let titles = catalog.search(query, "", limit.min(MAX_RESULTS));
+    Ok(titles
+        .into_iter()
+        .map(|title| SourceTitle {
+            title_id: title.title_id,
+            name: title.name,
+            region: title.region,
+            icon: title.icon,
+            source_id: descriptor.id.clone(),
+            source_name: catalog_name(&descriptor.id, &descriptor.name),
+            source_version: descriptor.version.clone(),
+        })
+        .collect())
+}
+
+/// Resolve a title against a static catalog, carrying the catalog's archive
+/// passwords so extraction can use them without a separate lookup.
+fn static_resolve(
+    directory: &std::path::Path,
+    descriptor: &Descriptor,
+    title_id: &str,
+    region: &str,
+) -> Result<Vec<SourcePackage>, String> {
+    let catalog = static_catalog::cached(directory)?;
+    let rows = catalog.resolve(title_id, region)?;
+    let mut packages: Vec<SourcePackage> = rows
+        .into_iter()
+        .map(|row| SourcePackage {
+            kind: if row.kind != "base" && row.label.to_ascii_lowercase().contains("backport") { "backport".into() } else { infer_kind(&row.kind).to_owned() },
+            label: row.label.clone(),
+            url: row.url.clone(),
+            access_type: {
+                let kind = row.access_type.to_ascii_lowercase();
+                match kind.as_str() {
+                    "direct" => "Direct".into(),
+                    "hosterlanding" | "hoster-landing" => "HosterLanding".into(),
+                    _ if row.url.contains("1fichier") => "HosterLanding".into(),
+                    _ => row.access_type.clone(),
+                }
+            },
+            source_id: descriptor.id.clone(),
+            source_name: catalog_name(&descriptor.id, &descriptor.name),
+            source_version: descriptor.version.clone(),
+            candidate_id: row.id.clone(),
+            group_id: if row.group_id.is_empty() {
+                row.id.clone()
+            } else {
+                row.group_id.clone()
+            },
+            hoster: row.hoster.clone(),
+            version: row.version.clone(),
+            firmware: row.firmware.clone(),
+            source_page_url: row.source_page_url.clone(),
+            expected_size: row.expected_size,
+            expected_sha256: String::new(),
+            expected_content_id: String::new(),
+            archive_set_id: row.archive_set_id.clone(),
+            archive_part_number: row.archive_part_number,
+            archive_part_count: row.archive_part_count,
+            archive_file_name: row.file_name.clone(),
+            archive_format_hint: row.archive_format_hint.clone(),
+            archive_password: row.archive_password.clone(),
+            mirror_id: row.mirror_id.clone(),
+            intermediate_url: row.intermediate_url.clone(),
+            referer: None,
+            diagnostics: if row.archive_passwords.len() > 1 {
+                let mut notes = row.diagnostics.clone(); notes.push(format!(
+                    "archive password fallbacks: {}",
+                    row.archive_passwords.len()
+                )); notes
+            } else {
+                row.diagnostics.clone()
+            },
+        })
+        .collect();
+    annotate_static_parts(&mut packages);
+    Ok(packages)
+}
+
+fn annotate_static_parts(packages: &mut [SourcePackage]) {
+    let pattern = Regex::new(r"(?i)(?:[. _-]part[. _-]*(\d+))\.rar$").unwrap();
+    let mut groups: HashMap<String, Vec<(usize, u32)>> = HashMap::new();
+    for (index, package) in packages.iter_mut().enumerate() {
+        let name = package.archive_file_name.as_deref().unwrap_or("").replace('+', " ");
+        let captures = pattern.captures(&name);
+        let Some(number) = package.archive_part_number.or_else(|| captures.as_ref().and_then(|c| c[1].parse::<u32>().ok())).filter(|n| *n > 0 && *n <= 10000) else {
+            if package.archive_set_id.is_some() { package.diagnostics.push("incomplete archive set: part numbers are not documented".into()); }
+            continue;
+        };
+        let stem = pattern.replace(&name, "").to_ascii_lowercase();
+        let set = package.archive_set_id.clone().unwrap_or_else(|| sha256(format!("{}|{}|{}|{}|{}", package.source_id, package.group_id, package.kind, package.hoster, stem).as_bytes()));
+        package.archive_set_id = Some(set.clone());
+        if package.mirror_id.is_none() { package.mirror_id = Some(package.hoster.clone()); }
+        package.archive_part_number = Some(number);
+        package.archive_format_hint = Some("rar".into());
+        groups.entry(set).or_default().push((index, number));
+    }
+    for rows in groups.values() {
+        let highest = rows.iter().map(|(_, n)| *n).max().unwrap_or(0);
+        let numbers: HashSet<u32> = rows.iter().map(|(_, n)| *n).collect();
+        let declared: HashSet<u32> = rows.iter().filter_map(|(index, _)| packages[*index].archive_part_count).collect();
+        let count = if declared.len() == 1 { declared.iter().next().copied() } else if declared.is_empty() && highest >= 2 && numbers.len() == rows.len() && numbers.len() == highest as usize { Some(highest) } else { None };
+        let incomplete = declared.len() > 1 || count.is_none_or(|count| count < 2 || numbers.len() != rows.len() || numbers.len() != count as usize || highest != count);
+        for &(index, _) in rows {
+            packages[index].archive_part_count = count;
+            if incomplete { packages[index].diagnostics.push("incomplete archive set: this mirror does not list every part".into()); }
+        }
+    }
+}
+
+#[cfg(test)]
+mod supplied_catalog_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires SSPI_CATALOG_FIXTURE extracted from the supplied source"]
+    fn validates_and_resolves_the_supplied_ps5_source() {
+        let root = PathBuf::from(std::env::var_os("SSPI_CATALOG_FIXTURE").expect("source fixture directory"));
+        let descriptor: Descriptor = serde_json::from_slice(&fs::read(root.join("source.json")).unwrap()).unwrap();
+        validate_descriptor(&descriptor).unwrap();
+        let declared: Vec<_> = descriptor.files.iter().map(|f| (f.path.clone(), f.size, f.sha256.clone())).collect();
+        let counts = static_catalog::validate_installed(&root, &declared).unwrap();
+        let catalog = static_catalog::cached(&root).unwrap();
+        let titles = catalog.search("", "", 60000);
+        assert_eq!(titles.len() as u64, counts.ready_titles);
+        assert!(titles.iter().all(|t| t.title_id.starts_with("PPSA")));
+        let mut rows = 0; let mut firmware = 0; let mut multipart = 0;
+        for title in &titles {
+            let packages = static_resolve(&root, &descriptor, &title.title_id, "").unwrap();
+            assert!(!packages.is_empty(), "{} has no resolved packages", title.title_id);
+            assert!(packages.iter().all(|p| p.url.starts_with("http")));
+            firmware += packages.iter().filter(|p| !p.firmware.is_empty()).count();
+            multipart += packages.iter().filter(|p| p.archive_part_number.is_some()).count();
+            rows += packages.len();
+        }
+        assert!(firmware > 0 && multipart > 0);
+        println!("Supplied source: {} searchable PS5 titles, {rows} resolved rows, {firmware} firmware fields, {multipart} multipart rows; every declared shard hash passed", titles.len());
+    }
+}
+
+/// Local indexes populate both platforms without waiting for a remote source.
+pub fn home_titles(app: &AppHandle) -> Result<Vec<SourceTitle>, String> {
+    let registry = load_registry(app)?;
+    let mut results = Vec::new();
+    for entry in registry.sources.iter().filter(|s| s.enabled && s.engine_type == "embedded-catalog-v1") {
+        let (descriptor, _) = load_source(app, entry)?;
+        let directory = source_dir(app, &entry.id, &entry.version)?;
+        let catalog = static_catalog::cached(&directory)?;
+        for title in catalog.search("", "", 60000) {
+            results.push(SourceTitle { title_id: title.title_id, name: title.name, region: title.region, icon: title.icon,
+                source_id: descriptor.id.clone(), source_name: catalog_name(&descriptor.id, &descriptor.name), source_version: descriptor.version.clone() });
+        }
+    }
+    Ok(results)
+}
+
 pub async fn search(
     app: &AppHandle,
     query: &str,
@@ -2790,6 +2986,7 @@ pub async fn search(
     let registry = load_registry(app)?;
     struct SourceJob {
         name: String,
+        directory: PathBuf,
         descriptor: Descriptor,
         recipe: Option<Value>,
     }
@@ -2810,12 +3007,15 @@ pub async fn search(
         {
             continue;
         }
-        jobs.push(SourceJob { name: entry.name.clone(), descriptor, recipe });
+        let directory = source_dir(app, &entry.id, &entry.version).unwrap_or_default();
+        jobs.push(SourceJob { name: catalog_name(&entry.id, &entry.name), directory, descriptor, recipe });
     }
     // Sources resolve concurrently: latency is slowest-source, not sum-of-sources.
     let results = futures_util::future::join_all(jobs.into_iter().map(|job| async move {
         let result = tokio::time::timeout(Duration::from_secs(60), async {
-            if matches!(
+            if job.descriptor.engine.engine_type == "embedded-catalog-v1" {
+                static_search(&job.directory, &job.descriptor, query, limit)
+            } else if matches!(
                 job.descriptor.engine.engine_type.as_str(),
                 "recipe-v1" | "recipe-v2"
             ) {
@@ -2860,6 +3060,7 @@ pub async fn resolve(
     let registry = load_registry(app)?;
     struct ResolveJob {
         name: String,
+        directory: PathBuf,
         descriptor: Descriptor,
         recipe: Option<Value>,
     }
@@ -2880,12 +3081,15 @@ pub async fn resolve(
         {
             continue;
         }
-        jobs.push(ResolveJob { name: entry.name.clone(), descriptor, recipe });
+        let directory = source_dir(app, &entry.id, &entry.version).unwrap_or_default();
+        jobs.push(ResolveJob { name: catalog_name(&entry.id, &entry.name), directory, descriptor, recipe });
     }
     // Sources resolve concurrently: latency is slowest-source, not sum-of-sources.
     let results = futures_util::future::join_all(jobs.into_iter().map(|job| async move {
         let result = tokio::time::timeout(Duration::from_secs(60), async {
-            if matches!(
+            if job.descriptor.engine.engine_type == "embedded-catalog-v1" {
+                static_resolve(&job.directory, &job.descriptor, title_id, region)
+            } else if matches!(
                 job.descriptor.engine.engine_type.as_str(),
                 "recipe-v1" | "recipe-v2"
             ) {
@@ -3224,6 +3428,21 @@ mod tests {
         let gapped_links = parse_hoster_links(&[gapped], &step);
         assert!(gapped_links.iter().all(|item| item.archive_part_count.is_none()));
         assert!(gapped_links[0].diagnostics.iter().any(|value| value.contains("missing Part.")));
+    }
+
+    #[test]
+    fn secure_split_complementary_part_is_preserved() {
+        let document = WorkItem {
+            url: "https://downloadgameps3.net/archives/44239".into(), kind: "base".into(), group_id: "base".into(),
+            html: r##"<div class="post-content"><a href="https://1fichier.com/?first">1File - Part.01</a>
+                <a href="#" data-d1="https://1fi" data-d2="chier.com" data-path="/?second">1File - Part.02</a></div>"##.into(),
+            ..Default::default()
+        };
+        let step = serde_json::json!({"rootSelectors":[".post-content"],"allowedHosts":["1fichier.com"],"maximumLinks":128});
+        let links = parse_hoster_links(&[document], &step);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[1].url, "https://1fichier.com/?second");
+        assert!(links.iter().all(|item| item.archive_part_count == Some(2)));
     }
 
     #[test]

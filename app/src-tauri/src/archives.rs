@@ -337,6 +337,10 @@ fn extract_zip_tree_metered(
     dest: &Path,
     report: &dyn Fn(ExtractionReport),
 ) -> Result<ExtractionMeter, String> {
+    extract_zip_tree_controlled(source, dest, report, &|| Ok(()))
+}
+
+fn extract_zip_tree_controlled(source: &Path, dest: &Path, report: &dyn Fn(ExtractionReport), checkpoint: &dyn Fn() -> Result<(), String>) -> Result<ExtractionMeter, String> {
     let mut zip = zip::ZipArchive::new(std::fs::File::open(source).map_err(redact)?)
         .map_err(|error| phase_error(ExtractionPhase::Inspection, source, redact(error)))?;
     // Unavailable destinations are reported, never silently replaced.
@@ -354,6 +358,7 @@ fn extract_zip_tree_metered(
     let mut files_total = 0u64;
     let mut names = std::collections::HashSet::new();
     for i in 0..zip.len() {
+        checkpoint()?;
         let entry = zip
             .by_index(i)
             .map_err(|error| phase_error(ExtractionPhase::Inspection, source, redact(error)))?;
@@ -421,6 +426,10 @@ fn extract_zip_tree_metered(
             .open(&out)
             .map_err(|error| phase_error(ExtractionPhase::Extraction, &out, redact(error)))?;
         loop {
+            checkpoint()?;
+            if meter.done_bytes % (64 * 1024 * 1024) < buffer.len() as u64 {
+                storage::guard_bytes(dest, meter.total_bytes.saturating_sub(meter.done_bytes), "extraction")?;
+            }
             let read = entry
                 .read(&mut buffer)
                 .map_err(|error| phase_error(ExtractionPhase::Extraction, &out, redact(error)))?;
@@ -471,12 +480,12 @@ fn extract_zip_tree_metered(
     Ok(meter)
 }
 
-fn extract_zip_tree(source: &Path, dest: &Path, progress: &dyn Fn(u64, u64, f64)) -> Result<(), String> {
+pub(super) fn extract_zip_tree(source: &Path, dest: &Path, progress: &dyn Fn(u64, u64, f64), checkpoint: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
     // Legacy (done, total, speed) callback kept for the current caller; the
     // measured work happens in extract_zip_tree_metered above.
-    let result = extract_zip_tree_metered(source, dest, &|report| {
+    let result = extract_zip_tree_controlled(source, dest, &|report| {
         progress(report.done_bytes, report.total_bytes, report.speed_bps);
-    });
+    }, checkpoint);
     match result {
         Ok(meter) => {
             progress(meter.done_bytes, meter.total_bytes.max(1), 0.);
@@ -490,6 +499,15 @@ pub(super) fn extract_content(
     source: &Path, cache: &Path, kind: ArtifactKind, password: Option<&str>,
     progress: Arc<dyn Fn(u64, u64, f64) + Send + Sync>, depth: usize,
 ) -> Result<ExtractedContent, String> {
+    extract_content_controlled(source, cache, kind, password, progress, depth, Arc::new(|| Ok(())))
+}
+
+pub(super) fn extract_content_controlled(
+    source: &Path, cache: &Path, kind: ArtifactKind, password: Option<&str>,
+    progress: Arc<dyn Fn(u64, u64, f64) + Send + Sync>, depth: usize,
+    checkpoint: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+) -> Result<ExtractedContent, String> {
+    checkpoint()?;
     if depth > 3 {
         return Err(phase_error(
             ExtractionPhase::Inspection,
@@ -517,7 +535,7 @@ pub(super) fn extract_content(
     let dest = cache.join(Uuid::new_v4().to_string());
     let mut result = (|| {
         match kind {
-            ArtifactKind::Zip => extract_zip_tree(source, &dest, progress.as_ref())?,
+            ArtifactKind::Zip => extract_zip_tree(source, &dest, progress.as_ref(), checkpoint.as_ref())?,
             ArtifactKind::Rar => {
                 let size = archive_passwords(password).into_iter().find_map(|p| rar_list_size(source, p).ok());
                 if let (Some(size), Some(free)) = (size, free_space(cache)) {
@@ -525,11 +543,11 @@ pub(super) fn extract_content(
                         return Err(phase_error(
                             ExtractionPhase::Inspection,
                             source,
-                            "Not enough free space to extract this RAR",
+                            format!("Not enough free space to extract this RAR: {:.2} GiB required, {:.2} GiB free. Free space and Retry; the archive is retained.", size as f64 / 1_073_741_824., free as f64 / 1_073_741_824.),
                         ));
                     }
                 }
-                extract_rar_builtin(source, &dest, password, progress.clone())
+                extract_rar_builtin(source, &dest, password, progress.clone(), checkpoint.clone())
                     .map_err(|error| phase_error(ExtractionPhase::Extraction, source, error))?;
             }
             _ => unreachable!(),
@@ -544,7 +562,7 @@ pub(super) fn extract_content(
                 .read(&mut header)
                 .map_err(|error| phase_error(ExtractionPhase::Inspection, &inner, redact(error)))?;
             let kind = artifact_kind(&header[..read], &inner.to_string_lossy(), "");
-            match extract_content(&inner, &dest, kind, password, progress.clone(), depth + 1)
+            match extract_content_controlled(&inner, &dest, kind, password, progress.clone(), depth + 1, checkpoint.clone())
                 .map_err(|error| {
                     // Keep the exact inner phase; tag only untagged (legacy) errors.
                     let tagged = if error_phase(&error) == "unknown" {
@@ -605,6 +623,26 @@ pub(super) fn extracted_outputs(content: &ExtractedContent) -> Vec<PathBuf> {
 ///
 /// Delivery-wiring API (lib.rs staging/upload wiring + unit tests).
 #[allow(dead_code)]
+pub(super) fn with_extraction_slot<T>(destination: &Path, checkpoint: &dyn Fn() -> Result<(), String>, waiting: &dyn Fn(), work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    static VOLUMES: std::sync::OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = std::sync::OnceLock::new();
+    let slot = VOLUMES.get_or_init(Default::default).lock().unwrap()
+        .entry(volume_key(destination).to_ascii_lowercase()).or_default().clone();
+    let mut announced = false;
+    let _guard = loop {
+        checkpoint()?;
+        match slot.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if !announced { waiting(); announced = true; }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+    checkpoint()?;
+    work()
+}
+
 pub(super) fn remove_consumed_inputs(
     consumed: &[PathBuf],
     outputs: &[PathBuf],
@@ -623,6 +661,14 @@ pub(super) fn remove_consumed_inputs(
         }
         if let Err(error) = std::fs::remove_file(path) {
             failures.push(format!("{} ({})", path.display(), redact(error)));
+        }
+    }
+    // Removing an empty owned staging directory does not touch unrelated files
+    // or another job's remaining volumes. Never recurse during this pruning.
+    for parent in consumed.iter().filter_map(|path| path.parent()) {
+        let name = parent.file_name().unwrap_or_default().to_string_lossy();
+        if name.strip_prefix("archive_").and_then(|name| name.get(..36)).is_some_and(|id| Uuid::parse_str(id).is_ok()) {
+            let _ = std::fs::remove_dir(parent);
         }
     }
     if failures.is_empty() {
@@ -650,6 +696,33 @@ pub(super) fn remove_consumed_inputs(
 mod tests {
     use super::*;
     #[test]
+    fn consumed_archive_prunes_empty_owned_folder_but_keeps_other_parts() {
+        let root = crate::test_output_root().join(Uuid::new_v4().to_string());
+        let owned = root.join(format!("archive_{}_base", Uuid::new_v4()));
+        std::fs::create_dir_all(&owned).unwrap();
+        let a = owned.join("part1.rar"); let b = owned.join("part2.rar");
+        std::fs::write(&a, b"one").unwrap(); std::fs::write(&b, b"two").unwrap();
+        remove_consumed_inputs(&[a], &[]).unwrap(); assert!(b.exists());
+        remove_consumed_inputs(&[b], &[]).unwrap(); assert!(!owned.exists()); assert!(root.exists());
+    }
+    #[test]
+    fn extraction_slot_wait_is_cancellable_and_releases_after_error() {
+        use std::sync::mpsc;
+        let destination = PathBuf::from("Q:/sspi-extraction-slot-test");
+        let (started_tx, started_rx) = mpsc::channel(); let (release_tx, release_rx) = mpsc::channel();
+        let first_path = destination.clone();
+        let first = std::thread::spawn(move || with_extraction_slot(&first_path, &|| Ok(()), &|| {}, || {
+            started_tx.send(()).unwrap(); release_rx.recv_timeout(Duration::from_secs(5)).unwrap(); Err::<(), _>("test error".into())
+        }));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let result = with_extraction_slot(&destination, &|| if cancelled.load(Ordering::Relaxed) { Err("cancelled".into()) } else { Ok(()) },
+            &|| cancelled.store(true, Ordering::Relaxed), || panic!("A second extraction must wait"));
+        assert_eq!(result, Err::<(), _>("cancelled".into()));
+        release_tx.send(()).unwrap(); assert!(first.join().unwrap().is_err());
+        assert!(with_extraction_slot(&destination, &|| Ok(()), &|| {}, || Ok(())).is_ok());
+    }
+    #[test]
     fn zip_preserves_ps5_dump_structure() {
         let (source, cache) = crate::tests::make_zip(vec![
             ("Game/eboot.bin", vec![1,2,3]), ("Game/sce_sys/param.json", b"{}".to_vec()),
@@ -663,6 +736,30 @@ mod tests {
         assert_eq!(archive_passwords(Some("secret"))[0], b"secret");
         assert!(archive_passwords(None).contains(&b"[DLPSGAME.COM]".as_slice()));
     }
+    #[cfg(windows)]
+    #[test]
+    fn source_password_variants_decrypt_rar_headers_and_files() {
+        use std::os::windows::process::CommandExt;
+        let archiver = Path::new("C:/Program Files/WinRAR/Rar.exe");
+        if !archiver.is_file() { eprintln!("skipping: local WinRAR is required to create encrypted fixtures"); return; }
+        let root = crate::test_output_root().join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        let input = root.join("payload.txt");
+        let contents = b"SSPI encrypted archive password fallback\n";
+        std::fs::write(&input, contents).unwrap();
+        for (index, password) in ["www.DLPSGAME.COM", "[DLPSGAME.COM]", "DLPSGAME.COM"].iter().enumerate() {
+            let archive = root.join(format!("variant-{index}.rar"));
+            let status = std::process::Command::new(archiver)
+                .args(["a", "-idq", "-ep", &format!("-hp{password}")])
+                .arg(&archive).arg(&input).creation_flags(0x08000000).status().unwrap();
+            assert!(status.success());
+            assert_eq!(storage::archive_size(&archive, ArtifactKind::Rar, Some("outdated-source-password")).unwrap(), Some(contents.len() as u64));
+            let destination = root.join(format!("extracted-{index}"));
+            extract_rar_builtin(&archive, &destination, Some("outdated-source-password"), Arc::new(|_,_,_| {}), Arc::new(|| Ok(()))).unwrap();
+            assert_eq!(std::fs::read(destination.join("payload.txt")).unwrap(), contents);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn encrypted_rar_extracts_with_the_explicit_password() {
         let source=Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/encrypted.rar");
@@ -670,9 +767,9 @@ mod tests {
             eprintln!("skipping: tests/fixtures/encrypted.rar is not shipped with the repo");
             return;
         }
-        let dest=std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let dest=crate::test_output_root().join(Uuid::new_v4().to_string());
         assert!(rar_extract_to(&source,&dest,b"wrong-password").is_err());
-        extract_rar_builtin(&source,&dest,Some("unrar"),Arc::new(|_,_,_|{})).unwrap();
+        extract_rar_builtin(&source,&dest,Some("unrar"),Arc::new(|_,_,_|{}),Arc::new(|| Ok(()))).unwrap();
         assert_eq!(std::fs::read_to_string(dest.join(".gitignore")).unwrap(),"target\nCargo.lock\n");
         let _=std::fs::remove_dir_all(dest);
     }
@@ -682,6 +779,33 @@ mod tests {
         assert!(extract_content(&source,&cache,ArtifactKind::Zip,None,Arc::new(|_,_,_|{}),0).is_err());
         assert!(!source.parent().unwrap().join("escape.txt").exists());
         let _=std::fs::remove_dir_all(source.parent().unwrap());
+    }
+
+    #[test]
+    fn cancelled_extraction_preserves_archive_and_removes_partial_output() {
+        let (source, cache) = crate::tests::make_zip(vec![("game/large.bin", vec![1; 4 * 1024 * 1024])]);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let error = extract_content_controlled(&source, &cache, ArtifactKind::Zip, None, Arc::new(|_,_,_|{}), 0,
+            Arc::new(move || if count.fetch_add(1, Ordering::SeqCst) >= 5 { Err("cancelled".into()) } else { Ok(()) })).err().expect("cancelled extraction");
+        assert!(error.contains("cancelled"));
+        assert!(source.is_file());
+        assert!(!cache.exists() || std::fs::read_dir(cache).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn rar_callback_can_cancel_with_archive_open() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/encrypted.rar");
+        if !source.exists() { return; }
+        let dest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../Build-Output/Windows Manager/rar-control-tests").join(Uuid::new_v4().to_string());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let error = rar_control::extract(&source, &dest, b"unrar", &|| {
+            if calls.fetch_add(1, Ordering::SeqCst) >= 2 { Err("cancelled".into()) } else { Ok(()) }
+        }).unwrap_err();
+        assert_eq!(error, "cancelled");
+        assert!(source.is_file());
+        // Reopening and extracting proves cancellation released the native handle.
+        assert!(rar_control::extract(&source, &dest, b"unrar", &|| Ok(())).is_ok());
     }
     #[test]
     fn system_volume_is_detected_not_assumed() {
@@ -727,7 +851,7 @@ mod tests {
         assert_eq!(sanitize_set_id("a/b\\c:set"), "a_b_c_set");
         assert_eq!(sanitize_set_id("///"), "set");
         // Temporary extraction files resolve under the selected root.
-        let tmp = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let tmp = crate::test_output_root().join(Uuid::new_v4().to_string());
         let extract = extraction_dir(&tmp);
         require_writable_dir(&extract, "extraction").unwrap();
         let probe = extract.join("part.tmp");
@@ -737,7 +861,7 @@ mod tests {
     }
     #[test]
     fn unavailable_destination_reports_without_fallback() {
-        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let root = crate::test_output_root().join(Uuid::new_v4().to_string());
         std::fs::create_dir_all(&root).unwrap();
         let blocker = root.join("file");
         std::fs::write(&blocker, b"x").unwrap();
@@ -749,7 +873,7 @@ mod tests {
     }
     #[test]
     fn space_check_sums_shared_volumes_once() {
-        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let root = crate::test_output_root().join(Uuid::new_v4().to_string());
         std::fs::create_dir_all(&root).unwrap();
         let Some(free) = free_space(&root) else {
             let _ = std::fs::remove_dir_all(&root);
@@ -818,7 +942,7 @@ mod tests {
     }
     #[test]
     fn corrupt_archive_reports_phase() {
-        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let root = crate::test_output_root().join(Uuid::new_v4().to_string());
         std::fs::create_dir_all(&root).unwrap();
         let source = root.join("broken.zip");
         std::fs::write(&source, b"definitely not a zip archive............").unwrap();
@@ -829,7 +953,7 @@ mod tests {
     }
     #[test]
     fn successful_cleanup_touches_only_consumed_files() {
-        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let root = crate::test_output_root().join(Uuid::new_v4().to_string());
         std::fs::create_dir_all(root.join("out")).unwrap();
         let part1 = root.join("archive.part01.rar");
         let part2 = root.join("archive.part02.rar");
