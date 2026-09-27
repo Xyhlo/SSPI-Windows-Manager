@@ -479,6 +479,12 @@ report:
     }
     save_job(index,&j);
 }
+bool install_busy(void) {
+    rx_lock(&command_lock); bool busy=pending.busy; rx_unlock(&command_lock);
+    rx_lock(&job_lock);
+    for (unsigned i=0;i<MAX_JOBS;i++) if (jobs[i].used && jobs[i].phase!=JOB_INSTALLED && jobs[i].phase!=JOB_FAILED) busy=true;
+    rx_unlock(&job_lock); return busy;
+}
 void install_worker_tick(void) {
     rx_lock(&command_lock); bool execute=pending.busy&&!pending.done; Command work;
     if (execute) work=pending; rx_unlock(&command_lock);

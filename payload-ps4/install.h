@@ -20,5 +20,6 @@ int install_request(int fd, unsigned command, const uint8_t *body, size_t size);
 int install_status_reply(int fd, const char *content_id);
 int install_preflight(int fd, bool writable);
 int install_inventory_title_ready(const PkgInfo *package);
+bool install_busy(void);
 const char *install_error(int code);
 #endif

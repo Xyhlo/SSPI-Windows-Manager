@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <ps5/kernel.h>
+#include "console_tools.h"
 #ifndef MNT_UPDATE
 #define MNT_UPDATE 0x00000010
 #endif
@@ -34,7 +35,7 @@
 #define IOVEC_ENTRY(x) { (void *)(x), (x) ? strlen(x) + 1 : 0 }
 #define IOVEC_SIZE(x) (sizeof(x) / sizeof(struct iovec))
 
-#define VERSION "1.0.5"
+#define VERSION "1.0.6"
 #define DEFAULT_PORT 9114
 #define MAX_FRAME (8u * 1024u * 1024u)
 #define MAX_PATH_BYTES 2048
@@ -57,6 +58,14 @@
 #define CMD_INSTALL_PREFLIGHT 0x56
 #define CMD_TITLE_CONTEXT 0x57
 #define CMD_PROGRESS_NOTIFICATION 0x58
+#define CMD_STOP 0x5a
+#define CMD_LIST_INSTALLED 0x5e
+#define CMD_INSTALLED_METADATA 0x5f
+#define CMD_TITLE_ICON_GET 0x60
+#define CMD_TITLE_ICON_SET 0x61
+#define CMD_TITLE_ICON_RESTORE 0x62
+#define CMD_SHELL_REFRESH 0x63
+#define CMD_SYSTEM_INFO 0x64
 #define RESP_OK 0x01
 #define RESP_ERROR 0x02
 #define RESP_DATA 0x03
@@ -108,6 +117,12 @@ static Transfer *g_transfers;
 static unsigned g_transfer_count;
 static unsigned g_upload_lanes;
 static atomic_uint g_clients;
+static atomic_bool g_stopping;
+static pthread_mutex_t g_operation_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_clients_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_client_fds[MAX_CLIENTS];
+static pthread_t g_client_threads[MAX_CLIENTS];
+static bool g_client_used[MAX_CLIENTS];
 static pthread_mutex_t g_mount_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_install_lock = PTHREAD_MUTEX_INITIALIZER;
 static SceAppInstallPkgInfo g_last_pkg;
@@ -811,10 +826,52 @@ static int handle_progress_notification(int fd, const uint8_t *body, uint32_t si
     return text_reply(fd, RESP_OK, "OK");
 }
 
+static int handle_console_tools(int fd, unsigned cmd, const uint8_t *b, uint32_t n) {
+    if (cmd==CMD_LIST_INSTALLED || cmd==CMD_SYSTEM_INFO || cmd==CMD_SHELL_REFRESH) {
+        if (n) return text_reply(fd,RESP_ERROR,"This command requires an empty request.");
+        if (cmd==CMD_SHELL_REFRESH) return text_reply(fd,RESP_ERROR,"Restart your PS5 to see the new icons.");
+        size_t cap=cmd==CMD_LIST_INSTALLED ? 65536 : 4096;
+        char *out=malloc(cap); if (!out) return text_reply(fd,RESP_ERROR,"Not enough memory to read console information.");
+        int rc=cmd==CMD_LIST_INSTALLED ? ps5_library_json(out,cap) : ps5_system_info(out,cap);
+        int result=rc ? text_reply(fd,RESP_ERROR,"Console information could not be read.") : text_reply(fd,RESP_DATA,out);
+        free(out); return result;
+    }
+    if (!b || n<10 || b[9] || memchr(b,0,9) || !ct_valid_id((const char *)b)) return text_reply(fd,RESP_ERROR,"Invalid installed title ID.");
+    if (((cmd==CMD_INSTALLED_METADATA || cmd==CMD_TITLE_ICON_RESTORE) && n!=10) ||
+        (cmd==CMD_TITLE_ICON_GET && (n!=11 || b[10]>1)) ||
+        (cmd==CMD_TITLE_ICON_SET && (n<=10 || n>CT_MAX_PNG+10))) return text_reply(fd,RESP_ERROR,"Invalid icon or metadata request length.");
+    if (!ps5_title_installed((const char *)b)) return text_reply(fd,RESP_ERROR,"Refresh Library to confirm this title is installed.");
+    if (cmd==CMD_INSTALLED_METADATA || cmd==CMD_TITLE_ICON_GET) {
+        uint8_t *out=malloc(cmd==CMD_INSTALLED_METADATA ? CT_METADATA_SIZE : CT_MAX_PNG); size_t size=0;
+        if (!out) return text_reply(fd,RESP_ERROR,"Not enough memory to read the icon.");
+        int rc=cmd==CMD_INSTALLED_METADATA ? ps5_metadata((const char *)b,out,&size) : ct_icon_get("/data/SSPI",(const char *)b,b[10]!=0,out,&size);
+        int result=rc ? text_reply(fd,RESP_ERROR,"The title metadata or icon is unavailable.") : reply(fd,RESP_DATA,out,(uint32_t)size);
+        free(out); return result;
+    }
+    char out[512]; int rc=ct_icon_change("/data/SSPI","PS5",(const char *)b,b+10,n-10,cmd==CMD_TITLE_ICON_RESTORE,out,sizeof(out));
+    return text_reply(fd,rc?RESP_ERROR:RESP_DATA,out);
+}
+static int handle_stop(int fd, uint32_t size) {
+    if (size) return text_reply(fd,RESP_ERROR,"STOP requires an empty request.");
+    pthread_mutex_lock(&g_transfer_lock);
+    bool busy=g_upload_lanes!=0;
+    pthread_mutex_lock(&g_install_lock);
+    if (g_has_install && g_hold_system_authid) {
+        SceAppInstallStatusInstalled s; memset(&s,0,sizeof(s));
+        int rc=sceAppInstUtilGetInstallStatus(g_last_pkg.content_id,&s);
+        bool done=!rc && (s.error_info.error_code || !strcmp(s.status,"installed") || !strcmp(s.status,"complete") ||
+            (!strcmp(s.status,"playable") && (s.promote_progress==100 || s.local_copy_percent==100)));
+        if (done) { if (restore_appinst_authid(g_original_authid)) busy=true; else g_hold_system_authid=false; }
+        else busy=true;
+    }
+    pthread_mutex_unlock(&g_install_lock); pthread_mutex_unlock(&g_transfer_lock);
+    if (busy) return text_reply(fd,RESP_ERROR,"A transfer or installation is active. Wait for it to finish before stopping the receiver.");
+    int rc=text_reply(fd,RESP_OK,"stopping"); atomic_store(&g_stopping,true); return rc?rc:-1;
+}
 static void *client_thread(void *argument) {
-    int fd = *(int *)argument; free(argument); Lane lane; memset(&lane, 0, sizeof(lane));
+    unsigned slot=(unsigned)(uintptr_t)argument; int fd=g_client_fds[slot]; Lane lane; memset(&lane, 0, sizeof(lane));
     uint8_t *upload_buffer = NULL;
-    for (;;) {
+    while (!atomic_load(&g_stopping)) {
         uint8_t header[5];
         if (recv_all(fd, header, sizeof(header))) break;
         uint32_t size = read_u32le(header + 1);
@@ -825,12 +882,20 @@ static void *client_thread(void *argument) {
             if (handle_upload_chunk(fd, size, &lane, upload_buffer)) break;
             continue;
         }
-        if (size > MAX_PATH_BYTES + 25) { text_reply(fd, RESP_ERROR, "control frame too large"); break; }
+        if (size > (header[0]==CMD_TITLE_ICON_SET ? CT_MAX_PNG+10 : MAX_PATH_BYTES+25)) { text_reply(fd, RESP_ERROR, "control frame too large"); break; }
         uint8_t *body = size ? malloc(size + 1) : NULL;
         if (size && (!body || recv_all(fd, body, size))) { free(body); break; }
         if (body) body[size] = 0;
         int result = 0;
+        bool guarded=header[0]==CMD_START_UPLOAD || header[0]==CMD_INSTALL_PKG || header[0]==CMD_MOUNT_GAME ||
+            header[0]==CMD_STOP || (header[0]>=CMD_TITLE_ICON_GET && header[0]<=CMD_TITLE_ICON_RESTORE);
+        if (guarded) pthread_mutex_lock(&g_operation_lock);
+        if (atomic_load(&g_stopping)) { if (guarded) pthread_mutex_unlock(&g_operation_lock); free(body); break; }
         switch (header[0]) {
+            case CMD_STOP: result=handle_stop(fd,size); break;
+            case CMD_LIST_INSTALLED: case CMD_INSTALLED_METADATA: case CMD_TITLE_ICON_GET:
+            case CMD_TITLE_ICON_SET: case CMD_TITLE_ICON_RESTORE: case CMD_SHELL_REFRESH: case CMD_SYSTEM_INFO:
+                result=handle_console_tools(fd,header[0],body,size); break;
             case CMD_PING: result = text_reply(fd, RESP_OK, "SSPI"); break;
             case CMD_CREATE_DIR: result = allowed_path((char *)body) && mkdir_parents((char *)body) == 0 && (mkdir((char *)body, 0775) == 0 || errno == EEXIST) ? text_reply(fd, RESP_OK, "OK") : text_reply(fd, RESP_ERROR, "directory rejected"); break;
             case CMD_START_UPLOAD: result = handle_start(fd, body, size, &lane); break;
@@ -842,22 +907,24 @@ static void *client_thread(void *argument) {
             case CMD_INSTALL_PKG: result = handle_install(fd, (char *)body); break;
             case CMD_INSTALL_STATUS: result = handle_status(fd, (char *)body); break;
             case CMD_MOUNT_GAME: result = handle_mount_game(fd, (char *)body); break;
-            case CMD_GET_CONFIG: { const char *appinst = "untried", *authid = "untried"; char appinst_error[32], authid_error[32]; pthread_mutex_lock(&g_install_lock); if (g_appinst_init_attempted) { if (g_appinst_init_rc) { snprintf(appinst_error, sizeof(appinst_error), "unavailable:%d", g_appinst_init_rc); appinst = appinst_error; } else appinst = "ready"; } if (g_authid_attempted) { if (g_authid_rc) { snprintf(authid_error, sizeof(authid_error), "unavailable:%d", g_authid_rc); authid = authid_error; } else authid = "system-install"; } pthread_mutex_unlock(&g_install_lock); char config[384]; snprintf(config, sizeof(config), "{\"port\":%d,\"version\":\"%s\",\"authid\":\"%s\",\"appinst\":\"%s\",\"capabilities\":[\"pkg-preflight\",\"pkg-install\",\"parallel-upload\",\"verify\",\"extracted-upload\",\"dump-mount\",\"fih-install\",\"title-context\",\"progress-notifications\"]}", g_port, VERSION, authid, appinst); result = text_reply(fd, RESP_DATA, config); break; }
+            case CMD_GET_CONFIG: { const char *appinst = "untried", *authid = "untried"; char appinst_error[32], authid_error[32]; pthread_mutex_lock(&g_install_lock); if (g_appinst_init_attempted) { if (g_appinst_init_rc) { snprintf(appinst_error, sizeof(appinst_error), "unavailable:%d", g_appinst_init_rc); appinst = appinst_error; } else appinst = "ready"; } if (g_authid_attempted) { if (g_authid_rc) { snprintf(authid_error, sizeof(authid_error), "unavailable:%d", g_authid_rc); authid = authid_error; } else authid = "system-install"; } pthread_mutex_unlock(&g_install_lock); char config[640]; snprintf(config, sizeof(config), "{\"port\":%d,\"version\":\"%s\",\"platform\":\"ps5\",\"authid\":\"%s\",\"appinst\":\"%s\",\"capabilities\":[\"pkg-preflight\",\"pkg-install\",\"parallel-upload\",\"verify\",\"extracted-upload\",\"dump-mount\",\"fih-install\",\"title-context\",\"progress-notifications\",\"installed-library-v1\",\"title-icons-v1\",\"system-info-v1\",\"stop\"]}", g_port, VERSION, authid, appinst); result = text_reply(fd, RESP_DATA, config); break; }
             case CMD_SET_PORT: { char *end = NULL; long port = body ? strtol((char *)body, &end, 10) : 0; result = end && *end == 0 && port >= 1024 && port <= 65535 && config_save((int)port) == 0 ? text_reply(fd, RESP_OK, "OK restart required") : text_reply(fd, RESP_ERROR, "invalid port or config write failed"); break; }
             default: result = text_reply(fd, RESP_ERROR, "unsupported command"); break;
         }
+        if (guarded) pthread_mutex_unlock(&g_operation_lock);
         free(body); if (result) break;
     }
     bool failed_lane = lane.transfer != NULL && !lane.ended;
     release_lane(&lane);
     free(upload_buffer);
-    close(fd);
+    pthread_mutex_lock(&g_clients_lock); close(fd); g_client_fds[slot]=-1; pthread_mutex_unlock(&g_clients_lock);
     atomic_fetch_sub(&g_clients, 1);
     if (failed_lane) trace_resources("lane disconnected");
     return NULL;
 }
 
 int main(void) {
+    for (unsigned i=0;i<MAX_CLIENTS;i++) g_client_fds[i]=-1;
     signal(SIGPIPE, SIG_IGN);
     /* Name ourselves so process lists show sspi.elf instead of the loader's
        default "payload.elf" (elfldr only derives a name from file:// URIs). */
@@ -872,7 +939,14 @@ int main(void) {
     pthread_attr_t attributes;
     if (pthread_attr_init(&attributes) != 0) { close(server); return 3; }
     if (pthread_attr_setstacksize(&attributes, CLIENT_STACK) != 0) { pthread_attr_destroy(&attributes); close(server); return 3; }
-    for (;;) {
+    while (!atomic_load(&g_stopping)) {
+        for (unsigned i=0;i<MAX_CLIENTS;i++) {
+            pthread_mutex_lock(&g_clients_lock); bool done=g_client_fds[i]<0; pthread_mutex_unlock(&g_clients_lock);
+            if (g_client_used[i] && done && !pthread_join(g_client_threads[i],NULL)) g_client_used[i]=false;
+        }
+        fd_set ready_fds; FD_ZERO(&ready_fds); FD_SET(server,&ready_fds); struct timeval wait={0,100000};
+        int available=select(server+1,&ready_fds,NULL,NULL,&wait);
+        if (available<=0) { if (available<0 && errno!=EINTR) break; continue; }
         int accepted = accept(server, NULL, NULL);
         if (accepted < 0) { if (errno != EINTR) { trace_resources("accept failed"); usleep(100000); } continue; }
         if (atomic_fetch_add(&g_clients, 1) >= MAX_CLIENTS) {
@@ -881,9 +955,9 @@ int main(void) {
             trace_resources("client limit");
             continue;
         }
-        int *client = malloc(sizeof(*client));
-        if (!client) { close(accepted); atomic_fetch_sub(&g_clients, 1); trace_resources("client allocation failed"); continue; }
-        *client = accepted;
+        unsigned slot=0; while (slot<MAX_CLIENTS && g_client_used[slot]) slot++;
+        if (slot==MAX_CLIENTS) { close(accepted); atomic_fetch_sub(&g_clients,1); continue; }
+        g_client_fds[slot]=accepted; int *client=&g_client_fds[slot];
         struct timeval receive_timeout = {120, 0}, send_timeout = {30, 0};
         setsockopt(*client, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout, sizeof(receive_timeout));
         setsockopt(*client, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
@@ -893,9 +967,17 @@ int main(void) {
 #ifdef SO_NOSIGPIPE
         setsockopt(*client, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
 #endif
-        pthread_t thread;
-        int created = pthread_create(&thread, &attributes, client_thread, client);
-        if (!created) pthread_detach(thread);
-        else { close(*client); free(client); atomic_fetch_sub(&g_clients, 1); trace_resources("thread creation failed"); }
+        int created = pthread_create(&g_client_threads[slot], &attributes, client_thread, (void *)(uintptr_t)slot);
+        if (!created) g_client_used[slot]=true;
+        else { close(*client); *client=-1; atomic_fetch_sub(&g_clients, 1); trace_resources("thread creation failed"); }
     }
+    atomic_store(&g_stopping,true); close(server); pthread_attr_destroy(&attributes);
+    pthread_mutex_lock(&g_clients_lock);
+    for (unsigned i=0;i<MAX_CLIENTS;i++) if (g_client_fds[i]>=0) shutdown(g_client_fds[i],SHUT_RDWR);
+    pthread_mutex_unlock(&g_clients_lock);
+    for (unsigned i=0;i<MAX_CLIENTS;i++) if (g_client_used[i]) pthread_join(g_client_threads[i],NULL);
+    pthread_mutex_lock(&g_transfer_lock);
+    while (g_transfers) destroy_transfer_locked(g_transfers);
+    pthread_mutex_unlock(&g_transfer_lock);
+    trace_mark("stop","receiver threads stopped"); return 0;
 }

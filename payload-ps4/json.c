@@ -164,6 +164,6 @@ int config_json(char *out, size_t cap, const ReceiverConfig *c) {
     Json j; json_init(&j,out,cap);
     json_add(&j,"{\"port\":%d,\"version\":\"" VERSION "\",\"platform\":\"ps4\",\"uid\":%d,\"jailbroken\":%s,\"data_root\":\"" DATA_ROOT "\",\"writable\":%s,\"bgft\":",c->port,c->uid,c->jailbroken?"true":"false",c->writable?"true":"false");
     json_quote(&j,c->bgft); json_add(&j,",\"appinst\":"); json_quote(&j,c->appinst); json_add(&j,",\"userservice\":"); json_quote(&j,c->userservice);
-    json_add(&j,",\"capabilities\":[\"pkg-preflight\",\"pkg-install\",\"url-install\",\"parallel-upload\",\"verify\",\"title-context\",\"progress-notifications\",\"install-control\",\"stop\",\"ps4\",\"installed-library-v1\"],\"diagnostics\":");
+    json_add(&j,",\"capabilities\":[\"pkg-preflight\",\"pkg-install\",\"url-install\",\"parallel-upload\",\"verify\",\"title-context\",\"progress-notifications\",\"install-control\",\"stop\",\"ps4\",\"installed-library-v1\",\"title-icons-v1\",\"system-info-v1\"],\"diagnostics\":");
     diagnostics_json(&j); json_add(&j,"}"); return j.failed?-1:0;
 }

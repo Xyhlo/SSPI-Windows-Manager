@@ -17,6 +17,7 @@ import type { Hint } from "./Shell"
 import type { OptionsTab } from "./OptionsOverlay"
 import { SpeedChart } from "./SpeedChart"
 import { toast } from "./toasts"
+import type { CardSize, CardStyle } from "@/lib/appearance"
 import { consoleAddress, jobTarget, sendBlockReason } from "@/lib/consoles"
 import {
   activeTransfer, errorContext, groupDownloads, honestPercent, kindLabel, kindOf, phaseDetail, phaseState, stageLabel,
@@ -51,6 +52,8 @@ type Props = {
   onSearch: () => void
   onOpenGame: (group: DownloadGroup) => void
   tintOn: boolean
+  cardStyle: CardStyle
+  cardSize: CardSize
 }
 
 const FILTERS = ["All", "Active", "Attention"] as const
@@ -136,7 +139,7 @@ function jobLine(job: DeliveryJob, group: DownloadGroup, downloadDir: string): {
 }
 
 export function DownloadsPage(props: Props) {
-  const { jobs, demo, settings, systemDrive, filter, setFilter, open, setOpen, drawer, setDrawer, statsForNerds, setStatsForNerds, ensureConsole, onOptions, onDock, onSearch, tintOn } = props
+  const { jobs, demo, settings, systemDrive, filter, setFilter, open, setOpen, drawer, setDrawer, statsForNerds, setStatsForNerds, ensureConsole, onOptions, onDock, onSearch, tintOn, cardStyle, cardSize } = props
   const groups = useMemo(() => groupDownloads(jobs), [jobs])
   const trackUpload = useUploadTrackers()
   const [current, setCurrent] = useState<Record<string, string>>({})
@@ -424,7 +427,7 @@ export function DownloadsPage(props: Props) {
             key={group.key} group={group} index={n} open={group.key === openKey} onToggle={() => toggle(group.key)}
             job={currentJob(group)} setCurrent={jobId => setCurrent(old => ({ ...old, [group.key]: jobId }))}
             drawer={drawer} setDrawer={setDrawer} statsForNerds={statsForNerds} setStatsForNerds={setStatsForNerds}
-            trackUpload={trackUpload} settings={settings} demo={demo}
+            trackUpload={trackUpload} settings={settings} demo={demo} cardStyle={cardStyle} cardSize={cardSize}
             actions={group.key === openKey ? actions : null} cancelArmed={cancelArmed} onCancel={cancel}
             onRetryJob={async jobId => { try { await onRetry(jobId) } catch (error) { toast({ tone: "error", title: "Retry didn't start", text: errorText(error) }) } }}
           />
@@ -449,10 +452,10 @@ export function DownloadsPage(props: Props) {
 }
 
 /* ---------------------------------------------------------------- one game card */
-function Card({ group, index, open, onToggle, job, setCurrent, drawer, setDrawer, statsForNerds, setStatsForNerds, trackUpload, settings, demo, actions, cancelArmed, onCancel, onRetryJob }: {
+function Card({ group, index, open, onToggle, job, setCurrent, drawer, setDrawer, statsForNerds, setStatsForNerds, trackUpload, settings, demo, cardStyle, cardSize, actions, cancelArmed, onCancel, onRetryJob }: {
   group: DownloadGroup; index: number; open: boolean; onToggle: () => void; job: DeliveryJob; setCurrent: (jobId: string) => void
   drawer: DrawerTab; setDrawer: (tab: DrawerTab) => void; statsForNerds: boolean; setStatsForNerds: (value: boolean) => void
-  trackUpload: (job: DeliveryJob) => UploadState | null; settings: Settings; demo: boolean
+  trackUpload: (job: DeliveryJob) => UploadState | null; settings: Settings; demo: boolean; cardStyle: CardStyle; cardSize: CardSize
   actions: ReturnType<typeof useJobActions> | null; cancelArmed: boolean; onCancel: () => void; onRetryJob: (jobId: string) => Promise<void>
 }) {
   const cardRef = useRef<HTMLElement>(null)
@@ -462,11 +465,18 @@ function Card({ group, index, open, onToggle, job, setCurrent, drawer, setDrawer
   const stats = transferStats(job, upload)
   const status = statusOf(job)
   const line = jobLine(job, group, settings.downloadDir)
-  const pct = ["complete", "delivered"].includes(job.stage) ? 100 : barPercent(job, upload)
-  const doneParts = job.components?.flatMap(component => component.parts) || []
+  const finished = ["complete", "delivered"].includes(job.stage)
+  const pct = finished ? 100 : barPercent(job, upload)
   const cover = { cover: group.icon, title: group.title, titleId: group.titleId }
   const hasAttention = group.jobs.some(attention)
   const target = jobTarget(job)
+  const moving = activeTransfer(job) && !job.paused
+  // One status line: measured bytes, speed and time left while bytes move; otherwise what's happening.
+  const summary = moving && stats.speedBps != null
+    ? [stats.label.replace(" / ", " of "), fmtSpeed(stats.speedBps), stats.etaSeconds ? `${fmtEta(stats.etaSeconds)} left` : ""].filter(Boolean).join(", ")
+    : line.text
+  const showBar = !finished && !["failed", "cancelled", "monitoring-ended"].includes(job.stage)
+  const showPct = showBar && !barIndeterminate(job) && job.stage !== "queued"
 
   useLayoutEffect(() => {
     const stage = getStage(), el = cardRef.current
@@ -476,35 +486,27 @@ function Card({ group, index, open, onToggle, job, setCurrent, drawer, setDrawer
   }, [group.icon, group.title])
 
   return (
-    <article ref={cardRef} className={`dcard ${open ? "is-open" : ""} ${hasAttention ? "attn" : ""} enter`} style={{ animationDelay: `${Math.min(index, 10) * 30}ms` }} data-group={group.key} data-art-level={open ? 1 : 0}>
-      <button type="button" className="dhead" aria-expanded={open} aria-label={`${group.title}, ${stageLabel(job)}`} data-hover-case onClick={onToggle} onContextMenu={event => void headActions.contextMenu(event)} onKeyDown={headActions.onKeyDown}>
+    <article
+      ref={cardRef} className={`dcard ${open ? "is-open" : ""} ${hasAttention ? "attn" : ""} ${cardStyle} ${cardSize} enter`}
+      style={{ animationDelay: `${Math.min(index, 10) * 30}ms`, ["--art" as string]: cardStyle === "art" && group.icon?.startsWith("data:image/") && !group.icon.startsWith("data:image/svg") ? `url("${group.icon}")` : undefined }}
+      data-group={group.key} data-art-level={open ? 1 : 0} data-banner={cardStyle === "art" ? 1 : 0}
+    >
+      <button type="button" className="dhead" aria-expanded={open} aria-label={`${group.title}, ${stageLabel(job)}${showPct ? `, ${pct}%` : ""}`} data-hover-case onClick={onToggle} onContextMenu={event => void headActions.contextMenu(event)} onKeyDown={headActions.onKeyDown}>
         <CaseAnchor spec={{ key: (group.titleId || group.key).toUpperCase(), cover: group.icon, title: group.title, titleId: group.titleId, kind: "download" }} className="dcase" />
         <span className="dsum">
           <strong className="dtitle">{group.title}</strong>
-          <span className="dident">
-            {group.titleId && <span>{group.titleId}</span>}
+          <span className="dmeta">
+            <span className={`dstatus ${status.cls}`}><span className={`dot ${status.dot}`} />{stageLabel(job)}</span>
             <span className="console-badge">{target.toUpperCase()}</span>
-            {group.kinds.includes("base") && <span className="tag">Base package</span>}
-            {group.kinds.includes("update") && <span className="tag">+UP</span>}
-            {group.kinds.includes("backport") && <span className="tag">+BP</span>}
-            {group.kinds.includes("dlc") && <span className="tag">+DLC</span>}
-            <span className="dlabel">{kindLabel(kindOf(job))}{job.packageVersion ? ` ${job.packageVersion}` : ""}</span>
+            {group.jobs.length > 1 && <span className="dcount">{plural(group.jobs.length, "package")}</span>}
           </span>
-          <span className="dprog">
-            <span className={`progress ${progressClass(job)}`}><span className="fill" style={{ width: `${pct}%` }} /></span>
-            <span className="dstats">
-              <span>{stats.label}</span>
-              <span>{stats.speedBps != null ? `${fmtSpeed(stats.speedBps)}${stats.etaSeconds ? `, ${fmtEta(stats.etaSeconds)}` : ""}` : ""}</span>
-              <span className="files">{job.localPkg ? "Local file" : doneParts.length ? `${doneParts.filter(part => part.downloaded).length} of ${plural(doneParts.length, "part")} downloaded` : ""}</span>
-            </span>
-          </span>
-          <span className={`dline ${line.cls}`}>{line.text}</span>
+          <span className={`dline ${moving ? "" : line.cls}`}>{summary}</span>
         </span>
         <span className="dside">
-          <span className={`dstatus ${status.cls}`}><span className={`dot ${status.dot}`} />{stageLabel(job)}</span>
-          <span className="dpct">{["complete", "delivered"].includes(job.stage) ? "" : barIndeterminate(job) ? "" : `${pct}%`}</span>
+          {showPct && <span className="dpct">{pct}<small>%</small></span>}
           <Icon name="chevD" className="dchev" />
         </span>
+        {showBar && <span className={`dbar progress ${progressClass(job)}`} aria-hidden="true"><span className="fill" style={{ width: `${pct}%` }} /></span>}
       </button>
       <Collapse open={open} className="ddrawer">
         <Drawer group={group} job={job} setCurrent={setCurrent} drawer={drawer} setDrawer={setDrawer} statsForNerds={statsForNerds} setStatsForNerds={setStatsForNerds} trackUpload={trackUpload} settings={settings} demo={demo} actions={actions || headActions} cancelArmed={!!actions && cancelArmed} onCancel={actions ? onCancel : () => void headActions.run("cancel")} onRetryJob={onRetryJob} />
@@ -542,13 +544,10 @@ function Drawer({ group, job, setCurrent, drawer, setDrawer, statsForNerds, setS
             <li key={name} className="phase" data-state={state} aria-current={state === "current" ? "step" : undefined}>
               <span className="link-fill" />
               <span className="node">
-                {state === "current" && !job.paused && (
-                  <svg className="ring" viewBox="0 0 36 36"><circle className="bg" cx="18" cy="18" r="15.5" /><circle className="fg" cx="18" cy="18" r="15.5" strokeDasharray="97.4" strokeDashoffset={97.4 * (1 - clamp(pct / 100, 0, 1))} /></svg>
-                )}
                 {state === "done" ? <Icon name="check" /> : state === "failed" ? <Icon name="x" /> : state === "skipped" ? "–" : n + 1}
               </span>
               <span>{name}</span>
-              <small>{state === "skipped" ? job.localPkg && index === 0 ? "Local file" : "Not needed" : state === "done" ? "Done" : state === "current" ? (job.paused ? "Paused" : detail.indeterminate ? detail.label : `${pct}%`) : state === "failed" ? "Stopped" : ""}</small>
+              <small>{state === "skipped" ? job.localPkg && index === 0 ? "Local file" : "Not needed" : state === "done" ? "Done" : state === "current" ? (job.paused ? "Paused" : detail.indeterminate ? detail.label : "In progress") : state === "failed" ? "Stopped" : ""}</small>
             </li>
           )
         })}
@@ -564,15 +563,12 @@ function Drawer({ group, job, setCurrent, drawer, setDrawer, statsForNerds, setS
         {drawer === "packages" && (
           <div className="drows">
             {group.jobs.map(item => {
-              const tracker = trackUpload(item)
-              const s = transferStats(item, tracker)
-              const p = ["complete", "delivered"].includes(item.stage) ? 100 : barPercent(item, tracker)
+              const s = transferStats(item, trackUpload(item))
+              const st = statusOf(item)
               return (
-                <button key={item.jobId} type="button" className={`drow ${item.jobId === job.jobId ? "is-current" : ""}`} onClick={() => setCurrent(item.jobId)}>
-                  <span><strong>{kindLabel(kindOf(item))}{item.packageVersion && <small>v{item.packageVersion}</small>}</strong><span className="sub">{stageLabel(item)}{item.message && activeTransfer(item) ? `. ${displayText(item.message)}` : ""}</span></span>
-                  <span className={`progress ${progressClass(item)}`}><span className="fill" style={{ width: `${p}%` }} /></span>
-                  <span className="num">{s.label}</span>
-                  <span className="pc">{barIndeterminate(item) ? "" : `${p}%`}</span>
+                <button key={item.jobId} type="button" className={`drow ${item.jobId === job.jobId ? "is-current" : ""}`} onClick={() => setCurrent(item.jobId)} aria-pressed={item.jobId === job.jobId}>
+                  <span><strong>{kindLabel(kindOf(item))}{item.packageVersion && <small>v{item.packageVersion}</small>}</strong><span className="sub">{item.message && activeTransfer(item) ? displayText(item.message) : s.label}</span></span>
+                  <span className={`dstatus ${st.cls}`}><span className={`dot ${st.dot}`} />{stageLabel(item)}</span>
                 </button>
               )
             })}

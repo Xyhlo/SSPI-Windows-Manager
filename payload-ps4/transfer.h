@@ -16,4 +16,5 @@ void release_lane(Lane *lane);
 int transfer_pin(const char *path, PkgInfo *info);
 void transfer_finish(const char *path, bool installed);
 void transfer_reset(void);
+bool transfer_busy(void);
 #endif

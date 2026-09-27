@@ -3,6 +3,8 @@
 #include "transfer.h"
 #include "install.h"
 #include "installed_library.h"
+#include "console_tools.h"
+#include "../payload/console_files.h"
 #include "notify.h"
 #include "log.h"
 #include <arpa/inet.h>
@@ -27,6 +29,7 @@ extern int privilege_apply(void);
 static atomic_bool stopping, boot_done;
 static atomic_uint clients;
 static RxMutex clients_lock=RX_MUTEX_INIT, config_lock=RX_MUTEX_INIT;
+static RxMutex operation_lock=RX_MUTEX_INIT;
 static int client_fds[MAX_CLIENTS], listen_fd=-1, port=DEFAULT_PORT, receiver_uid=-1, boot_result, jbc_result;
 static OrbisPthread client_threads[MAX_CLIENTS], worker_thread;
 static bool jailbroken, writable;
@@ -81,6 +84,10 @@ static int config_reply(int fd) {
 }
 static bool empty_command(unsigned cmd) { return cmd==CMD_PING||cmd==CMD_GET_CONFIG||cmd==CMD_END_UPLOAD||cmd==CMD_INSTALL_PREFLIGHT||cmd==CMD_STOP||cmd==CMD_LIST_INSTALLED; }
 static uint32_t command_limit(unsigned cmd) {
+    if (cmd==CMD_SHELL_REFRESH || cmd==CMD_SYSTEM_INFO) return 0;
+    if (cmd==CMD_TITLE_ICON_GET) return 11;
+    if (cmd==CMD_TITLE_ICON_RESTORE) return 10;
+    if (cmd==CMD_TITLE_ICON_SET) return CT_MAX_PNG+10;
     if (empty_command(cmd)) return 0;
     if (cmd==CMD_PROGRESS_NOTIFICATION) return 512u*1024u+16400u;
     if (cmd==CMD_INSTALL_URL) return 8193;
@@ -91,6 +98,8 @@ static uint32_t command_limit(unsigned cmd) {
 static int dispatch(int fd, uint8_t cmd, const uint8_t *b, uint32_t n, Lane *lane) {
     const char *path;
     switch(cmd) {
+        case CMD_TITLE_ICON_GET: case CMD_TITLE_ICON_SET: case CMD_TITLE_ICON_RESTORE:
+        case CMD_SHELL_REFRESH: case CMD_SYSTEM_INFO: return console_tools_request(fd,cmd,b,n);
         case CMD_PING: return text_reply(fd,RESP_OK,"SSPI");
         case CMD_GET_CONFIG: return config_reply(fd);
         case CMD_SET_PORT: {
@@ -123,6 +132,7 @@ static int dispatch(int fd, uint8_t cmd, const uint8_t *b, uint32_t n, Lane *lan
         case CMD_TITLE_CONTEXT: { int rc=notify_context(b,n); return text_reply(fd,rc?RESP_ERROR:RESP_OK,rc?"invalid title context":"OK"); }
         case CMD_PROGRESS_NOTIFICATION: { int rc=notify_artwork(b,n); return text_reply(fd,rc?RESP_ERROR:RESP_OK,rc?"invalid notification artwork or cache write failed":"OK"); }
         case CMD_STOP: {
+            if (transfer_busy() || install_busy()) return text_reply(fd,RESP_ERROR,"A transfer or installation is active. Wait for it to finish before stopping the receiver.");
             int rc=text_reply(fd,RESP_OK,"stopping"); atomic_store(&stopping,true); return rc?rc:-1;
         }
         default: return text_reply(fd,RESP_ERROR,"unknown command");
@@ -138,7 +148,12 @@ static void *client(void *arg) {
         if (cmd==CMD_UPLOAD_CHUNK) { if (handle_upload_chunk_deadline(fd,size,&lane,buffer,&deadline)) break; continue; }
         if (size>command_limit(cmd)) { if (text_reply(fd,RESP_ERROR,"invalid command length")) log_line("length error reply failed"); break; }
         uint8_t *body=buffer; if (size>UPLOAD_BUFFER) { body=malloc(size); if (!body) break; }
-        rc=size?recv_all_deadline(fd,body,size,&deadline):0; if (!rc) rc=dispatch(fd,cmd,body,size,&lane);
+        rc=size?recv_all_deadline(fd,body,size,&deadline):0;
+        bool guarded=cmd==CMD_START_UPLOAD || cmd==CMD_INSTALL_PKG || cmd==CMD_INSTALL_URL || cmd==CMD_STOP;
+        if (guarded) rx_lock(&operation_lock);
+        if (atomic_load(&stopping)) rc=-1;
+        if (!rc) rc=dispatch(fd,cmd,body,size,&lane);
+        if (guarded) rx_unlock(&operation_lock);
         if (body!=buffer) free(body); if (rc) break;
     }
     free(buffer);

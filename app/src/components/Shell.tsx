@@ -3,12 +3,31 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "re
 import { createPortal } from "react-dom"
 import sspiLogo from "@/assets/sspi-logo.svg"
 import { consoleAddress } from "@/lib/consoles"
+import type { ConsoleProbe } from "@/lib/console-types"
 import { SPRINGS, glide, motionOK, settle } from "@/lib/motion"
 import type { ConsoleKind, Settings } from "@/types"
 import { Icon } from "./Icon"
 
-export type Tab = "search" | "downloads"
-export type ConsoleState = "unknown" | "ok" | "fail"
+export type Tab = "library" | "search" | "downloads" | "tools"
+export const TABS: Array<[Tab, string]> = [["library", "Library"], ["search", "Search"], ["downloads", "Downloads"], ["tools", "Tools"]]
+export type ConsoleState = "unknown" | "ok" | "warn" | "fail"
+
+/** The header dot for a console: the launch probe when there is one, otherwise the last connection test. */
+export function consoleDot(state: ConsoleState) {
+  return state === "ok" ? "good live" : state === "warn" ? "warn" : state === "fail" ? "fail" : ""
+}
+
+/** One plain sentence about a console's receiver, for menus and banners. */
+export function probeSentence(probe: ConsoleProbe | undefined, demo = false) {
+  if (demo) return "Offline preview"
+  if (!probe) return "Checking the receiver"
+  const { receiver } = probe
+  if (receiver.state === "online") return `Receiver ${receiver.version || receiver.expectedVersion} at ${probe.host}`
+  if (receiver.state === "outdated") return `Receiver ${receiver.version || "(older)"} is loaded; this app needs ${receiver.expectedVersion}`
+  if (receiver.state === "unconfigured") return `Add your ${probe.target.toUpperCase()} address in Options`
+  if (receiver.state === "error") return receiver.message || `Something else answered at ${probe.host}:${receiver.port}`
+  return receiver.message || `Nothing answered at ${probe.host}:${receiver.port}`
+}
 
 const inTauri = () => "__TAURI_INTERNALS__" in window
 
@@ -50,19 +69,22 @@ export function pulseDownloadsTab() {
   void settle(ring.animate([{ opacity: 0.9, transform: "scale(.9)" }, { opacity: 0, transform: "scale(1.18)" }], { duration: 700, easing: "cubic-bezier(.2,.8,.2,1)" })).then(() => ring.remove())
 }
 
-export function Header({ tab, activeJobs, settings, consoleState, demo, brandRef, menuDisabled = false, onTab, onStep, onConsole, onOptions, onManageConsoles }: {
+export function Header({ tab, activeJobs, settings, consoleState, probes, demo, brandRef, menuDisabled = false, loadingReceiver, onTab, onStep, onConsole, onOptions, onManageConsoles, onLoadReceiver }: {
   tab: Tab
   activeJobs: number
   settings: Settings
   consoleState: Record<ConsoleKind, ConsoleState>
+  probes: Partial<Record<ConsoleKind, ConsoleProbe>>
   demo: boolean
   brandRef: React.RefObject<HTMLImageElement>
   menuDisabled?: boolean
+  loadingReceiver: ConsoleKind | null
   onTab: (tab: Tab) => void
   onStep: (direction: -1 | 1) => void
   onConsole: (target: ConsoleKind) => void
   onOptions: () => void
   onManageConsoles: () => void
+  onLoadReceiver: (target: ConsoleKind) => void
 }) {
   const tabsRef = useRef<HTMLElement>(null)
   const inkRef = useRef<HTMLSpanElement>(null)
@@ -95,16 +117,17 @@ export function Header({ tab, activeJobs, settings, consoleState, demo, brandRef
 
   const active = settings.activeConsole
   const address = demo ? "Offline preview" : consoleAddress(settings, active) || (active === "ps5" ? "Receiver not set" : "PS4 not set")
-  const dot = consoleState[active] === "ok" ? "good live" : consoleState[active] === "fail" ? "fail" : ""
+  const dot = consoleDot(consoleState[active])
   return (
     <header className="header">
-      <button type="button" className="brand" aria-label="Search" onClick={() => onTab("search")}><img ref={brandRef} src={sspiLogo} alt="SSPI" draggable={false} /></button>
+      <button type="button" className="brand" aria-label="Library" onClick={() => onTab("library")}><img ref={brandRef} src={sspiLogo} alt="SSPI" draggable={false} /></button>
       <nav className="tabs" ref={tabsRef} role="tablist" aria-label="Sections">
         <span className="shoulder l" id="shoulderQ" role="button" tabIndex={-1} aria-label="Previous section (Q)" onClick={() => onStep(-1)}>Q</span>
-        <button type="button" className="tab" role="tab" data-page="search" aria-selected={tab === "search"} onClick={() => onTab("search")}>Search</button>
-        <button type="button" className="tab" role="tab" data-page="downloads" aria-selected={tab === "downloads"} onClick={() => onTab("downloads")}>
-          Downloads{activeJobs > 0 && <span className="tab-badge" ref={badgeRef}>{activeJobs}</span>}
-        </button>
+        {TABS.map(([id, label]) => (
+          <button key={id} type="button" className="tab" role="tab" data-page={id} aria-selected={tab === id} onClick={() => onTab(id)}>
+            {label}{id === "downloads" && activeJobs > 0 && <span className="tab-badge" ref={badgeRef}>{activeJobs}</span>}
+          </button>
+        ))}
         <span className="shoulder r" id="shoulderE" role="button" tabIndex={-1} aria-label="Next section (E)" onClick={() => onStep(1)}>E</span>
         <span className="tab-ink" ref={inkRef} />
       </nav>
@@ -118,14 +141,14 @@ export function Header({ tab, activeJobs, settings, consoleState, demo, brandRef
         <button type="button" className="options-btn" onClick={onOptions}><span className="options-glyph" aria-hidden="true"><i /><i /><i /></span>Options</button>
       </div>
       {menu && !menuDisabled && chipRef.current && createPortal(
-        <ConsoleMenu anchor={chipRef.current} settings={settings} consoleState={consoleState} demo={demo} onClose={() => setMenu(false)} onPick={target => { setMenu(false); onConsole(target) }} onManage={() => { setMenu(false); onManageConsoles() }} />,
+        <ConsoleMenu anchor={chipRef.current} settings={settings} consoleState={consoleState} probes={probes} demo={demo} loadingReceiver={loadingReceiver} onClose={() => setMenu(false)} onPick={target => { setMenu(false); onConsole(target) }} onManage={() => { setMenu(false); onManageConsoles() }} onLoadReceiver={onLoadReceiver} />,
         document.body,
       )}
     </header>
   )
 }
 
-function ConsoleMenu({ anchor, settings, consoleState, demo, onClose, onPick, onManage }: { anchor: HTMLElement | null; settings: Settings; consoleState: Record<ConsoleKind, ConsoleState>; demo: boolean; onClose: () => void; onPick: (target: ConsoleKind) => void; onManage: () => void }) {
+function ConsoleMenu({ anchor, settings, consoleState, probes, demo, loadingReceiver, onClose, onPick, onManage, onLoadReceiver }: { anchor: HTMLElement | null; settings: Settings; consoleState: Record<ConsoleKind, ConsoleState>; probes: Partial<Record<ConsoleKind, ConsoleProbe>>; demo: boolean; loadingReceiver: ConsoleKind | null; onClose: () => void; onPick: (target: ConsoleKind) => void; onManage: () => void; onLoadReceiver: (target: ConsoleKind) => void }) {
   const ref = useRef<HTMLDivElement>(null)
   const [position, setPosition] = useState<{ top: number; right: number } | null>(null)
   useLayoutEffect(() => {
@@ -156,18 +179,30 @@ function ConsoleMenu({ anchor, settings, consoleState, demo, onClose, onPick, on
     ref.current?.querySelector<HTMLElement>("[aria-checked=true]")?.focus()
     return () => { document.removeEventListener("pointerdown", away, true); document.removeEventListener("keydown", key, true) }
   }, [anchor, onClose])
-  const items: Array<{ id: ConsoleKind; detail: string }> = [
-    { id: "ps5", detail: demo ? "Offline preview" : consoleAddress(settings, "ps5") ? `Receiver at ${consoleAddress(settings, "ps5")}` : "Receiver not set" },
-    { id: "ps4", detail: demo ? "Offline preview" : consoleAddress(settings, "ps4") ? `${settings.ps4Transport === "receiver" ? "Receiver" : "SSPI inbox"} at ${consoleAddress(settings, "ps4")}` : "PS4 not set" },
-  ]
+  const fallback = (id: ConsoleKind) => id === "ps5"
+    ? consoleAddress(settings, "ps5") ? `Receiver at ${consoleAddress(settings, "ps5")}` : "Receiver not set"
+    : consoleAddress(settings, "ps4") ? `${settings.ps4Transport === "receiver" ? "Receiver" : "SSPI inbox"} at ${consoleAddress(settings, "ps4")}` : "PS4 not set"
+  const items = (["ps5", "ps4"] as const).map(id => {
+    const probe = probes[id]
+    const reload = !demo && !!probe?.host && (probe.receiver.state === "outdated" || probe.receiver.state === "offline")
+    return { id, detail: demo ? "Offline preview" : probe ? probeSentence(probe) : fallback(id), reload }
+  })
   return (
     <div ref={ref} className="popover" role="menu" style={{ top: position?.top ?? 0, right: position?.right ?? 0, visibility: position ? "visible" : "hidden" }}>
       {items.map(item => (
-        <button key={item.id} type="button" className="pop-item" role="menuitemradio" aria-checked={settings.activeConsole === item.id} onClick={() => onPick(item.id)}>
-          <span className="pop-ico">{item.id.toUpperCase()}<span className={`dot ${consoleState[item.id] === "ok" ? "good" : consoleState[item.id] === "fail" ? "fail" : ""}`} /></span>
-          <span><strong>Manage {item.id.toUpperCase()}</strong><span>{item.detail}</span></span>
-          <Icon name="check" className="ck" />
-        </button>
+        <div key={item.id} className="pop-group">
+          <button type="button" className="pop-item" role="menuitemradio" aria-checked={settings.activeConsole === item.id} onClick={() => onPick(item.id)}>
+            <span className="pop-ico">{item.id.toUpperCase()}<span className={`dot ${consoleDot(consoleState[item.id]).replace(" live", "")}`} /></span>
+            <span><strong>Manage {item.id.toUpperCase()}</strong><span>{item.detail}</span></span>
+            <Icon name="check" className="ck" />
+          </button>
+          {item.reload && (
+            <button type="button" className="pop-action" role="menuitem" disabled={loadingReceiver !== null} onClick={() => onLoadReceiver(item.id)}>
+              {loadingReceiver === item.id ? <span className="spinner" /> : <Icon name="upload" />}
+              {loadingReceiver === item.id ? "Loading the receiver" : `Load the receiver on your ${item.id.toUpperCase()}`}
+            </button>
+          )}
+        </div>
       ))}
       <div className="pop-sep" />
       <div className="pop-foot"><button type="button" className="link" onClick={onManage}>Console settings in Options</button></div>

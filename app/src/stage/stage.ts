@@ -71,12 +71,14 @@ void main() {
 }`
 
 /* Download cards: an opaque surface drawn behind the DOM card, so the card's 3D case stays
-   visible above it. The open card gets a faint, mostly desaturated wash of its game's art. */
+   visible above it. With the Artwork card style the card head (uBannerH px tall) is filled with
+   the game's blurred art, darkest where the text sits; the Plain style keeps the flat surface
+   and gives the open card a faint, mostly desaturated wash. */
 const SURFACE_FRAG = /* glsl */`
 precision highp float;
 varying vec2 vUv;
 uniform sampler2D uMap;
-uniform float uOpacity, uAspect, uRadius, uArt, uHover, uHasMap;
+uniform float uOpacity, uAspect, uRadius, uArt, uHover, uHasMap, uBanner, uBannerH;
 uniform vec2 uSize;
 uniform vec4 uClip;
 uniform vec3 uBase;
@@ -91,8 +93,19 @@ void main() {
   art = mix(vec3(lum), art, .4) * .6;
   vec3 surface = uBase + uHover * vec3(.016, .016, .018);
   float fromTop = (1.0 - uv.y) * uSize.y;
-  float wash = smoothstep(.4, 1.0, uv.x) * (1.0 - smoothstep(80.0, 300.0, fromTop)) * uArt * uHasMap * .26;
+  float wash = smoothstep(.4, 1.0, uv.x) * (1.0 - smoothstep(80.0, 300.0, fromTop)) * uArt * uHasMap * .26 * (1.0 - uBanner);
   vec3 col = mix(surface, max(surface, art), wash);
+  if (uBanner > .001 && uHasMap > .5) {
+    float bh = max(uBannerH, 1.0);
+    vec2 bst = vec2(uv.x, 1.0 - clamp(fromTop / bh, 0.0, 1.0));
+    float bAspect = uSize.x / bh;
+    if (bAspect > texAspect) { bst.y = .5 + (bst.y - .5) * texAspect / bAspect; } else { bst.x = .5 + (bst.x - .5) * bAspect / texAspect; }
+    vec3 raw = texture2D(uMap, bst).rgb;
+    float l = dot(raw, vec3(.299, .587, .114));
+    vec3 banner = mix(vec3(l), raw, .85) * mix(.26, .5, smoothstep(.08, .95, uv.x)) + uHover * .02;
+    float inBanner = 1.0 - smoothstep(bh - 22.0, bh + 1.0, fromTop);
+    col = mix(col, banner, uBanner * inBanner);
+  }
   vec2 p = (uv - .5) * uSize;
   float edge = 1.0 - smoothstep(-1.0, 1.0, roundedBox(p, uSize * .5 - 1.0, uRadius));
   float clip = step(uClip.y, gl_FragCoord.y) * step(gl_FragCoord.y, uClip.w) * step(uClip.x, gl_FragCoord.x) * step(gl_FragCoord.x, uClip.z);
@@ -437,7 +450,7 @@ function createStage() {
   })
 
   /* ---------- card surfaces */
-  type Surface = { mesh: THREE.Mesh; material: THREE.ShaderMaterial; alpha: Spring; art: Spring; hover: Spring; radius: number; spec: CoverSpec }
+  type Surface = { mesh: THREE.Mesh; material: THREE.ShaderMaterial; alpha: Spring; art: Spring; hover: Spring; banner: Spring; head: HTMLElement | null; radius: number; spec: CoverSpec }
   const surfaces = new Map<HTMLElement, Surface>()
   const blankTex = new THREE.DataTexture(new Uint8Array([17, 17, 19, 255]), 1, 1)
   blankTex.needsUpdate = true
@@ -449,6 +462,7 @@ function createStage() {
         uniforms: {
           uMap: { value: blankTex }, uHasMap: { value: 0 }, uOpacity: { value: 0 }, uAspect: { value: 1 }, uRadius: { value: 12 },
           uSize: { value: new THREE.Vector2(100, 100) }, uClip: { value: OPEN_CLIP() }, uArt: { value: 0 }, uHover: { value: 0 },
+          uBanner: { value: 0 }, uBannerH: { value: 100 },
           uBase: { value: new THREE.Vector3(17 / 255, 17 / 255, 19 / 255) },
         },
         vertexShader: BG_VERT.replace("gl_Position = vec4(position.xy, 0.0, 1.0);", "gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);"),
@@ -457,7 +471,11 @@ function createStage() {
       const mesh = new THREE.Mesh(planeGeo, material)
       mesh.renderOrder = 1
       scene.add(mesh)
-      const surface: Surface = { mesh, material, alpha: new Spring(0, 120, 22).set(1), art: new Spring(0, 90, 20), hover: new Spring(0, 260, 26), radius: parseFloat(getComputedStyle(el).borderTopLeftRadius) || 12, spec }
+      const surface: Surface = {
+        mesh, material, alpha: new Spring(0, 120, 22).set(1), art: new Spring(0, 90, 20), hover: new Spring(0, 260, 26),
+        banner: new Spring(Number(el.dataset.banner ?? 0), 90, 20), head: el.querySelector<HTMLElement>(".dhead"),
+        radius: parseFloat(getComputedStyle(el).borderTopLeftRadius) || 12, spec,
+      }
       surfaces.set(el, surface)
       void blurredArt(spec).then(canvas => {
         if (!surfaces.has(el)) return
@@ -856,9 +874,10 @@ function createStage() {
         if (surface.alpha.value < 0.01) { scene.remove(surface.mesh); surface.material.dispose(); surfaces.delete(el); continue }
       } else {
         surface.art.set(Number(el.dataset.artLevel ?? 0))
+        surface.banner.set(Number(el.dataset.banner ?? 0))
         surface.hover.set(el.matches(":hover:not(.is-open)") ? 1 : 0)
       }
-      surface.alpha.step(dt); surface.art.step(dt); surface.hover.step(dt)
+      surface.alpha.step(dt); surface.art.step(dt); surface.hover.step(dt); surface.banner.step(dt)
       const r = el.getBoundingClientRect()
       if (el.isConnected && r.width > 0) {
         const z = -CASE.thickness * 300 - 20, k = (camDist - z) / camDist
@@ -872,6 +891,8 @@ function createStage() {
       u.uOpacity.value = clamp(surface.alpha.value, 0, 1)
       u.uArt.value = clamp(surface.art.value, 0, 1)
       u.uHover.value = clamp(surface.hover.value, 0, 1)
+      u.uBanner.value = clamp(surface.banner.value, 0, 1)
+      u.uBannerH.value = surface.head?.offsetHeight || u.uSize.value.y
     }
     updateBoot(dt)
     updateFx(dt)

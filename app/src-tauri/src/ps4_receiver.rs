@@ -138,7 +138,7 @@ fn valid_installed_title_id(value: &str) -> bool {
     value.len() == 9 && value.starts_with("CUSA") && value.as_bytes()[4..].iter().all(u8::is_ascii_digit)
 }
 
-fn compact_installed_icon(bytes: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn compact_installed_icon(bytes: &[u8]) -> Option<Vec<u8>> {
     if !pkg_meta::is_valid_png(bytes) { return None; }
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
     let mut limits = image::Limits::default();
@@ -159,7 +159,7 @@ fn compact_installed_icon(bytes: &[u8]) -> Option<Vec<u8>> {
 
 async fn decode_installed_metadata(expected_title_id: &str, data: &[u8]) -> Result<(Option<String>, Option<String>, Option<String>, Option<String>, Vec<String>), String> {
     const MAX_SFO: usize = 64 * 1024;
-    const MAX_ICON: usize = 1024 * 1024;
+    const MAX_ICON: usize = 2 * 1024 * 1024;
     let mut cursor = 0;
     let base_sfo = installed_metadata_field(data, &mut cursor, MAX_SFO)?;
     let patch_sfo = installed_metadata_field(data, &mut cursor, MAX_SFO)?;
@@ -1251,7 +1251,7 @@ mod tests {
     fn ps5_endpoint_literals_and_wire_paths_are_unchanged() {
         let settings = Settings { ps5_host:"192.168.1.5".into(), ps5_port:9120, ..Settings::default() };
         let endpoint = ReceiverEndpoint::ps5(&settings);
-        assert_eq!((endpoint.console, endpoint.host.as_str(), endpoint.port, endpoint.expected_version), ("PS5", "192.168.1.5", 9120, "1.0.5"));
+        assert_eq!((endpoint.console, endpoint.host.as_str(), endpoint.port, endpoint.expected_version), ("PS5", "192.168.1.5", 9120, RECEIVER_VERSION));
         assert_eq!(endpoint.pkg_dir, "/user/data/tmp"); assert_eq!(endpoint.dump_prefix, Some("/data/homebrew")); assert!(endpoint.required_capabilities.is_empty());
         assert_eq!(endpoint.path_body("/user/data/tmp/test.pkg"), b"/user/data/tmp/test.pkg");
         assert!(remote(&endpoint, Some("CUSA12345")).starts_with("/user/data/tmp/upload_CUSA12345_"));

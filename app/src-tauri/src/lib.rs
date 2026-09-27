@@ -12,9 +12,12 @@ mod backport;
 mod debrid;
 mod package_details;
 mod static_catalog;
+mod discovery;
+mod payloads;
 mod ps4_protocol;
 mod ps4_inbox;
 mod ps4_receiver;
+mod console_tools;
 mod pkg_meta;
 mod pkg_server;
 #[cfg(test)]
@@ -50,8 +53,8 @@ use url::Url;
 use uuid::Uuid;
 
 const CONFIG_NAME: &str = "settings.json";
-const RECEIVER_VERSION: &str = "1.0.5";
-const PS4_RECEIVER_VERSION: &str = "1.0.3";
+const RECEIVER_VERSION: &str = "1.0.6";
+const PS4_RECEIVER_VERSION: &str = "1.0.4";
 
 #[derive(Debug, Clone)]
 struct ReceiverEndpoint {
@@ -119,6 +122,7 @@ const PS4_RECEIVER_ELF: &[u8] = include_bytes!("../../../../Build-Output/Windows
 struct Settings {
     ps5_host: String,
     ps5_port: u16,
+    #[serde(default = "default_ps5_loader_port")] ps5_loader_port: u16,
     #[serde(default = "default_console")] active_console: String,
     #[serde(default)] ps4_host: String,
     #[serde(default = "default_ps4_transport")] ps4_transport: String,
@@ -177,6 +181,7 @@ fn default_console() -> String { "ps5".into() }
 fn default_ps4_transport() -> String { "receiver".into() }
 fn default_receiver_port() -> u16 { 9114 }
 fn default_ps4_loader_port() -> u16 { 9090 }
+fn default_ps5_loader_port() -> u16 { 9021 }
 fn default_ps4_serve_port() -> u16 { 9115 }
 fn default_ps4_port() -> u16 { 2121 }
 fn default_ps4_archive_mode() -> String { "pc".into() }
@@ -197,6 +202,7 @@ impl Default for Settings {
         Self {
             ps5_host: String::new(),
             ps5_port: 9114,
+            ps5_loader_port: default_ps5_loader_port(),
             active_console: default_console(), ps4_host: String::new(), ps4_ftp_port: default_ps4_port(),
             ps4_transport: default_ps4_transport(), ps4_receiver_port: default_receiver_port(),
             ps4_loader_port: default_ps4_loader_port(), ps4_serve_port: default_ps4_serve_port(),
@@ -524,6 +530,7 @@ fn local_package_from_path(path: &Path, number: usize) -> LocalPackage {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SaveSettings {
+    #[serde(default)] ps5_loader_port: Option<u16>,
     #[serde(default)] active_console: Option<String>,
     #[serde(default)] ps4_host: Option<String>,
     #[serde(default)] ps4_transport: Option<String>,
@@ -2194,6 +2201,7 @@ fn save_settings(
     input: SaveSettings,
 ) -> Result<Settings, String> {
     if let Some(console) = &input.active_console { delivery_target(Some(console))?; }
+    if input.ps5_loader_port == Some(0) { return Err("PS5 loader port must be between 1 and 65535.".into()); }
     ps4_receiver::validate_settings(input.ps4_transport.as_deref(), input.ps4_receiver_port, input.ps4_loader_port, input.ps4_serve_port)?;
     if input.ps4_ftp_port == Some(0) { return Err("PS4 FTP port must be between 1 and 65535.".into()); }
     if input.ps4_archive_mode.as_deref().is_some_and(|mode| !matches!(mode, "pc" | "ps4")) {
@@ -2235,6 +2243,7 @@ fn save_settings(
         ps4_remove_after_install: input.ps4_remove_after_install.unwrap_or(s.ps4_remove_after_install),
         ps5_host: input.ps5_host.trim().into(),
         ps5_port: input.ps5_port,
+        ps5_loader_port: input.ps5_loader_port.unwrap_or(s.ps5_loader_port),
         resolver_base_url: input.resolver_base_url.trim_end_matches('/').into(),
         download_dir: input.download_dir.trim().into(),
         onboarding_complete: input.onboarding_complete,
@@ -5307,6 +5316,12 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            console_tools::list_console_library,
+            console_tools::get_title_icon,
+            console_tools::set_title_icon,
+            console_tools::restore_title_icon,
+            console_tools::refresh_console_shell,
+            console_tools::console_system_info,
             get_settings,
             save_settings,
             inspect_package_dump,
@@ -5345,7 +5360,16 @@ pub fn run() {
             scan_local_packages,
             start_local_install,
             scan_manual_folder,
-            start_manual_install
+            start_manual_install,
+            discovery::probe_consoles,
+            discovery::discover_consoles,
+            payloads::list_payloads,
+            payloads::add_payloads,
+            payloads::update_payload,
+            payloads::remove_payload,
+            payloads::send_payload,
+            payloads::save_theme_file,
+            payloads::load_theme_file
         ])
         .run(tauri::generate_context!())
         .expect("Tauri error")

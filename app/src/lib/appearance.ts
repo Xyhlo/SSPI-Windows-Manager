@@ -29,10 +29,13 @@ export const patternIndex = (id: string) => Math.max(0, PATTERNS.findIndex(patte
 /** The backdrop pattern is drawn at reduced strength so it stays behind the interface. */
 export const PATTERN_STRENGTH = 0.58
 
-/** Look-and-feel preferences. They only affect this PC's window, so they live in the WebView's storage. */
-export type Appearance = { accent: string; pattern: string; gameTint: boolean; statsForNerds: boolean }
+export type CardStyle = "art" | "plain"
+export type CardSize = "large" | "compact"
 
-export const DEFAULT_APPEARANCE: Appearance = { accent: "#E4E4E1", pattern: "ripple", gameTint: false, statsForNerds: true }
+/** Look-and-feel preferences. They only affect this PC's window, so they live in the WebView's storage. */
+export type Appearance = { accent: string; pattern: string; gameTint: boolean; statsForNerds: boolean; cardStyle: CardStyle; cardSize: CardSize }
+
+export const DEFAULT_APPEARANCE: Appearance = { accent: "#E4E4E1", pattern: "ripple", gameTint: false, statsForNerds: true, cardStyle: "art", cardSize: "large" }
 
 const KEY = "sspi.appearance.v1"
 
@@ -45,6 +48,8 @@ export function loadAppearance(): Appearance {
       pattern: PATTERNS.some(p => p.id === saved.pattern) ? saved.pattern! : DEFAULT_APPEARANCE.pattern,
       gameTint: typeof saved.gameTint === "boolean" ? saved.gameTint : DEFAULT_APPEARANCE.gameTint,
       statsForNerds: typeof saved.statsForNerds === "boolean" ? saved.statsForNerds : DEFAULT_APPEARANCE.statsForNerds,
+      cardStyle: saved.cardStyle === "plain" || saved.cardStyle === "art" ? saved.cardStyle : DEFAULT_APPEARANCE.cardStyle,
+      cardSize: saved.cardSize === "compact" || saved.cardSize === "large" ? saved.cardSize : DEFAULT_APPEARANCE.cardSize,
     }
   } catch {
     return { ...DEFAULT_APPEARANCE }

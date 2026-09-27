@@ -32,6 +32,9 @@ static void destroy(Transfer *t) {
     while (t->segments) { Segment *s=t->segments; t->segments=s->next; free(s); }
     free(t); transfer_count--;
 }
+bool transfer_busy(void) {
+    rx_lock(&lock); bool busy=upload_lanes!=0; rx_unlock(&lock); return busy;
+}
 void release_lane(Lane *lane) {
     rx_lock(&lock); Transfer *t=lane->transfer;
     if (t) { t->active_lanes--; upload_lanes--; memset(lane,0,sizeof(*lane)); if (!t->active_lanes && t->completed!=t->total) destroy(t); }

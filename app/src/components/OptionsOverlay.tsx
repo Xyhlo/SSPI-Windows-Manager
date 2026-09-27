@@ -7,13 +7,16 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog"
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from "react"
 import { DoctorReportView } from "./DoctorReportView"
 import { CheckDraw, Icon } from "./Icon"
+import { Field, Row, Seg, Switch } from "./Controls"
 import { Dock, type Hint } from "./Shell"
 import { toast } from "./toasts"
 import { ACCENTS, DEFAULT_APPEARANCE, PATTERNS, type Appearance } from "@/lib/appearance"
+import { discoverConsoles } from "@/lib/console-api"
 import { displayText } from "@/lib/display"
 import { errorText } from "@/lib/format"
 import { glide } from "@/lib/motion"
 import { patternPreview } from "@/stage/art"
+import type { DiscoveredConsole } from "@/lib/console-types"
 import type { ConsoleKind, DoctorReport, PackageSource, Ps4Probe, Settings } from "@/types"
 
 export type OptionsTab = "consoles" | "sources" | "debrid" | "downloads" | "packaging" | "appearance"
@@ -39,40 +42,6 @@ type Props = {
 
 const inTauri = () => "__TAURI_INTERNALS__" in window
 
-function Row({ label, detail, children, tone, wide, className = "" }: { label: string; detail?: ReactNode; children?: ReactNode; tone?: "warn" | "good"; wide?: boolean; className?: string }) {
-  return (
-    <div className={`orow ${wide ? "wide" : ""} ${className}`}>
-      <div className="ol"><strong>{label}</strong>{detail && <span className={tone || ""}>{detail}</span>}</div>
-      {children && <div className="or">{children}</div>}
-    </div>
-  )
-}
-
-function Switch({ checked, onChange, label, disabled }: { checked: boolean; onChange: (value: boolean) => void; label: string; disabled?: boolean }) {
-  return <button type="button" className="switch" role="switch" aria-checked={checked} aria-label={label} disabled={disabled} onClick={() => onChange(!checked)} />
-}
-
-function Field({ value, onChange, placeholder, type = "text", width = 240, icon, label }: { value: string | number; onChange: (value: string) => void; placeholder?: string; type?: string; width?: number; icon?: Parameters<typeof Icon>[0]["name"]; label: string }) {
-  return (
-    <label className="field" style={{ width }}>
-      {icon && <Icon name={icon} />}
-      <input type={type} value={value} placeholder={placeholder} aria-label={label} autoComplete="off" spellCheck={false} onChange={event => onChange(event.target.value)} />
-    </label>
-  )
-}
-
-function Seg<T extends string>({ value, options, onChange, label }: { value: T; options: Array<[T, string]>; onChange: (value: T) => void; label: string }) {
-  const ref = useRef<HTMLDivElement>(null)
-  const thumb = useRef<HTMLSpanElement>(null)
-  useLayoutEffect(() => { glide(thumb.current, ref.current?.querySelector<HTMLElement>("[aria-pressed=true]") || null, ref.current) }, [value])
-  return (
-    <div className="seg" role="group" aria-label={label} ref={ref}>
-      <span className="seg-thumb" ref={thumb} />
-      {options.map(([id, text]) => <button key={id} type="button" aria-pressed={value === id} onClick={() => onChange(id)}>{text}</button>)}
-    </div>
-  )
-}
-
 function TestButton({ busy, ok, onClick, label, okLabel = "Connected", disabled, icon = "signal" }: { busy: boolean; ok: boolean; onClick: () => void; label: string; okLabel?: string; disabled?: boolean; icon?: Parameters<typeof Icon>[0]["name"] }) {
   return (
     <button type="button" className={`btn sm ${ok ? "ok" : ""}`} disabled={disabled || busy} onClick={onClick}>
@@ -91,6 +60,9 @@ export function OptionsOverlay(props: Props) {
   const [ps4FtpPassword, setPs4FtpPassword] = useState("")
   const [ps4Message, setPs4Message] = useState("")
   const [ps5Message, setPs5Message] = useState("")
+  const [discoveredConsoles, setDiscoveredConsoles] = useState<DiscoveredConsole[] | null>(null)
+  const [discoveryError, setDiscoveryError] = useState("")
+  const [scanningNetwork, setScanningNetwork] = useState(false)
   const [busy, setBusy] = useState("")
   const [flash, setFlash] = useState("")
   const [doctor, setDoctor] = useState<DoctorReport | null>(null)
@@ -188,6 +160,18 @@ export function OptionsOverlay(props: Props) {
   const exportPs4 = () => run("ps4-export", async () => {
     toast({ tone: "success", title: "PS4 receiver payload saved", text: await invoke<string>("export_ps4_receiver_payload") })
   }, "The payload couldn't be saved")
+  const findConsoles = async () => {
+    setScanningNetwork(true)
+    setDiscoveryError("")
+    setDiscoveredConsoles(null)
+    try { setDiscoveredConsoles(await discoverConsoles({ demo })) }
+    catch (error) { setDiscoveryError(errorText(error)) }
+    finally { setScanningNetwork(false) }
+  }
+  const useDiscoveredConsole = (console: DiscoveredConsole, target: ConsoleKind) => {
+    if (target === "ps5") patch({ ps5Host: console.host, ...(console.receiver ? { ps5Port: console.receiver.port } : {}) })
+    else patch({ ps4Host: console.host, ...(console.receiver ? { ps4ReceiverPort: console.receiver.port } : {}) })
+  }
   const verify = (id: string, token: string) => run(id, async () => {
     toast({ tone: "success", title: "Account verified", text: await invoke<string>("verify_provider", { provider: id, token: token || undefined }) })
   }, "The account couldn't be verified")
@@ -239,11 +223,27 @@ export function OptionsOverlay(props: Props) {
   const sections: Record<OptionsTab, ReactNode> = {
     consoles: <>
       <h2>Consoles</h2><p className="lede">SSPI installs on the console you manage. Browsing and package links never need a connection.</p>
+      <div className="orows one">
+        <Row wide label="Find consoles on this network" detail="Scan this PC's network for consoles and receiver services.">
+          <button type="button" className="btn sm" disabled={scanningNetwork || (!demo && !inTauri())} onClick={() => void findConsoles()}>
+            {scanningNetwork ? <><span className="spinner" aria-hidden="true" />Scanning</> : <><Icon name="search" />Find consoles</>}
+          </button>
+        </Row>
+      </div>
+      {discoveryError && <p className="opt-msg" role="alert">{discoveryError}</p>}
+      {discoveredConsoles?.length === 0 && <p className="opt-msg" role="status">No consoles answered. Check that the console is on and on the same network, then load the receiver.</p>}
+      {!!discoveredConsoles?.length && <div className="orows one" aria-label="Discovered consoles">
+        {discoveredConsoles.map(console => <Row key={`${console.host}-${console.label}`} label={console.host} detail={console.label}>
+          {(console.platform === "ps5" || console.platform === "unknown") && <button type="button" className="btn sm ghost" onClick={() => useDiscoveredConsole(console, "ps5")}>Use for PS5</button>}
+          {(console.platform === "ps4" || console.platform === "unknown") && <button type="button" className="btn sm ghost" onClick={() => useDiscoveredConsole(console, "ps4")}>Use for PS4</button>}
+        </Row>)}
+      </div>}
       <div className="opt-section">PS5 receiver</div>
       <div className="orows">
         <Row label="Address" detail="IPv4 address or hostname of your PS5"><Field label="PS5 address" value={draft.ps5Host} onChange={value => patch({ ps5Host: value })} placeholder="IP address or hostname" icon="monitor" /></Row>
         <Row label="Receiver port" detail="Must match the receiver on the PS5"><Field label="PS5 receiver port" type="number" width={110} value={draft.ps5Port} onChange={value => patch({ ps5Port: Number(value) })} /></Row>
-        <Row wide label="Receiver" detail={ps5Message || "Receiver 1.0.5 shows artwork and progress on the PS5. Reload it after updating the app or changing the port."} tone={ps5Message ? "good" : undefined}>
+        <Row label="ELF loader port" detail="Payloads and the receiver are sent here. The etaHEN and elfldr loaders listen on 9021."><Field label="PS5 ELF loader port" type="number" width={110} value={draft.ps5LoaderPort ?? 9021} onChange={value => { const port = Number(value); if (Number.isFinite(port)) patch({ ps5LoaderPort: Math.min(65535, Math.max(1, Math.trunc(port))) }) }} /></Row>
+        <Row wide label="Receiver" detail={ps5Message || "The SSPI receiver shows artwork and progress on the PS5. Reload it after updating the app or changing the port."} tone={ps5Message ? "good" : undefined}>
           <TestButton busy={busy === "ps5"} ok={flash === "ps5"} onClick={() => void testPs5()} label="Test receiver" disabled={disabled} />
           <button type="button" className="btn ghost sm" disabled={payloadBusy || disabled} onClick={() => void downloadReceiver()}>{payloadBusy ? <span className="spinner" /> : <Icon name="download" />}Download receiver ELF</button>
         </Row>
@@ -460,8 +460,17 @@ function AppearanceSection({ appearance, setAppearance, reduceMotion, setReduceM
     <div className="orows" style={{ marginTop: 12 }}>
       <Row label="Tint with game artwork" detail="The background picks up the colour of the selected game"><Switch label="Tint with game artwork" checked={appearance.gameTint} onChange={value => setAppearance(prev => ({ ...prev, gameTint: value }))} /></Row>
       <Row label="Reduced motion" detail="Static focus and immediate transitions. Saved with your settings."><Switch label="Reduced motion" checked={reduceMotion} onChange={setReduceMotion} /></Row>
-      <Row label="Restore defaults" detail="Ripple pattern and Charcoal accent, no artwork tint">
-        <button type="button" className="btn sm" onClick={event => setAppearance(prev => ({ ...prev, accent: DEFAULT_APPEARANCE.accent, pattern: DEFAULT_APPEARANCE.pattern, gameTint: false }), { x: event.clientX, y: event.clientY })}><Icon name="refresh" />Restore</button>
+      <Row label="Restore defaults" detail="Resets the background, accent, artwork tint and download cards">
+        <button type="button" className="btn sm" onClick={event => setAppearance(prev => ({ ...prev, accent: DEFAULT_APPEARANCE.accent, pattern: DEFAULT_APPEARANCE.pattern, gameTint: DEFAULT_APPEARANCE.gameTint, cardStyle: DEFAULT_APPEARANCE.cardStyle, cardSize: DEFAULT_APPEARANCE.cardSize }), { x: event.clientX, y: event.clientY })}><Icon name="refresh" />Restore</button>
+      </Row>
+    </div>
+    <div className="opt-section">Download cards</div>
+    <div className="orows">
+      <Row label="Card style" detail="Artwork blurs each game's art behind its card.">
+        <Seg label="Download card style" value={appearance.cardStyle} options={[["art", "Artwork"], ["plain", "Plain"]]} onChange={cardStyle => setAppearance(prev => ({ ...prev, cardStyle }))} />
+      </Row>
+      <Row label="Card size" detail="Compact fits more transfers on screen.">
+        <Seg label="Download card size" value={appearance.cardSize} options={[["large", "Large"], ["compact", "Compact"]]} onChange={cardSize => setAppearance(prev => ({ ...prev, cardSize }))} />
       </Row>
     </div>
   </>

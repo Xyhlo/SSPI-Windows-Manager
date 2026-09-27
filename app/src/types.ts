@@ -9,6 +9,8 @@ export type Settings = {
   ps4Transport: Ps4Transport
   ps4ReceiverPort: number
   ps4LoaderPort: number
+  /** PS5 ELF loader port for sending payloads (9021 by default). Older settings files don't have it. */
+  ps5LoaderPort?: number
   ps4ServePort: number
   ps4FtpPort: number
   ps4FtpUser: string
@@ -256,6 +258,7 @@ export const blankSettings: Settings = {
   ps4Transport: "receiver",
   ps4ReceiverPort: 9114,
   ps4LoaderPort: 9090,
+  ps5LoaderPort: 9021,
   ps4ServePort: 9115,
   ps4FtpPort: 2121,
   ps4FtpUser: "",

@@ -5,6 +5,7 @@
 #include "pkg.h"
 #include "platform.h"
 #include "proto.h"
+#include "../payload/console_files.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -68,6 +69,10 @@ static int find_base_package(const char *title_id, PkgInfo *package) {
         if (!package_at(path, title_id, package)) return 0;
     }
     return -1;
+}
+int installed_library_title_present(const char *title_id) {
+    PkgInfo package;
+    return ct_valid_id(title_id) && !memcmp(title_id,"CUSA",4) && !find_base_package(title_id,&package);
 }
 
 static int remember_candidate(const char *name, void *context) {
@@ -188,6 +193,12 @@ int installed_library_list_json(char *out, size_t capacity) {
         if (i) json_add(&json, ",");
         json_quote(&json, scan.errors[i]);
     }
+    json_add(&json, "],\"customIcons\":[");
+    unsigned custom=0;
+    for (size_t i=0;i<scan.count;i++) if (ct_custom_icon(DATA_ROOT,scan.ids[i])) {
+        if (custom++) json_add(&json,",");
+        json_quote(&json,scan.ids[i]);
+    }
     json_add(&json, "]}");
     return json.failed ? -1 : 0;
 }
@@ -258,6 +269,11 @@ static int read_patch_metadata(const char *title_id, uint8_t *out, size_t capaci
 }
 
 static int read_icon(const char *title_id, uint8_t *out, size_t capacity, size_t *length) {
+    /* The library reflects a custom home icon, while preserving the legacy 1 MiB limit. */
+    for (size_t i=0;i<ct_metadata_root_count;i++) {
+        char path[192]; snprintf(path,sizeof(path),"%s/%s/icon0.png",ct_metadata_roots[i],title_id);
+        if (!ct_read(path,out,capacity,length) && ct_valid_png(out,*length)) return 0;
+    }
     const char *roots[] = {"", "/mnt/ext0"};
     for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); ++i) {
         char path[192];
