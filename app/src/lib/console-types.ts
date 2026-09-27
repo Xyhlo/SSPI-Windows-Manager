@@ -131,3 +131,31 @@ export type PayloadSendResult = { message: string; bytes: number; port: number; 
 
 /** `save_theme_file({ path, contents })` and `load_theme_file({ path })` → contents. `.sspitheme` only, at most 8 MiB. */
 export type ThemeFileContents = string
+
+/**
+ * `build_ps4_theme({ request })` → ThemeBuildResult. The studio draws every image; the app checks
+ * sizes, compresses the animated background into the console's scene format and packs a
+ * system-theme PKG (images are base64 PNG, a data: prefix is accepted).
+ */
+export type ThemePackageColors = { themeColor: number; font: string; fontShadow: string; focus: string; homeDimmer: string; functionDimmer: string; titleDimmer: string }
+export type ThemePackageRequest = {
+  title: string
+  /** 16 characters, A–Z and 0–9; anything else gets a fresh label. */
+  label: string
+  home: string
+  function?: string | null
+  preview?: string | null
+  icon0?: string | null
+  contentIcons: Record<string, string>
+  functionIcons: Record<string, { icon: string; glow: string }>
+  colors: ThemePackageColors
+  animation?: { width: number; height: number; wait: number; frames: string[] } | null
+}
+export type ThemeBuildResult = { path: string; size: number; contentId: string; title: string; frames: number; sceneBytes: number; files: number }
+
+/**
+ * PS4 receiver `themes-v1`: `list_console_themes({ host, port })` → ConsoleThemes,
+ * `apply_console_theme` / `remove_console_theme({ host, port, contentId })` → message.
+ */
+export type InstalledTheme = { contentId: string; title: string }
+export type ConsoleThemes = { themes: InstalledTheme[]; activeContentId: string | null; truncated: boolean }

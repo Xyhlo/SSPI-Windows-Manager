@@ -82,7 +82,7 @@ static int config_reply(int fd) {
     ReceiverConfig c={port,receiver_uid,jailbroken,writable,s.bgft,s.appinst,s.userservice};
     int rc=config_json(text,49152,&c)?text_reply(fd,RESP_ERROR,"configuration JSON overflow"):text_reply(fd,RESP_DATA,text); free(text); return rc;
 }
-static bool empty_command(unsigned cmd) { return cmd==CMD_PING||cmd==CMD_GET_CONFIG||cmd==CMD_END_UPLOAD||cmd==CMD_INSTALL_PREFLIGHT||cmd==CMD_STOP||cmd==CMD_LIST_INSTALLED; }
+static bool empty_command(unsigned cmd) { return cmd==CMD_PING||cmd==CMD_GET_CONFIG||cmd==CMD_END_UPLOAD||cmd==CMD_INSTALL_PREFLIGHT||cmd==CMD_STOP||cmd==CMD_LIST_INSTALLED||cmd==CMD_THEME_LIST; }
 static uint32_t command_limit(unsigned cmd) {
     if (cmd==CMD_SHELL_REFRESH || cmd==CMD_SYSTEM_INFO) return 0;
     if (cmd==CMD_TITLE_ICON_GET) return 11;
@@ -114,9 +114,9 @@ static int dispatch(int fd, uint8_t cmd, const uint8_t *b, uint32_t n, Lane *lan
         case CMD_START_UPLOAD: return handle_start(fd,b,n,lane);
         case CMD_END_UPLOAD: return handle_end(fd,lane);
         case CMD_INSTALL_PREFLIGHT: return install_preflight(fd,writable);
-        case CMD_INSTALL_PKG: case CMD_INSTALL_URL: case CMD_CANCEL_INSTALL: case CMD_PAUSE_INSTALL: case CMD_RESUME_INSTALL:
+        case CMD_INSTALL_PKG: case CMD_INSTALL_THEME: case CMD_INSTALL_URL: case CMD_CANCEL_INSTALL: case CMD_PAUSE_INSTALL: case CMD_RESUME_INSTALL:
             return install_request(fd,cmd,b,n);
-        case CMD_LIST_INSTALLED: return install_request(fd,cmd,b,n);
+        case CMD_LIST_INSTALLED: case CMD_THEME_LIST: case CMD_THEME_APPLY: case CMD_THEME_DELETE: return install_request(fd,cmd,b,n);
         case CMD_INSTALLED_METADATA: {
             const char *id=wire_string(b,n,9);
             if (!id || !valid_title_id(id) || memcmp(id,"CUSA",4)) return text_reply(fd,RESP_ERROR,"invalid installed title ID");
@@ -149,7 +149,7 @@ static void *client(void *arg) {
         if (size>command_limit(cmd)) { if (text_reply(fd,RESP_ERROR,"invalid command length")) log_line("length error reply failed"); break; }
         uint8_t *body=buffer; if (size>UPLOAD_BUFFER) { body=malloc(size); if (!body) break; }
         rc=size?recv_all_deadline(fd,body,size,&deadline):0;
-        bool guarded=cmd==CMD_START_UPLOAD || cmd==CMD_INSTALL_PKG || cmd==CMD_INSTALL_URL || cmd==CMD_STOP;
+        bool guarded=cmd==CMD_START_UPLOAD || cmd==CMD_INSTALL_PKG || cmd==CMD_INSTALL_THEME || cmd==CMD_INSTALL_URL || cmd==CMD_STOP || cmd==CMD_THEME_APPLY || cmd==CMD_THEME_DELETE;
         if (guarded) rx_lock(&operation_lock);
         if (atomic_load(&stopping)) rc=-1;
         if (!rc) rc=dispatch(fd,cmd,body,size,&lane);

@@ -10,7 +10,10 @@ import type {
   PayloadSendResult,
   PayloadTarget,
   ShellRefreshResult,
+  ThemeBuildResult,
   ThemeFileContents,
+  ThemePackageRequest,
+  ConsoleThemes,
 } from "./console-types"
 import { demoCapabilities, demoIcon, demoLibrary, demoPayloads, demoProbes, demoSystemInfo } from "./console-demo"
 
@@ -149,4 +152,48 @@ export async function loadThemeFile({ path, demo }: { path: string; demo: boolea
   requireTauri(demo)
   if (demo) return demoResult(previewThemes.get(path) || "")
   return invoke<ThemeFileContents>("load_theme_file", { path })
+}
+
+/* ---------------------------------------------------------------- PS4 theme packages */
+let previewInstalled: ConsoleThemes = { themes: [{ contentId: "UP9000-CUSA00000_00-SSPIDEMOTHEME001", title: "Preview theme" }], activeContentId: null, truncated: false }
+
+export async function buildPs4Theme({ request, demo }: { request: ThemePackageRequest; demo: boolean }) {
+  requireTauri(demo)
+  if (demo) {
+    const label = /^[A-Z0-9]{16}$/.test(request.label) ? request.label : `SSPIPREVIEW${String(previewId++).padStart(5, "0")}`
+    const frames = request.animation?.frames.length || 0
+    return demoResult({ path: `preview/${label}.pkg`, size: 2_228_224 + frames * 259_328, contentId: `UP9000-CUSA00000_00-${label}`, title: request.title, frames, sceneBytes: frames * 259_328, files: 8 + frames } satisfies ThemeBuildResult)
+  }
+  return invoke<ThemeBuildResult>("build_ps4_theme", { request })
+}
+
+/** Queues a local PKG for the console; progress shows in Downloads. Returns the job ID. */
+export async function installLocalPackage({ path, target, title, demo }: { path: string; target: ConsoleKind; title: string; demo: boolean }) {
+  requireTauri(demo)
+  if (demo) {
+    const label = path.replace(/^preview\//, "").replace(/\.pkg$/, "")
+    previewInstalled = { ...previewInstalled, themes: [...previewInstalled.themes.filter(item => !item.contentId.endsWith(label)), { contentId: `UP9000-CUSA00000_00-${label}`, title }] }
+    return demoResult(`preview-${label}`)
+  }
+  return invoke<string>("start_local_install", { path, target })
+}
+
+export async function listConsoleThemes({ host, port, demo }: { host: string; port: number; demo: boolean }) {
+  requireTauri(demo)
+  return demo ? demoResult(structuredClone(previewInstalled)) : invoke<ConsoleThemes>("list_console_themes", { host, port })
+}
+
+export async function applyConsoleTheme({ host, port, contentId, demo }: { host: string; port: number; contentId: string; demo: boolean }) {
+  requireTauri(demo)
+  if (demo) { previewInstalled = { ...previewInstalled, activeContentId: contentId }; return demoResult(OFFLINE_PREVIEW_MESSAGE) }
+  return invoke<string>("apply_console_theme", { host, port, contentId })
+}
+
+export async function removeConsoleTheme({ host, port, contentId, demo }: { host: string; port: number; contentId: string; demo: boolean }) {
+  requireTauri(demo)
+  if (demo) {
+    previewInstalled = { ...previewInstalled, themes: previewInstalled.themes.filter(item => item.contentId !== contentId), activeContentId: previewInstalled.activeContentId === contentId ? null : previewInstalled.activeContentId }
+    return demoResult(OFFLINE_PREVIEW_MESSAGE)
+  }
+  return invoke<string>("remove_console_theme", { host, port, contentId })
 }

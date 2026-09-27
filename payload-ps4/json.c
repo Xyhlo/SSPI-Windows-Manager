@@ -128,8 +128,11 @@ int parse_install_url(const uint8_t *body, size_t size, UrlRequest *r, char *err
     if (!http_url(r->url,false)||(r->icon_url[0]&&!http_url(r->icon_url,true))) goto bad;
     reason="invalid or mismatched PS4 content ID/title ID";
     if (!valid_content_id(r->content_id)||!valid_title_id(r->title_id)||memcmp(r->content_id+7,r->title_id,9)) goto bad;
-    reason="kind must be base, update or dlc; title and size are required";
-    r->kind=pkg_kind(kind); if (!r->kind||!r->title[0]||!r->size||r->size>INT64_MAX) goto bad;
+    reason="kind must be base, update, dlc or theme; title and size are required";
+    /* A system theme (or its license-only unlocker) is add-on content that
+       belongs to no installed game, so it skips the base-game check. */
+    r->theme=!strcmp(kind,"theme"); r->kind=r->theme?PKG_DLC:pkg_kind(kind);
+    if (!r->kind||!r->title[0]||!r->size||r->size>INT64_MAX) goto bad;
     reason="digest and header_sha256 must contain exactly 64 hexadecimal characters";
     if (((fields&512)&&hash_normalize(r->digest))||((fields&1024)&&hash_normalize(r->header_sha256))) goto bad;
     reason="unsupported CNT content_type";
@@ -164,6 +167,6 @@ int config_json(char *out, size_t cap, const ReceiverConfig *c) {
     Json j; json_init(&j,out,cap);
     json_add(&j,"{\"port\":%d,\"version\":\"" VERSION "\",\"platform\":\"ps4\",\"uid\":%d,\"jailbroken\":%s,\"data_root\":\"" DATA_ROOT "\",\"writable\":%s,\"bgft\":",c->port,c->uid,c->jailbroken?"true":"false",c->writable?"true":"false");
     json_quote(&j,c->bgft); json_add(&j,",\"appinst\":"); json_quote(&j,c->appinst); json_add(&j,",\"userservice\":"); json_quote(&j,c->userservice);
-    json_add(&j,",\"capabilities\":[\"pkg-preflight\",\"pkg-install\",\"url-install\",\"parallel-upload\",\"verify\",\"title-context\",\"progress-notifications\",\"install-control\",\"stop\",\"ps4\",\"installed-library-v1\",\"title-icons-v1\",\"system-info-v1\"],\"diagnostics\":");
+    json_add(&j,",\"capabilities\":[\"pkg-preflight\",\"pkg-install\",\"url-install\",\"parallel-upload\",\"verify\",\"title-context\",\"progress-notifications\",\"install-control\",\"stop\",\"ps4\",\"installed-library-v1\",\"title-icons-v1\",\"system-info-v1\",\"theme-install-v1\",\"themes-v1\"],\"diagnostics\":");
     diagnostics_json(&j); json_add(&j,"}"); return j.failed?-1:0;
 }

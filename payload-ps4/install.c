@@ -25,6 +25,8 @@ static struct {
     int (*reg)(GsBgftParam *,int *), (*debug_reg)(GsBgftParam *,int *);
     int (*start)(int), (*int_start)(int), (*find)(const char *,int,int *);
     int (*progress)(int,GsBgftProgress *), (*pause)(int), (*resume)(int), (*stop)(int), (*unregister_task)(int);
+    /* Optional theme controls; their signatures are inferred, so every call is logged. */
+    int (*theme_uninstall)(const char *), (*theme_get)(int,char *,size_t), (*theme_set)(int,const char *);
 } api;
 static ModuleStatus modules={"untried","untried","untried"};
 static RxMutex module_lock=RX_MUTEX_INIT, job_lock=RX_MUTEX_INIT, command_lock=RX_MUTEX_INIT;
@@ -124,6 +126,9 @@ int install_init(void) {
     BIND(bgft,"sceBgftServiceDownloadStopTask",stop,br);
     BIND(bgft,"sceBgftServiceIntDownloadUnregisterTask",unregister_task,br);
 #undef BIND
+    if (bind_symbol(app,"sceAppInstUtilAppUnInstallTheme",&api.theme_uninstall,false)) api.theme_uninstall=NULL;
+    if (bind_symbol(users,"sceUserServiceGetThemeEntitlementId",&api.theme_get,false)) api.theme_get=NULL;
+    if (bind_symbol(users,"sceUserServiceSetThemeEntitlementId",&api.theme_set,false)) api.theme_set=NULL;
     int sr=bind_symbol(bgft,"sceBgftServiceDownloadStartTask",&api.start,false);
     int ir=bind_symbol(bgft,"sceBgftServiceIntDownloadStartTask",&api.int_start,false);
     if (sr&&ir&&!br) br=sr;
@@ -322,15 +327,20 @@ static bool same_request(const UrlRequest *a, const UrlRequest *b) {
     return !strcmp(a->url,b->url);
 }
 static void submit(Command *c) {
-    bool local=c->command==CMD_INSTALL_PKG; PkgInfo p; memset(&p,0,sizeof(p));
+    bool local=c->command==CMD_INSTALL_PKG||c->command==CMD_INSTALL_THEME;
+    bool theme=c->command==CMD_INSTALL_THEME||(c->command==CMD_INSTALL_URL&&c->url.theme); PkgInfo p; memset(&p,0,sizeof(p));
     int rc=0, index=-1; char error[256]="";
     if (init_code) { rc=init_code; snprintf(error,sizeof(error),"installer initialization failed; inspect GET_CONFIG"); goto result; }
     if (local) {
         if (transfer_pin(c->path,&p)) { rc=-1; snprintf(error,sizeof(error),"path must be a verified, idle CNT upload"); goto result; }
         if (p.kind!=PKG_DLC) { transfer_finish(c->path,false); rc=-1; snprintf(error,sizeof(error),"local installation accepts DLC only; use INSTALL_URL for games and updates"); goto result; }
+        /* Themes are additional content with IRO tag 2; their license-only
+           unlocker is AL content. Neither belongs to an installed game. */
+        if (theme && !(p.content_type==0x1b&&p.iro_tag==2) && p.content_type!=0x1c) { transfer_finish(c->path,false); rc=-1; snprintf(error,sizeof(error),"theme installation accepts system themes and their license packages only"); goto result; }
     } else {
         snprintf(p.content_id,sizeof(p.content_id),"%s",c->url.content_id); snprintf(p.title_id,sizeof(p.title_id),"%s",c->url.title_id);
         p.kind=c->url.kind; p.size=c->url.size;
+        if (theme && (!c->url.has_content_type||c->url.content_type==0x1b)) { p.content_type=0x1b; p.iro_tag=2; }
     }
     index=allocate_job(p.content_id);
     if (index<0) { if (local) transfer_finish(c->path,false); rc=-1; snprintf(error,sizeof(error),"install job capacity busy"); goto result; }
@@ -375,13 +385,13 @@ static void submit(Command *c) {
         log_line("already installed cid=%s path=%s",j.pkg.content_id,j.proof_path);
         installed(&j); save_job((unsigned)index,&j); goto accepted;
     }
-    if (p.kind!=PKG_BASE) {
+    if (p.kind!=PKG_BASE && !theme) {
         int exists=0; rc=api.app_exists(p.title_id,&exists); log_line("base exists %s rc=0x%08x exists=%d",p.title_id,(unsigned)rc,exists);
         if (!rc&&!exists) rc=(int)0x80a30004u;
         if (rc) goto job_error;
     }
     if (local) {
-        rc=api.app_pkg(j.path,NULL); log_line("AppInstallPkg cid=%s rc=0x%08x",p.content_id,(unsigned)rc);
+        rc=api.app_pkg(j.path,NULL); log_line("AppInstallPkg cid=%s type=0x%02x iro=%u rc=0x%08x",p.content_id,(unsigned)p.content_type,(unsigned)p.iro_tag,(unsigned)rc);
         if (rc) goto job_error;
         j.phase=JOB_INSTALLING;
     } else {
@@ -439,6 +449,39 @@ static void control(Command *c) {
     if (rc) snprintf(c->result,sizeof(c->result),"%s (0x%08x)",install_error(rc),(unsigned)rc);
     else { save_job((unsigned)index,&j); c->code=RESP_OK; snprintf(c->result,sizeof(c->result),"OK"); }
 }
+static void theme_active(char *out, size_t cap) {
+    out[0]=0;
+    if (!api.theme_get||user_id<0) return;
+    char raw[128]; memset(raw,0,sizeof(raw));
+    int rc=api.theme_get(user_id,raw,64);
+    char hex[97]; for (unsigned i=0;i<48;i++) snprintf(hex+2*i,3,"%02x",(unsigned char)raw[i]);
+    log_line("theme entitlement get user=%d rc=0x%08x raw=%s",user_id,(unsigned)rc,hex);
+    if (rc) return;
+    size_t n=0; while (n<64 && n+1<cap && raw[n] && ((raw[n]>='A'&&raw[n]<='Z')||(raw[n]>='0'&&raw[n]<='9')||raw[n]=='-'||raw[n]=='_')) { out[n]=raw[n]; n++; }
+    out[n]=0;
+}
+static void theme_command(Command *c) {
+    c->code=RESP_ERROR;
+    if (c->command==CMD_THEME_LIST) {
+        char active[65]; theme_active(active,sizeof(active));
+        if (installed_library_themes_json(c->result,sizeof(c->result),active)) snprintf(c->result,sizeof(c->result),"installed-theme scan failed");
+        else c->code=RESP_DATA;
+        return;
+    }
+    if (!installed_library_theme_present(c->cid)) { snprintf(c->result,sizeof(c->result),"that theme is not installed on this PS4"); return; }
+    int rc;
+    if (c->command==CMD_THEME_DELETE) {
+        if (!api.theme_uninstall) { snprintf(c->result,sizeof(c->result),"this firmware does not offer theme removal"); return; }
+        rc=api.theme_uninstall(c->cid); log_line("theme uninstall cid=%s rc=0x%08x",c->cid,(unsigned)rc);
+    } else {
+        if (!api.theme_set||user_id<0) { snprintf(c->result,sizeof(c->result),"this firmware does not offer theme selection"); return; }
+        /* The entitlement is the 16-character label after the content ID's last dash. */
+        char label[64]; memset(label,0,sizeof(label)); memcpy(label,c->cid+20,16);
+        rc=api.theme_set(user_id,label); log_line("theme entitlement set user=%d label=%s rc=0x%08x",user_id,label,(unsigned)rc);
+    }
+    if (rc) snprintf(c->result,sizeof(c->result),"PS4 refused the theme request (0x%08x)",(unsigned)rc);
+    else { c->code=RESP_OK; snprintf(c->result,sizeof(c->result),"OK"); }
+}
 static void poll_job(unsigned index) {
     Job j=jobs[index]; if (!j.used||j.phase==JOB_INSTALLED||j.phase==JOB_FAILED) return;
     uint64_t now=rx_now(); bool complete=false;
@@ -489,7 +532,8 @@ void install_worker_tick(void) {
     rx_lock(&command_lock); bool execute=pending.busy&&!pending.done; Command work;
     if (execute) work=pending; rx_unlock(&command_lock);
     if (execute) {
-        if (work.command==CMD_INSTALL_URL||work.command==CMD_INSTALL_PKG) submit(&work);
+        if (work.command==CMD_INSTALL_URL||work.command==CMD_INSTALL_PKG||work.command==CMD_INSTALL_THEME) submit(&work);
+        else if (work.command==CMD_THEME_LIST||work.command==CMD_THEME_APPLY||work.command==CMD_THEME_DELETE) theme_command(&work);
         else if (work.command==CMD_LIST_INSTALLED) {
             work.code = installed_library_list_json(work.result, sizeof(work.result)) ? RESP_ERROR : RESP_DATA;
             if (work.code == RESP_ERROR) snprintf(work.result, sizeof(work.result), "installed-library scan failed");
@@ -503,28 +547,29 @@ void install_worker_tick(void) {
     for (unsigned i=0;i<MAX_JOBS;i++) poll_job(i);
 }
 static int command_error(int fd, const Command *c, int code, const char *error) {
-    if (c->command!=CMD_INSTALL_URL&&c->command!=CMD_INSTALL_PKG) return text_reply(fd,RESP_ERROR,error);
+    if (c->command!=CMD_INSTALL_URL&&c->command!=CMD_INSTALL_PKG&&c->command!=CMD_INSTALL_THEME) return text_reply(fd,RESP_ERROR,error);
     char text[16384]; bool url=c->command==CMD_INSTALL_URL;
     if (submission_json(text,sizeof(text),code,url?c->url.content_id:"",url?c->url.url:c->path,error,-1,url)) return -1;
     return text_reply(fd,RESP_ERROR,text);
 }
 int install_request(int fd, unsigned cmd, const uint8_t *body, size_t size) {
-    if (cmd==CMD_INSTALL_URL||cmd==CMD_INSTALL_PKG) {
+    if (cmd==CMD_INSTALL_URL||cmd==CMD_INSTALL_PKG||cmd==CMD_INSTALL_THEME) {
         char denied[1024]; int blocked=privilege_error_json(denied,sizeof(denied),privilege_ready,privilege_boot,privilege_jbc);
         if (blocked) return blocked<0?-1:text_reply(fd,RESP_ERROR,denied);
     }
     Command c; memset(&c,0,sizeof(c)); c.command=cmd; char error[256]="";
-    if (cmd==CMD_LIST_INSTALLED) {
-        if (size) return command_error(fd,&c,-EINVAL,"LIST_INSTALLED request must be empty");
+    if (cmd==CMD_LIST_INSTALLED||cmd==CMD_THEME_LIST) {
+        if (size) return command_error(fd,&c,-EINVAL,"this request must be empty");
     } else if (cmd==CMD_INSTALL_URL) {
         if (parse_install_url(body,size,&c.url,error,sizeof(error))) {
             char response[1024]; if (submission_json(response,sizeof(response),-1,"","",error,-1,true)) return -1;
             return text_reply(fd,RESP_ERROR,response);
         }
     } else {
-        const char *s=wire_string(body,size,cmd==CMD_INSTALL_PKG?MAX_PATH_BYTES:36);
-        if (!s || (cmd==CMD_INSTALL_PKG?!allowed_path(s):!valid_content_id(s))) return command_error(fd,&c,-EINVAL,"invalid install path or content ID");
-        if (cmd==CMD_INSTALL_PKG) snprintf(c.path,sizeof(c.path),"%s",s); else snprintf(c.cid,sizeof(c.cid),"%s",s);
+        bool file=cmd==CMD_INSTALL_PKG||cmd==CMD_INSTALL_THEME;
+        const char *s=wire_string(body,size,file?MAX_PATH_BYTES:36);
+        if (!s || (file?!allowed_path(s):!valid_content_id(s))) return command_error(fd,&c,-EINVAL,"invalid install path or content ID");
+        if (file) snprintf(c.path,sizeof(c.path),"%s",s); else snprintf(c.cid,sizeof(c.cid),"%s",s);
     }
     rx_lock(&command_lock);
     if (pending.busy) { rx_unlock(&command_lock); return command_error(fd,&c,-EBUSY,"installer busy or previous operation unconfirmed; query INSTALL_STATUS"); }

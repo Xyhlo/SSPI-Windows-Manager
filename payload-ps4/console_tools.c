@@ -24,7 +24,7 @@ static int system_info(int fd) {
         if ((uint64_t)fs.f_blocks>UINT64_MAX/(uint64_t)fs.f_bsize || (uint64_t)fs.f_bavail>(uint64_t)fs.f_blocks) continue;
         json_add(&j,"%s{\"label\":\"%s\",\"path\":\"%s\",\"totalBytes\":%llu,\"freeBytes\":%llu}",count++?",":"",i?"Extended":"Internal",paths[i],(unsigned long long)fs.f_blocks*fs.f_bsize,(unsigned long long)fs.f_bavail*fs.f_bsize);
     }
-    json_add(&j,"],\"capabilities\":[\"pkg-preflight\",\"pkg-install\",\"url-install\",\"parallel-upload\",\"verify\",\"title-context\",\"progress-notifications\",\"install-control\",\"stop\",\"ps4\",\"installed-library-v1\",\"title-icons-v1\",\"system-info-v1\"],\"extras\":{}}");
+    json_add(&j,"],\"capabilities\":[\"pkg-preflight\",\"pkg-install\",\"url-install\",\"parallel-upload\",\"verify\",\"title-context\",\"progress-notifications\",\"install-control\",\"stop\",\"ps4\",\"installed-library-v1\",\"title-icons-v1\",\"system-info-v1\",\"theme-install-v1\",\"themes-v1\"],\"extras\":{}}");
     return j.failed ? text_reply(fd,RESP_ERROR,"System information exceeded its size limit.") : text_reply(fd,RESP_DATA,out);
 }
 int console_tools_request(int fd,uint8_t cmd,const uint8_t *b,size_t n) {

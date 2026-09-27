@@ -14,5 +14,10 @@ int installed_library_parse_dirents(const uint8_t *buffer, size_t size, Installe
 int installed_library_list_json(char *out, size_t capacity);
 int installed_library_metadata(const char *title_id, uint8_t *out, size_t capacity, size_t *written);
 int installed_library_title_present(const char *title_id);
+#define INSTALLED_THEME_ROOT "/user/addcont/I00000002"
+#define INSTALLED_LIBRARY_MAX_THEMES 128u
+int installed_library_theme_present(const char *content_id);
+int installed_library_themes_json(char *out, size_t capacity, const char *active);
+void installed_library_sfo_string(const uint8_t *sfo, size_t size, const char *key, char *out, size_t capacity);
 
 #endif

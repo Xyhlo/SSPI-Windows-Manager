@@ -8,7 +8,7 @@ void json_quote(Json *j, const char *s);
 typedef struct {
     char url[2048], content_id[37], title[220], title_id[10], icon_url[1000];
     enum PkgKind kind; uint64_t size, declared_size; uint32_t content_type;
-    bool has_declared_size, has_content_type;
+    bool has_declared_size, has_content_type, theme;
     char digest[65], header_sha256[65];
 } UrlRequest;
 int json_object_valid(const char *data, size_t size);

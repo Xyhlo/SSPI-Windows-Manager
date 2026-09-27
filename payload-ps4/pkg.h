@@ -5,7 +5,7 @@ enum PkgKind { PKG_OTHER, PKG_BASE=6, PKG_DLC=7, PKG_UPDATE=8 };
 typedef struct {
     char content_id[37], title_id[10];
     enum PkgKind kind;
-    uint32_t content_type;
+    uint32_t content_type, iro_tag;
     uint64_t size;
     uint8_t header[4096];
 } PkgInfo;

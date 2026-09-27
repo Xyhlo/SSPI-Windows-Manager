@@ -307,3 +307,91 @@ int installed_library_metadata(const char *title_id, uint8_t *out, size_t capaci
     *written = offset;
     return 0;
 }
+
+/* System themes are installed per content ID under INSTALLED_THEME_ROOT. */
+typedef struct { char ids[INSTALLED_LIBRARY_MAX_THEMES][37]; size_t count; bool truncated; } ThemeScan;
+static int remember_theme(const char *name, void *context) {
+    ThemeScan *scan = context;
+    if (!valid_content_id(name)) return 0;
+    if (scan->count >= INSTALLED_LIBRARY_MAX_THEMES) { scan->truncated = true; return 1; }
+    snprintf(scan->ids[scan->count++], sizeof(scan->ids[0]), "%s", name);
+    return 0;
+}
+void installed_library_sfo_string(const uint8_t *sfo, size_t size, const char *key, char *out, size_t capacity) {
+    if (!out || !capacity) return;
+    out[0] = 0;
+    if (!sfo || size < 20 || memcmp(sfo, "\0PSF", 4)) return;
+    uint32_t keys = read_u32le(sfo + 8), data = read_u32le(sfo + 12), count = read_u32le(sfo + 16);
+    if (keys > size || data > size || count > 1024 || 20u + (size_t)count * 16u > size) return;
+    size_t wanted = strlen(key);
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint8_t *entry = sfo + 20 + (size_t)i * 16;
+        size_t name = keys + ((size_t)entry[0] | ((size_t)entry[1] << 8));
+        uint16_t format = (uint16_t)(entry[2] | (entry[3] << 8));
+        uint32_t length = read_u32le(entry + 4), offset = read_u32le(entry + 12);
+        if (name + wanted + 1 > size || memcmp(sfo + name, key, wanted + 1)) continue;
+        if (format != 0x0204 || (size_t)data + offset > size || length > size - data - offset) return;
+        size_t n = length && sfo[data + offset + length - 1] == 0 ? length - 1 : length;
+        if (n >= capacity) n = capacity - 1;
+        memcpy(out, sfo + data + offset, n);
+        out[n] = 0;
+        for (size_t c = 0; c < n; ++c) if ((unsigned char)out[c] < 0x20) out[c] = ' ';
+        return;
+    }
+}
+static int scan_themes(ThemeScan *scan) {
+    int fd = directory_open(INSTALLED_THEME_ROOT);
+    if (fd < 0) return 0;  /* no theme has been installed yet */
+    uint8_t buffer[DIRECTORY_BUFFER_SIZE];
+    int result = 0;
+    for (;;) {
+        int n = directory_read(fd, buffer, sizeof(buffer));
+        if (n < 0 || (size_t)n > sizeof(buffer)) { result = -1; break; }
+        if (!n) break;
+        int parsed = installed_library_parse_dirents(buffer, (size_t)n, remember_theme, scan);
+        if (parsed < 0) { result = -1; break; }
+        if (parsed > 0) break;
+    }
+    if (directory_close(fd)) result = -1;
+    return result;
+}
+int installed_library_theme_present(const char *content_id) {
+    if (!valid_content_id(content_id)) return 0;
+    char path[160];
+    int n = snprintf(path, sizeof(path), "%s/%s/ac.pkg", INSTALLED_THEME_ROOT, content_id);
+    if (n < 0 || (size_t)n >= sizeof(path)) return 0;
+    int fd = rx_open(path, RX_READ);
+    if (fd < 0) return 0;
+    PkgInfo package;
+    int ok = !pkg_read(fd, &package) && package.iro_tag == 2 && !strcmp(package.content_id, content_id);
+    if (rx_close(fd)) ok = 0;
+    return ok;
+}
+int installed_library_themes_json(char *out, size_t capacity, const char *active) {
+    if (!out || !capacity) return -1;
+    static ThemeScan scan;
+    static uint8_t sfo[INSTALLED_LIBRARY_MAX_SFO];
+    memset(&scan, 0, sizeof(scan));
+    if (scan_themes(&scan)) return -1;
+    Json json;
+    json_init(&json, out, capacity);
+    json_add(&json, "{\"themes\":[");
+    for (size_t i = 0; i < scan.count; ++i) {
+        char path[160], title[130] = "", title_id[10];
+        snprintf(path, sizeof(path), "%s/%s/ac.pkg", INSTALLED_THEME_ROOT, scan.ids[i]);
+        memcpy(title_id, scan.ids[i] + 7, 9); title_id[9] = 0;
+        size_t length = 0;
+        if (!read_package_entry(path, title_id, PKG_DLC, 0x1000, sfo, sizeof(sfo), &length))
+            installed_library_sfo_string(sfo, length, "TITLE", title, sizeof(title));
+        if (i) json_add(&json, ",");
+        json_add(&json, "{\"contentId\":");
+        json_quote(&json, scan.ids[i]);
+        json_add(&json, ",\"title\":");
+        json_quote(&json, title);
+        json_add(&json, "}");
+    }
+    json_add(&json, "],\"truncated\":%s,\"active\":", scan.truncated ? "true" : "false");
+    json_quote(&json, active ? active : "");
+    json_add(&json, "}");
+    return json.failed ? -1 : 0;
+}

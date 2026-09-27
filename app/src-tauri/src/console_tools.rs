@@ -47,6 +47,12 @@ pub(super) struct ConsoleMemory { total_bytes: u64, free_bytes: u64 }
 pub(super) struct ConsoleNetwork { ip: Option<String>, mac: Option<String> }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(super) struct InstalledTheme { content_id: String, title: String }
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ConsoleThemes { themes: Vec<InstalledTheme>, active_content_id: Option<String>, truncated: bool }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct ConsoleSystemInfo {
     target: String,
     receiver_version: String,
@@ -95,7 +101,8 @@ async fn exchange(socket: &mut TcpStream, command: u8, body: &[u8], max: usize) 
             let value=serde_json::from_slice::<Value>(&bytes).ok();
             return Err(clean(value.as_ref().and_then(|v| v["error"].as_str()).unwrap_or(&text)));
         }
-        if (command==0x63 && header[0]!=1) || (command!=0x63 && header[0]!=3) { return Err("The receiver returned an unexpected response code.".into()); }
+        let ok_reply=matches!(command,0x63|0x67|0x68);
+        if (ok_reply && header[0]!=1) || (!ok_reply && header[0]!=3) { return Err("The receiver returned an unexpected response code.".into()); }
         if size>max { return Err("The receiver response exceeds its size limit.".into()); }
         Ok(bytes)
     }).await.map_err(|_| "The receiver did not respond in time. Retry the operation.".to_string())?
@@ -162,6 +169,42 @@ pub(super) async fn restore_title_icon(target: String, host: String, port: u16, 
     let body=id_request(&title_id)?;
     let (mut socket,_)=checked(&target,&host,port,"title-icons-v1","restore icons").await?;
     icon_result(&exchange(&mut socket,0x62,&body,4096).await?,&title_id)
+}
+fn theme_request(content_id: &str) -> Result<Vec<u8>,String> {
+    let valid = content_id.len()==36 && content_id.is_char_boundary(36) && content_id.as_bytes()[6]==b'-' && content_id.as_bytes()[16]==b'_' && content_id.as_bytes()[19]==b'-'
+        && content_id.bytes().enumerate().all(|(i,b)| matches!(i,6|16|19) || b.is_ascii_uppercase() || b.is_ascii_digit() || b==b'_');
+    if !valid { return Err("That is not a PS4 theme content ID.".into()); }
+    let mut body=content_id.as_bytes().to_vec(); body.push(0); Ok(body)
+}
+#[tauri::command]
+pub(super) async fn list_console_themes(host: String, port: u16) -> Result<ConsoleThemes,String> {
+    let (mut socket,_)=checked("ps4",&host,port,"themes-v1","list installed themes").await?;
+    let value: Value=serde_json::from_slice(&exchange(&mut socket,0x66,&[],256*1024).await?).map_err(|_| "The receiver returned an invalid theme list.".to_string())?;
+    let items=value["themes"].as_array().ok_or("The receiver returned an invalid theme list.")?;
+    let mut themes=Vec::new();
+    for item in items.iter().take(128) {
+        let Some(id)=item["contentId"].as_str().filter(|id| theme_request(id).is_ok()) else { continue };
+        let title: String=item["title"].as_str().unwrap_or("").chars().filter(|c| !c.is_control()).take(127).collect();
+        themes.push(InstalledTheme { content_id: id.into(), title: if title.trim().is_empty() { id[20..].into() } else { title } });
+    }
+    // The console stores the selected theme as its 16-character label.
+    let active=value["active"].as_str().unwrap_or("");
+    let active_content_id=(!active.is_empty()).then(|| themes.iter().find(|t| t.content_id[20..]==*active).map(|t| t.content_id.clone())).flatten();
+    Ok(ConsoleThemes { themes, active_content_id, truncated: value["truncated"].as_bool().unwrap_or(false) })
+}
+#[tauri::command]
+pub(super) async fn apply_console_theme(host: String, port: u16, content_id: String) -> Result<String,String> {
+    let body=theme_request(&content_id)?;
+    let (mut socket,_)=checked("ps4",&host,port,"themes-v1","apply themes").await?;
+    exchange(&mut socket,0x67,&body,4096).await?;
+    Ok("Theme selected on the PS4.".into())
+}
+#[tauri::command]
+pub(super) async fn remove_console_theme(host: String, port: u16, content_id: String) -> Result<String,String> {
+    let body=theme_request(&content_id)?;
+    let (mut socket,_)=checked("ps4",&host,port,"themes-v1","remove themes").await?;
+    exchange(&mut socket,0x68,&body,4096).await?;
+    Ok("Theme removed from the PS4.".into())
 }
 #[tauri::command]
 pub(super) async fn refresh_console_shell(target: String, host: String, port: u16) -> Result<String,String> {
@@ -300,6 +343,14 @@ pub(super) async fn list_console_library(target: String, host: String, port: u16
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_requests_need_a_ps4_content_id() {
+        assert_eq!(theme_request("UP9000-CUSA00000_00-SSPIBUBBLES00002").unwrap().last(), Some(&0));
+        for bad in ["", "UP9000-CUSA00000_00-SSPIBUBBLES0000", "UP9000-CUSA00000_00-sspibubbles00002", "UP9000/CUSA00000_00-SSPIBUBBLES00002", "UP9000-CUSA00000_00-SSPIBUBBLES0000\u{e9}"] {
+            assert!(theme_request(bad).is_err(), "{bad}");
+        }
+    }
     use tokio::net::TcpListener;
     const ID: &str = "CUSA12345";
     const HOST: &str = "127.0.0.1";

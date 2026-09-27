@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "game-search"
-version = "2.21.0"
+version = "2.22.0"
 dependencies = [
  "base64 0.22.1",
  "futures-util",

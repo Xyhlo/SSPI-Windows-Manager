@@ -27,7 +27,7 @@ int pkg_parse(const uint8_t *h, size_t length, uint64_t size, PkgInfo *p) {
     if (length<4096 || size<4096 || memcmp(h,"\x7f" "CNT",4)) return -1;
     memset(p,0,sizeof(*p)); memcpy(p->header,h,4096); memcpy(p->content_id,h+0x40,36);
     if (!valid_content_id(p->content_id)) return -1;
-    memcpy(p->title_id,p->content_id+7,9); p->size=size; p->content_type=be32(h+0x74);
+    memcpy(p->title_id,p->content_id+7,9); p->size=size; p->content_type=be32(h+0x74); p->iro_tag=be32(h+0x98);
     /* CNT content_flags at 0x78 carries the full-patch flags (0x1a is also base). */
     uint32_t flags=be32(h+0x78);
     if (p->content_type==0x1a) p->kind=(flags&0x40300000u)?PKG_UPDATE:PKG_BASE;
@@ -52,6 +52,9 @@ int pkg_installed_path(const PkgInfo *p, char *out, size_t cap) {
     int n;
     if (p->kind==PKG_BASE) n=snprintf(out,cap,"/user/app/%s/app.pkg",p->title_id);
     else if (p->kind==PKG_UPDATE) n=snprintf(out,cap,"/user/patch/%s/patch.pkg",p->title_id);
+    /* Themes (IRO tag 1 or 2) are kept per tag and full content ID, e.g.
+       /user/addcont/I00000002/UP9000-CUSA00000_00-LABEL/ac.pkg (seen on 12.02). */
+    else if (p->kind==PKG_DLC && (p->iro_tag==1||p->iro_tag==2)) n=snprintf(out,cap,"/user/addcont/I%08u/%s/ac.pkg",(unsigned)p->iro_tag,p->content_id);
     else if (p->kind==PKG_DLC) n=snprintf(out,cap,"/user/addcont/%s/%.16s/ac.pkg",p->title_id,p->content_id+20);
     else return -1;
     return n<0||(size_t)n>=cap?-1:0;

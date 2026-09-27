@@ -155,6 +155,23 @@ or add verified provenance and notices.
   bundling with software; the font may not be sold on its own, and the license
   text must accompany redistributed copies.
 
+### LibOrbisPkg — PS4 theme packaging library
+
+- Observed file: `LibOrbisPkg.Core.dll` (assembly version 0.2.0.0), supplied locally
+  under `SDK/liborbispkg/` and shipped unmodified in `resources/themepack/`.
+- Source: https://github.com/maxton/LibOrbisPkg. License: GNU LGPL version 3,
+  as stated in the project README. It stays a separate, replaceable assembly;
+  SSPI's packager only calls it.
+- Status: the local build's exact source revision is not recorded. Record it
+  before any public binary distribution, and ship the LGPL text with it.
+
+### PS4 Ultimate Theme Creator — theme format reference
+
+- Source: PS4 Ultimate Theme Creator, Copyright (c) 2026 Imxnxl. License: MIT.
+- SSPI's PS4 theme builder follows its console-verified theme layout, animated
+  scene structure and limits, and embeds the 420-byte plane model its generator
+  writes. Keep the MIT notice with distributions.
+
 ## Release rule
 
 A clean-room/public release should be generated from an explicit allowlist.

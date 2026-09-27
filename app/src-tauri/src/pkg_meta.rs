@@ -126,6 +126,9 @@ pub(super) fn read(path: &Path) -> Result<PkgMeta, String> {
         "base"
     } else if category.starts_with("gp") {
         "update"
+    } else if category.starts_with("ac") && matches!(be_u32(&header, 0x98), 1 | 2) {
+        // IRO tag 1/2 (header 0x98) marks a SHAREfactory or system theme.
+        "theme"
     } else if category.starts_with("ac") {
         "dlc"
     } else {
@@ -471,6 +474,25 @@ mod tests {
             file_size: bytes.len() as u64,
             icon0: Some(tiny_png()),
         });
+    }
+
+    #[test]
+    fn system_themes_are_recognised_by_their_iro_tag() {
+        let mut bytes = package(true);
+        let at = bytes[0x1100..].windows(3).position(|w| w == b"gd\0").unwrap() + 0x1100;
+        bytes[at..at + 2].copy_from_slice(b"ac");
+        put_be(&mut bytes, 0x74, 0x1b, 4);
+        let seal = |bytes: &mut Vec<u8>| { let digest = Sha256::digest(&bytes[..0xfe0]); bytes[0xfe0..0x1000].copy_from_slice(&digest); };
+        seal(&mut bytes);
+        let path = temp_pkg(&bytes);
+        assert_eq!(read(&path).unwrap().kind, "dlc");
+        let _ = fs::remove_file(&path);
+        put_be(&mut bytes, 0x98, 2, 4);
+        seal(&mut bytes);
+        let path = temp_pkg(&bytes);
+        let result = read(&path).unwrap();
+        let _ = fs::remove_file(path);
+        assert_eq!((result.kind.as_str(), result.content_type), ("theme", 0x1b));
     }
 
     #[test]

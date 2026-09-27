@@ -57,8 +57,10 @@ export function MockFrame({ children, overlay, className = "" }: { children: Rea
 }
 
 /* ---------------------------------------------------------------- PS4 */
-export function Ps4Home({ tiles, focusName }: { tiles: MockTile[]; focusName?: string }) {
+export function Ps4Home({ tiles, systemTiles = [], focusName }: { tiles: MockTile[]; systemTiles?: MockTile[]; focusName?: string }) {
   const [focus, ...rest] = tiles
+  // Library, TV & Video and Internet Browser sit at the end of the row, after the games.
+  const row = [...rest.slice(0, 7 - Math.min(3, systemTiles.length)), ...systemTiles.slice(0, 3)]
   const clock = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })
   return (
     <>
@@ -75,8 +77,8 @@ export function Ps4Home({ tiles, focusName }: { tiles: MockTile[]; focusName?: s
         <span className="p4-focus-art">{focus?.art ? <img src={focus.art} alt="" draggable={false} /> : null}</span>
         <span className="p4-start">Start</span>
       </span>
-      {rest.slice(0, 7).map((tile, n) => (
-        <span key={tile.key} className="p4-tile" style={{ left: 632 + n * 204 }}>{tile.art ? <img src={tile.art} alt="" draggable={false} /> : null}</span>
+      {row.map((tile, n) => (
+        <span key={tile.key} className={`p4-tile ${tile.key.startsWith("sys:") ? "p4-app" : ""}`} style={{ left: 632 + n * 204 }}>{tile.art ? <img src={tile.art} alt="" draggable={false} /> : null}</span>
       ))}
       <span className="p4-title">{focusName || focus?.name || ""}</span>
       <Ps4Hints items={[[<Cross key="x" />, "Enter"], [<Key key="l1">L1</Key>, "To the Left End"], [<Key key="r1">R1</Key>, "To the Right End"], [<Key key="op">OPTIONS</Key>, "Options Menu"]]} />
@@ -155,7 +157,7 @@ export function Ps5Settings() {
   )
 }
 
-export function ConsoleScreen({ target, screen, tiles }: { target: ConsoleKind; screen: MockScreen; tiles: MockTile[] }) {
-  if (target === "ps4") return screen === "home" ? <Ps4Home tiles={tiles} /> : <Ps4Settings />
+export function ConsoleScreen({ target, screen, tiles, systemTiles }: { target: ConsoleKind; screen: MockScreen; tiles: MockTile[]; systemTiles?: MockTile[] }) {
+  if (target === "ps4") return screen === "home" ? <Ps4Home tiles={tiles} systemTiles={systemTiles} /> : <Ps4Settings />
   return screen === "home" ? <Ps5Home tiles={tiles} /> : <Ps5Settings />
 }

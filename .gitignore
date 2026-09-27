@@ -162,3 +162,7 @@
 !/payload-ps4/console_files.c
 !/payload-ps4/console_tools.c
 !/payload-ps4/console_tools.h
+
+# SSPI Windows 2.22 PS4 theme packages
+!/app/src/lib/theme-package.ts
+!/app/src-tauri/src/ps4_theme.rs

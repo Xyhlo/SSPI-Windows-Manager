@@ -705,6 +705,9 @@ pub(super) async fn deliver(app: &AppHandle, settings: &Settings, job: &str, pat
     let mut session = Session::connect(Endpoint::settings(settings), Timing::default()).await.map_err(|e| e.message)?;
     let mut delivery = if let Some(saved) = record.ps4_delivery { saved } else {
         if !archive { for path in &paths { validate_pkg(path)?; } }
+        if !archive && paths.iter().any(|path| pkg_meta::read(path).is_ok_and(|meta| meta.kind == "theme")) {
+            return Err("PS4 themes install through the SSPI receiver. Switch PS4 delivery to the receiver in Settings > Consoles.".into());
+        }
         let paths = if archive { paths } else { sort_pkgs(paths) };
         DeliveryState { root: session.root().await.map_err(|e| e.message)?, generation: 0, units: make_units(paths, archive, job)? }
     };

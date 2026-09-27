@@ -599,7 +599,7 @@ async fn deliver_packages(context: &Context<'_>, settings: &Settings, pkgs: &[Pa
     for path in pkgs {
         ps4_inbox::validate_pkg(path).map_err(|e| error_text(&e))?;
         let meta = pkg_meta::read(path).map_err(|e| error_text(&e))?;
-        if !matches!(meta.kind.as_str(), "base" | "update" | "dlc") { return Err("PS4: Could not determine the PKG type from its metadata".into()); }
+        if !matches!(meta.kind.as_str(), "base" | "update" | "dlc" | "theme") { return Err("PS4: Could not determine the PKG type from its metadata".into()); }
         packages.push((path, meta));
     }
     packages.sort_by_key(|(_, meta)| rank(&meta.kind));
@@ -816,7 +816,11 @@ mod tests {
         }
     }
     fn package(category: &str) -> PathBuf {
+        // "theme" is add-on content whose header carries IRO tag 2.
+        let theme = category == "theme";
+        let category = if theme { "ac" } else { category };
         let mut bytes = vec![0; 8192];
+        if theme { bytes[0x98..0x9c].copy_from_slice(&2u32.to_be_bytes()); }
         bytes[..4].copy_from_slice(b"\x7fCNT"); bytes[0x40..0x64].copy_from_slice(CID.as_bytes());
         bytes[0x10..0x14].copy_from_slice(&2u32.to_be_bytes()); bytes[0x18..0x1c].copy_from_slice(&0x1000u32.to_be_bytes());
         bytes[0x20..0x28].copy_from_slice(&0x1000u64.to_be_bytes()); bytes[0x28..0x30].copy_from_slice(&0x1000u64.to_be_bytes());
@@ -874,6 +878,21 @@ mod tests {
             icon.strip_prefix("data:image/jpeg;base64,").and_then(|data| BASE64.decode(data).ok()).is_some_and(|bytes| image::load_from_memory(&bytes).is_ok())
         })));
         std::fs::write(crate::test_output_root().join("ps4-library-live-rust.json"), serde_json::to_vec_pretty(&snapshot).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn themes_install_through_the_url_route_as_themes() {
+        let port = pkg_server_test_port();
+        let fake = Fake::start(vec![status("downloading", 4096), status("installing", 8192), status("installed", 8192)], None).await;
+        let path = package("theme"); let job = Uuid::new_v4().to_string();
+        let (_tx, rx) = watch::channel(false); let events = Mutex::new(vec![]);
+        deliver_packages(&context(&job, &rx, &events), &fake.settings(port), &[path.clone()], timing()).await.unwrap();
+        let peer = fake.peer.lock().unwrap();
+        assert!(peer.commands.contains(&0x59) && !peer.commands.contains(&0x10) && !peer.commands.contains(&0x50));
+        assert_eq!(peer.urls[0]["kind"], "theme");
+        assert_eq!(peer.urls[0]["content_type"], 0x1b);
+        assert_eq!(peer.fetched_ranges, 1);
+        drop(peer); std::fs::remove_file(&path).unwrap();
     }
 
     #[tokio::test]

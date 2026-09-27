@@ -15,7 +15,7 @@ export function demoIcon(title: string, from: string, to: string, accent: string
 }
 
 // Matches what receiver 1.0.6 / 1.0.4 advertise; neither offers a live home-screen refresh.
-export const demoCapabilities = ["installed-library-v1", "title-icons-v1", "system-info-v1"]
+export const demoCapabilities = ["installed-library-v1", "title-icons-v1", "system-info-v1", "theme-install-v1", "themes-v1"]
 const capabilities = demoCapabilities
 
 export const demoProbes: ConsoleProbe[] = [

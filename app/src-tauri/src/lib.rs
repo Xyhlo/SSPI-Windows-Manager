@@ -18,6 +18,7 @@ mod ps4_protocol;
 mod ps4_inbox;
 mod ps4_receiver;
 mod console_tools;
+mod ps4_theme;
 mod pkg_meta;
 mod pkg_server;
 #[cfg(test)]
@@ -54,7 +55,7 @@ use uuid::Uuid;
 
 const CONFIG_NAME: &str = "settings.json";
 const RECEIVER_VERSION: &str = "1.0.6";
-const PS4_RECEIVER_VERSION: &str = "1.0.4";
+const PS4_RECEIVER_VERSION: &str = "1.0.5";
 
 #[derive(Debug, Clone)]
 struct ReceiverEndpoint {
@@ -458,7 +459,7 @@ fn read_local_pkg_metadata(path: &Path) -> Option<LocalPkgMetadata> {
     Some(LocalPkgMetadata {
         title_id: meta.title_id,
         title: meta.title.filter(|value| !value.trim().is_empty()),
-        package_kind: matches!(meta.kind.as_str(), "base" | "update" | "dlc").then_some(meta.kind),
+        package_kind: matches!(meta.kind.as_str(), "base" | "update" | "dlc" | "theme").then_some(meta.kind),
         version: meta.version.filter(|value| !value.trim().is_empty()),
         icon: meta.icon0.map(|bytes| format!("data:image/png;base64,{}", BASE64.encode(bytes))),
         file_size: meta.file_size,
@@ -5322,6 +5323,10 @@ pub fn run() {
             console_tools::restore_title_icon,
             console_tools::refresh_console_shell,
             console_tools::console_system_info,
+            ps4_theme::build_ps4_theme,
+            console_tools::list_console_themes,
+            console_tools::apply_console_theme,
+            console_tools::remove_console_theme,
             get_settings,
             save_settings,
             inspect_package_dump,
