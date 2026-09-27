@@ -141,6 +141,7 @@
 !/app/src-tauri/src/discovery.rs
 !/app/src-tauri/src/payloads.rs
 !/app/src/components/Controls.tsx
+!/app/src/components/ConsoleMock.tsx
 !/app/src/components/CoverEditor.tsx
 !/app/src/components/LibraryPage.tsx
 !/app/src/components/ThemeStudio.tsx

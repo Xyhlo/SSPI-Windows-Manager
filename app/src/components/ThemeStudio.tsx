@@ -20,7 +20,8 @@ import { motionOK, onFrame } from "@/lib/motion"
 import { DEFAULT_THEME, PRESETS, changesIcons, loadThemes, newTheme, parseTheme, renderThemedIcon, saveThemes, serializeTheme, type LabelField, type ParticleKind, type PreviewScreen, type ThemeSpec, type TileShape } from "@/lib/theme"
 import type { ConsoleKind, Settings } from "@/types"
 import { Row, Seg, Switch } from "./Controls"
-import { Icon, type IconName } from "./Icon"
+import { ConsoleScreen, MockFrame } from "./ConsoleMock"
+import { Icon } from "./Icon"
 import type { OptionsTab } from "./OptionsOverlay"
 import type { Hint } from "./Shell"
 import { toast } from "./toasts"
@@ -326,53 +327,24 @@ function ColorInput({ label, value, disabled, onChange }: { label: string; value
   return <input className="ts-color" type="color" value={value} disabled={disabled} aria-label={label} title={label} onChange={event => onChange(event.target.value)} />
 }
 
-/* ---------------------------------------------------------------- the console mock */
-const PS4_FUNCTIONS: IconName[] = ["download", "info", "gamepad", "send", "globe", "monitor", "star", "sliders", "unplug"]
-const SETTINGS_ROWS: Array<[IconName, string]> = [["download", "System software update"], ["globe", "Network"], ["monitor", "Sound and screen"], ["gamepad", "Accessibility"], ["shield", "Parental controls"], ["drive", "Storage"], ["palette", "Themes"], ["sliders", "System"]]
-
+/* ---------------------------------------------------------------- the console preview (stock screens in ConsoleMock) */
 function ConsolePreview({ target, screen, theme, tiles }: { target: ConsoleKind; screen: PreviewScreen; theme: ThemeSpec; tiles: Array<{ key: string; name: string; art: string | null }> }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const showParticles = theme.home.particles.kind !== "none" && theme.home.particles.screens.includes(screen)
   useParticles(canvasRef, theme.home.particles, showParticles)
-  const focused = tiles[0]
-  const clock = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+  const hero = target === "ps5" && screen === "home" ? tiles[0]?.art : null
   return (
     <div className="tsp-frame">
-      <div className={`tsp ${target} ${screen}`} style={{ ["--accent-mock" as string]: theme.home.accent }}>
-        <div className="tsp-bg">
-          {theme.home.wallpaper ? <img src={theme.home.wallpaper} alt="" style={{ filter: theme.home.blur ? `blur(${theme.home.blur}px)` : undefined }} /> : <span className="tsp-default" />}
-          <span className="tsp-dim" style={{ opacity: theme.home.dim }} />
+      <MockFrame className={`${target} ${screen}`}>
+        <div className={`cm-bg ${target}`}>
+          {theme.home.wallpaper
+            ? <img src={theme.home.wallpaper} alt="" style={{ filter: theme.home.blur ? `blur(${theme.home.blur * 2.4}px)` : undefined }} />
+            : hero ? <span className="cm-hero" style={{ backgroundImage: `url(${hero})` }} /> : null}
         </div>
-        <canvas ref={canvasRef} className="tsp-particles" style={{ opacity: showParticles ? 1 : 0 }} />
-        <div className="tsp-ui">
-          <div className="tsp-top">
-            {target === "ps5"
-              ? <span className="tsp-tabs"><b>Games</b><span>Media</span></span>
-              : <span className="tsp-fn">{PS4_FUNCTIONS.map((icon, n) => <i key={icon} className={screen === "settings" && n === 7 ? "on" : ""}><Icon name={icon} /></i>)}</span>}
-            <span className="tsp-clock">{clock}</span>
-          </div>
-          {screen === "home" ? (
-            <>
-              <div className="tsp-row">
-                {tiles.map((item, n) => (
-                  <span key={item.key} className={`tsp-tile ${n === 0 ? "focus" : ""}`}>{item.art ? <img src={item.art} alt="" draggable={false} /> : <i />}</span>
-                ))}
-              </div>
-              {focused && <div className="tsp-focus"><strong>{focused.name}</strong><span className="tsp-play">Play</span></div>}
-            </>
-          ) : target === "ps5" ? (
-            <div className="tsp-settings grid">
-              <strong>Settings</strong>
-              <div>{SETTINGS_ROWS.map(([icon, text], n) => <span key={text} className={n === 0 ? "focus" : ""}><Icon name={icon} />{text}</span>)}</div>
-            </div>
-          ) : (
-            <div className="tsp-settings list">
-              <strong>Settings</strong>
-              <div>{SETTINGS_ROWS.map(([icon, text], n) => <span key={text} className={n === 0 ? "focus" : ""}><i><Icon name={icon} /></i>{text}</span>)}</div>
-            </div>
-          )}
-        </div>
-      </div>
+        <span className="cm-dim" style={{ opacity: theme.home.dim * (theme.home.wallpaper ? 1 : 0.6) }} />
+        <canvas ref={canvasRef} className="cm-particles" style={{ opacity: showParticles ? 1 : 0 }} />
+        <ConsoleScreen target={target} screen={screen} tiles={tiles} />
+      </MockFrame>
     </div>
   )
 }
