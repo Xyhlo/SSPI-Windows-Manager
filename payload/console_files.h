@@ -20,5 +20,11 @@ bool ct_custom_icon(const char *data_root, const char *id);
 int ct_icon_get(const char *data_root, const char *id, bool original, uint8_t *out, size_t *size);
 int ct_icon_change(const char *data_root, const char *platform, const char *id,
     const uint8_t *png, size_t size, bool restore, char *result, size_t capacity);
+/* PS4 only: every icon copy of a title (icon0.png, the icon0.dds the home screen draws and the
+   per-language icon0_NN copies). `dds` may be NULL to leave the DDS copies alone. */
+#define CT_MAX_DDS (1024u * 1024u)
+bool ct_valid_dds(const uint8_t *bytes, size_t size);
+int ct_ps4_icon_change(const char *data_root, const char *id, const uint8_t *png, size_t png_size,
+    const uint8_t *dds, size_t dds_size, bool restore, char *result, size_t capacity);
 void ct_json_quote(char *out, size_t capacity, const char *text);
 #endif

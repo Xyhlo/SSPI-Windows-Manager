@@ -229,7 +229,7 @@ pub(super) async fn release_packaged_inputs(download_dir: String, paths: Vec<Pat
     }).await.unwrap_or_else(|error| format!("Verified package retained; input cleanup could not finish: {error}"))
 }
 
-pub(super) async fn queue_local(app: AppHandle, state: &AppState, path: PathBuf, kind: Option<String>, title: Option<String>, package_only: bool, target: Option<String>) -> Result<String, String> {
+pub(super) async fn queue_local(app: AppHandle, state: &AppState, path: PathBuf, kind: Option<String>, title: Option<String>, package_only: bool, target: Option<String>, package: Option<bool>) -> Result<String, String> {
     if !path.exists() { return Err("Local input is missing".into()); }
     if package_only && !is_game_dump(&path) && !is_doctor_dump(&path) { return Err("Select a complete PS5 dump containing sce_sys/param.json and eboot.bin".into()); }
     let pkg_metadata = if path.is_file() && fpkg::package_magic(&read_magic_sync(&path).unwrap_or([0; 8])) {
@@ -242,7 +242,7 @@ pub(super) async fn queue_local(app: AppHandle, state: &AppState, path: PathBuf,
         expected_size: seed.local_pkg.then_some(seed.file_size),
         archive_file_name: seed.local_pkg.then(|| seed.file_name.clone()),
         ..Default::default()
-    }, title_id: seed.title_id.clone(), title_name: Some(seed.name.clone()), icon: seed.icon.clone(), archive_parts: vec![], backport: None, provider: None };
+    }, title_id: seed.title_id.clone(), title_name: Some(seed.name.clone()), icon: seed.icon.clone(), archive_parts: vec![], backport: None, provider: None, package_dumps: package };
     snapshot_transport(&mut request, &state.settings.lock().unwrap(), false)?;
     let target = validate_delivery_target(&request, package_only, path.is_dir())?.to_string();
     if target == "ps4" && fpkg::package_magic(&read_magic_sync(&path).unwrap_or([0; 8])) { ps4_inbox::validate_pkg(&path)?; }
@@ -258,6 +258,38 @@ pub(super) async fn queue_local(app: AppHandle, state: &AppState, path: PathBuf,
         store.save(&job)?;
     }
     queue_delivery(app, state, request, Some(job)).await
+}
+
+/// Sends a finished package or image from a "package only" entry to the PS5. The entry itself
+/// resumes from its verified checkpoint; older entries without one send the file as a new job.
+#[tauri::command]
+pub(super) async fn send_packaged(app: AppHandle, job_id: String) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    if state.cancel.lock().unwrap().contains_key(&job_id) { return Err("This entry is already running".into()); }
+    let (request, path, resumable) = {
+        let mut store = state.retry.lock().unwrap();
+        let record = store.records.get_mut(&job_id).ok_or("Download record not found")?;
+        let checkpoint_path = match &record.checkpoint {
+            Some(Checkpoint::Package { path, .. }) => Some(path.clone()),
+            Some(Checkpoint::Extracted { paths, dump: false, .. }) if paths.len() == 1 => paths.first().cloned(),
+            _ => None,
+        };
+        let output = record.progress.packaging.as_ref().map(|p| PathBuf::from(&p.output_path)).filter(|p| !p.as_os_str().is_empty());
+        let path = checkpoint_path.clone().filter(|p| p.is_file()).or(output).ok_or("This entry has no finished package to send")?;
+        if !path.is_file() { return Err(format!("The package is no longer at {}", path.display())); }
+        let resumable = checkpoint_path.as_ref() == Some(&path) && record.request.is_some();
+        if resumable {
+            record.package_only = false;
+            if let Some(request) = record.request.as_mut() { request.target = Some("ps5".into()); }
+        }
+        let request = record.request.clone();
+        if resumable { store.save(&job_id)?; }
+        (request, path, resumable)
+    };
+    match request.filter(|_| resumable) {
+        Some(request) => queue_delivery(app.clone(), &state, request, Some(job_id)).await,
+        None => queue_local(app.clone(), &state, path, None, None, false, Some("ps5".into()), None).await,
+    }
 }
 
 pub(super) fn package_only(app: &AppHandle, job: &str) -> bool {
@@ -287,6 +319,8 @@ pub(super) async fn resume_checkpoint(app: &AppHandle, settings: &Settings, job:
                     validate_delivery_target(request, package_only(app, job), true)?;
                     let root = find_dump_root(primary).ok_or("Retained folder is not a complete game dump")?;
                     saved = Checkpoint::Extracted { paths: vec![root], dump: true, inputs: vec![] };
+                } else if primary.extension().is_some_and(|x| x.eq_ignore_ascii_case("exfat")) {
+                    saved = Checkpoint::Package { path: primary.clone(), dump: None, cleanup: false, backports_embedded: true, cleanup_extra: vec![] };
                 } else if fpkg::package_magic(&read_magic_sync(primary).unwrap_or([0; 8])) {
                     saved = Checkpoint::Extracted { paths, dump: false, inputs: vec![] };
                 } else {
@@ -366,6 +400,28 @@ pub(super) async fn resume_checkpoint(app: &AppHandle, settings: &Settings, job:
                 return upload_pkg_set(app, settings, &ReceiverEndpoint::ps5(settings), paths, job, request.title_id.as_deref(), cancel).await;
             },
             Checkpoint::Package { path, dump, cleanup, backports_embedded, cleanup_extra } => {
+                if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("exfat")) {
+                    if ps4 { return Err("ShadowMount exFAT images are for the PS5. Choose the PS5 as the target, then retry.".into()); }
+                    if !path.is_file() {
+                        if let Some(root) = dump.as_ref().filter(|root| root.is_dir()) {
+                            return package_and_install_dump(app, settings, root, job, request.title_id.as_deref(),
+                                &request.package.kind, &request.title_name, &request.icon, cancel, cleanup, &cleanup_extra).await;
+                        }
+                        return Err(format!("The retained image {} is missing and its dump was released. Start a new download to rebuild it.", path.display()));
+                    }
+                    if package_only(app, job) {
+                        emit(app, Progress { job_id: job.into(), stage: "complete".into(), progress: 1.,
+                            message: format!("ShadowMount image ready: {}", path.display()), ..Default::default() });
+                        return Ok(());
+                    }
+                    let mut inputs = cleanup_extra;
+                    if cleanup { inputs.extend(dump); }
+                    let cleanup_note = if settings.keep_extractions { "Extracted files retained by settings.".into() } else { release_packaged_inputs(settings.download_dir.clone(), inputs).await };
+                    emit(app, Progress { job_id: job.into(), stage: "uploading".into(), message: format!("Reusing the verified image. {cleanup_note}"), ..Default::default() });
+                    let delivered = deliver_image(app, settings, &path, job, cancel).await?;
+                    emit(app, Progress { job_id: job.into(), stage: "complete".into(), progress: 1., message: format!("{delivered} {cleanup_note}"), ..Default::default() });
+                    return Ok(());
+                }
                 if ps4 {
                     validate_delivery_target(request, false, dump.is_some())?;
                     return if receiver { ps4_receiver::deliver(app, settings, job, vec![path], cancel).await }
@@ -435,7 +491,7 @@ pub(super) fn recover_legacy(store: &mut Store, root: &Path) {
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let kind = artifact_kind(&read_magic_sync(&path).unwrap_or([0; 8]), &name, "");
         if !matches!(kind, ArtifactKind::Rar | ArtifactKind::Zip | ArtifactKind::Pkg) || path.extension().is_some_and(|s| s == "part") { continue; }
-        if kind == ArtifactKind::Rar && unrar::Archive::new(&path).as_first_part().filename() != path { continue; }
+        if kind == ArtifactKind::Rar && rar_first_volume(&path) != path { continue; }
         let already_known = store.records.values().any(|r| r.downloads.iter().any(|f| f.path == path) || match &r.checkpoint {
             Some(Checkpoint::Archive { primary, .. }) | Some(Checkpoint::Package { path: primary, .. }) => primary == &path,
             Some(Checkpoint::Local { paths }) => paths.contains(&path),
@@ -455,7 +511,7 @@ pub(super) fn recover_legacy(store: &mut Store, root: &Path) {
             let inputs = if kind == ArtifactKind::Rar {
                 std::fs::read_dir(path.parent().unwrap_or(root)).ok().into_iter().flatten().flatten()
                     .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-                    .map(|e| e.path()).filter(|p| unrar::Archive::new(p).as_first_part().filename() == path).collect()
+                    .map(|e| e.path()).filter(|p| rar_first_volume(p) == path).collect()
             } else { vec![path.clone()] };
             Checkpoint::Archive { primary: path.clone(), inputs, password: None }
         } else { Checkpoint::Local { paths: vec![path.clone()] } };
@@ -478,9 +534,17 @@ pub(super) async fn retry_job(app: AppHandle, job_id: String) -> Result<String, 
         transport: None,
         target: if saved.progress.target.is_empty() { None } else { Some(saved.progress.target) },
         package: Package { kind: saved.progress.package_kind, label: saved.progress.package_label, version: saved.progress.package_version, ..Default::default() },
-        title_id: Some(saved.progress.title_id), title_name: Some(saved.progress.title), icon: saved.progress.icon, archive_parts: vec![], backport: None, provider: None,
+        title_id: Some(saved.progress.title_id), title_name: Some(saved.progress.title), icon: saved.progress.icon, archive_parts: vec![], backport: None, provider: None, package_dumps: None,
     });
     queue_delivery(app.clone(), &state, request, Some(job_id)).await
+}
+
+/// Built FPKGs this record produced (a local PKG import is an original, never listed here).
+fn finished_packages(record: &Record) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(info) = &record.progress.packaging { if !info.output_path.is_empty() { paths.push(PathBuf::from(&info.output_path)); } }
+    if let Some(Checkpoint::Package { path, .. }) = &record.checkpoint { if !paths.contains(path) { paths.push(path.clone()); } }
+    paths
 }
 
 fn referenced_paths(record: &Record) -> Vec<PathBuf> {
@@ -563,7 +627,8 @@ fn cleanup_files(record: &Record, protected: &[PathBuf]) -> Result<(usize, usize
 #[tauri::command]
 pub(super) async fn remove_job(app: AppHandle, job_id: String, delete_files: bool) -> Result<String, String> {
     let state = app.state::<AppState>();
-    let (saved, protected) = {
+    let keep_packages = state.settings.lock().unwrap().keep_packages_on_remove;
+    let (saved, mut protected) = {
         let mut jobs = state.jobs.lock().unwrap();
         let current = jobs.get_mut(&job_id).ok_or("Download entry not found")?;
         if !terminal_stage(&current.stage) || state.cancel.lock().unwrap().contains_key(&job_id) { return Err("Stop this transfer before removing it".into()); }
@@ -573,6 +638,10 @@ pub(super) async fn remove_job(app: AppHandle, job_id: String, delete_files: boo
         current.stage = "removing".into();
         (saved, protected)
     };
+    // A finished package is a result, not a leftover: keep it (and any workspace still
+    // holding it) unless the user turned that off in Packaging settings.
+    let kept_packages: Vec<PathBuf> = if keep_packages { finished_packages(&saved).into_iter().filter(|path| path.is_file()).collect() } else { vec![] };
+    protected.extend(kept_packages.iter().cloned());
     let served = delete_files && referenced_paths(&saved).iter().any(|path| pkg_server::is_served(path));
     let result = if delete_files {
         let work = saved.clone(); tokio::task::spawn_blocking(move || cleanup_files(&work, &protected)).await.map_err(redact).and_then(|r| r)
@@ -592,8 +661,9 @@ pub(super) async fn remove_job(app: AppHandle, job_id: String, delete_files: boo
     drop(store); drop(jobs);
     let _ = app.emit("delivery-removed", &job_id);
     Ok(if delete_files {
-        if served { format!("Entry removed; {deleted} downloaded/staged paths deleted. {retained} shared or PS4-served paths retained. Packages still served to the PS4 were kept; keep SSPI open while it downloads. Imported originals are kept.") }
-        else { format!("Entry removed; {deleted} downloaded/staged paths deleted. {retained} shared paths retained. Imported originals are kept.") }
+        let kept = if kept_packages.is_empty() { String::new() } else { format!(" Finished package kept: {}.", kept_packages.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ")) };
+        if served { format!("Entry removed; {deleted} downloaded/staged paths deleted. {retained} shared or PS4-served paths retained. Packages still served to the PS4 were kept; keep SSPI open while it downloads. Imported originals are kept.{kept}") }
+        else { format!("Entry removed; {deleted} downloaded/staged paths deleted. {retained} shared paths retained. Imported originals are kept.{kept}") }
     } else { "Entry removed. Files kept on disk.".into() })
 }
 
@@ -612,7 +682,7 @@ mod tests {
     use super::*;
     fn pair_request() -> DeliveryRequest {
         DeliveryRequest { transport: None, target: None, package: Package { kind: "base".into(), version: "01.200".into(), label: "Game".into(), url: "https://base.example/archive.rar".into(), ..Default::default() },
-            title_id: Some("PPSA31246".into()), title_name: None, icon: None, archive_parts: vec![], provider: None,
+            title_id: Some("PPSA31246".into()), title_name: None, icon: None, archive_parts: vec![], provider: None, package_dumps: None,
             backport: Some(BackportInput { package: Package { kind: "backport".into(), version: "01.200".into(), label: "Backport 4.xx".into(), url: "https://overlay.example/backport.zip".into(), ..Default::default() }, parts: vec![] }) }
     }
     #[test]
@@ -646,7 +716,7 @@ mod tests {
     #[test]
     fn same_base_is_blocked_across_mirrors_and_combined_jobs() {
         let a = DeliveryRequest { transport: None, target: None, package: Package { kind: "base".into(), version: "01.200".into(), url: "https://one/base".into(), ..Default::default() },
-            title_id: Some("PPSA31246".into()), title_name: None, icon: None, archive_parts: vec![], backport: None, provider: None };
+            title_id: Some("PPSA31246".into()), title_name: None, icon: None, archive_parts: vec![], backport: None, provider: None, package_dumps: None };
         let mut b = a.clone(); b.package.url = "https://two/base".into();
         b.backport = Some(BackportInput { package: Package::default(), parts: vec![] });
         assert!(overlapping_delivery(&a, &b));
@@ -789,6 +859,32 @@ mod tests {
         assert!(original.exists()); assert!(!workspace.exists());
     }
     #[test]
+    fn removing_a_packaged_job_keeps_the_finished_package_when_asked() {
+        // The reported case: Remove from list > Delete leftover files wiped a package-only FPKG.
+        let (root, mut record) = cleanup_fixture();
+        let workspace = root.join("packaged").join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(workspace.join("output").join("work")).unwrap();
+        let package = root.join("FPKG").join("Game [PPSA00001]").join("UP0000-PPSA00001_00-GAME000000000000-A0100-V0100.pkg");
+        std::fs::create_dir_all(package.parent().unwrap()).unwrap(); std::fs::write(&package, b"finished").unwrap();
+        record.progress.work_paths.push(workspace.clone());
+        record.progress.packaging = Some(PackagingInfo { output_path: package.display().to_string(), ..Default::default() });
+        record.checkpoint = Some(Checkpoint::Package { path: package.clone(), dump: None, cleanup: false, backports_embedded: true, cleanup_extra: vec![] });
+        assert_eq!(finished_packages(&record), vec![package.clone()]);
+        cleanup_files(&record, &finished_packages(&record)).unwrap();
+        assert!(package.is_file()); assert!(!workspace.exists()); assert!(!root.join("archive.rar").exists());
+        // With the setting off the package is the job's own output and goes too.
+        cleanup_files(&record, &[]).unwrap();
+        assert!(!package.exists());
+
+        // Packages built before relocation still sit inside their workspace: keep the workspace.
+        let (root, mut record) = cleanup_fixture();
+        let legacy = root.join("packaged").join(Uuid::new_v4().to_string()).join("output").join("legacy.pkg");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap(); std::fs::write(&legacy, b"finished").unwrap();
+        record.progress.packaging = Some(PackagingInfo { output_path: legacy.display().to_string(), ..Default::default() });
+        cleanup_files(&record, &finished_packages(&record)).unwrap();
+        assert!(legacy.is_file());
+    }
+    #[test]
     fn dismissed_entry_keeps_legacy_recovery_from_recreating_it() {
         let (root, mut record) = cleanup_fixture(); record.progress.removed = true;
         let id = record.progress.job_id.clone(); let mut store = Store::load(root.join("journal"));
@@ -800,7 +896,7 @@ mod tests {
     fn combined_components_keep_backport_size_separate_from_base_parts() {
         let base = Package { kind: "base".into(), expected_size: Some(1024), ..Default::default() };
         let overlay = Package { kind: "backport".into(), expected_size: Some(98 * 1024 * 1024), ..Default::default() };
-        let request = DeliveryRequest { transport: None, target: None, package: base.clone(), archive_parts: vec![base; 8], backport: Some(BackportInput { package: overlay, parts: vec![] }), title_id: None, title_name: None, icon: None, provider: None };
+        let request = DeliveryRequest { transport: None, target: None, package: base.clone(), archive_parts: vec![base; 8], backport: Some(BackportInput { package: overlay, parts: vec![] }), title_id: None, title_name: None, icon: None, provider: None, package_dumps: None };
         let parts = request_components(&request, &[]); assert_eq!(parts.len(), 2); assert_eq!(parts[0].parts.len(), 8);
         assert_eq!(parts[0].bytes_total, Some(8192)); assert_eq!(parts[1].bytes_total, Some(98 * 1024 * 1024)); assert_eq!(parts[1].kind, "backport");
     }

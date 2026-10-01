@@ -537,7 +537,9 @@ pub(super) fn extract_content_controlled(
         match kind {
             ArtifactKind::Zip => extract_zip_tree(source, &dest, progress.as_ref(), checkpoint.as_ref())?,
             ArtifactKind::Rar => {
-                let size = archive_passwords(password).into_iter().find_map(|p| rar_list_size(source, p).ok());
+                let first = rar_first_volume(source);
+                let listed = if first.is_file() { first.as_path() } else { source };
+                let size = archive_passwords(password).into_iter().find_map(|p| rar_list_size(listed, p).ok());
                 if let (Some(size), Some(free)) = (size, free_space(cache)) {
                     if free < size.saturating_add(128 * 1024 * 1024) {
                         return Err(phase_error(
@@ -759,6 +761,69 @@ mod tests {
             assert_eq!(std::fs::read(destination.join("payload.txt")).unwrap(), contents);
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn old_style_rar_sets_start_at_the_rar_volume() {
+        assert_eq!(rar_first_volume(Path::new("d/lfc-cusa00109.r00")), PathBuf::from("d/lfc-cusa00109.rar"));
+        assert_eq!(rar_first_volume(Path::new("d/lfc-cusa00109.r17")), PathBuf::from("d/lfc-cusa00109.rar"));
+        assert_eq!(rar_first_volume(Path::new("d/GAME.R05")), PathBuf::from("d/GAME.RAR"));
+        assert_eq!(rar_first_volume(Path::new("d/game.rar")), PathBuf::from("d/game.rar"));
+        assert_eq!(rar_first_volume(Path::new("d/game.part07.rar")), PathBuf::from("d/game.part01.rar"));
+        assert_eq!(rar_first_volume(Path::new("d/game.003")), PathBuf::from("d/game.001"));
+    }
+    /// Stored RAR 4.x volumes with old-style names (name.rar, name.r00, …).
+    /// Current WinRAR can no longer create these, but older releases use them.
+    fn rar4_old_style_set(stem: &str, name: &str, data: &[u8], chunk: usize) -> Vec<(String, Vec<u8>)> {
+        fn crc32(bytes: &[u8]) -> u32 {
+            !bytes.iter().fold(!0u32, |crc, &byte| (0..8).fold(crc ^ byte as u32, |c, _| (c >> 1) ^ (0xEDB8_8320 & (c & 1).wrapping_neg())))
+        }
+        fn block(kind: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+            let mut header = vec![kind];
+            header.extend(flags.to_le_bytes());
+            header.extend((7 + body.len() as u16).to_le_bytes());
+            header.extend(body);
+            let mut out = (crc32(&header) as u16).to_le_bytes().to_vec();
+            out.extend(header);
+            out
+        }
+        let parts: Vec<&[u8]> = data.chunks(chunk).collect();
+        parts.iter().enumerate().map(|(index, part)| {
+            let (first, last) = (index == 0, index + 1 == parts.len());
+            let mut body = Vec::new();
+            body.extend((part.len() as u32).to_le_bytes());
+            body.extend((data.len() as u32).to_le_bytes());
+            body.push(2); // Windows host
+            body.extend((if last { crc32(data) } else { crc32(part) }).to_le_bytes());
+            body.extend(0x5B2A_0000u32.to_le_bytes()); // DOS time
+            body.extend([29, 0x30]); // unpack version 2.9, stored
+            body.extend((name.len() as u16).to_le_bytes());
+            body.extend(0x20u32.to_le_bytes());
+            body.extend(name.as_bytes());
+            let mut volume = b"Rar!\x1a\x07\x00".to_vec();
+            volume.extend(block(0x73, 0x0001 | if first { 0x0100 } else { 0 }, &[0; 6])); // volume, first volume
+            volume.extend(block(0x74, 0x8000 | if first { 0 } else { 0x01 } | if last { 0 } else { 0x02 }, &body));
+            volume.extend_from_slice(part);
+            volume.extend(block(0x7B, if last { 0 } else { 0x0001 }, &[])); // more volumes follow
+            let file = if first { format!("{stem}.rar") } else { format!("{stem}.r{:02}", index - 1) };
+            (file, volume)
+        }).collect()
+    }
+    #[test]
+    fn nested_old_style_rar_set_extracts_from_its_rar_volume() {
+        // Tomb Raider's download: one archive wrapping a release folder that holds
+        // lfc-cusa00109.rar/.r00/.r01. Windows lists .r00 before .rar.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut payload = b"\x7fCNT".to_vec();
+        payload.extend((0..300 * 1024).map(|_| { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state as u8 }));
+        let volumes = rar4_old_style_set("lfc-test", "game.pkg", &payload, 100 * 1024);
+        assert_eq!(volumes.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["lfc-test.rar", "lfc-test.r00", "lfc-test.r01", "lfc-test.r02"]);
+        let names: Vec<String> = volumes.iter().map(|(name, _)| format!("Release-TEST/{name}")).collect();
+        let (source, cache) = crate::tests::make_zip(names.iter().map(String::as_str).zip(volumes.into_iter().map(|(_, bytes)| bytes)).collect());
+        let content = extract_content(&source, &cache, ArtifactKind::Zip, None, Arc::new(|_,_,_| {}), 0).unwrap();
+        let ExtractedContent::Pkgs(pkgs) = content else { panic!("expected a PKG") };
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(std::fs::read(&pkgs[0]).unwrap(), payload);
+        std::fs::remove_dir_all(source.parent().unwrap()).unwrap();
     }
     #[test]
     fn encrypted_rar_extracts_with_the_explicit_password() {

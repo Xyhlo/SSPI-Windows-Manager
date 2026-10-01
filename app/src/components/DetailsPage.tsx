@@ -10,7 +10,6 @@ import { useProviders } from "./ProviderContext"
 import { CaseAnchor } from "./CaseAnchor"
 import { Collapse } from "./Collapse"
 import { Icon } from "./Icon"
-import type { Hint } from "./Shell"
 import type { OptionsTab } from "./OptionsOverlay"
 import { toast } from "./toasts"
 import { consoleAddress, sendBlockReason } from "@/lib/consoles"
@@ -51,7 +50,6 @@ type Props = {
   onVariant: (game: Game) => void
   onInstall: (candidates: PackageCandidate[], available: PackageCandidate[], from: HTMLElement | null, provider?: string) => Promise<string[]>
   onOptions: (tab: OptionsTab) => void
-  onDock: (dock: { context: ReactNode; hints: Hint[] }) => void
   tintOn: boolean
 }
 
@@ -68,7 +66,7 @@ type RowState = {
 }
 
 export function DetailsPage(props: Props) {
-  const { game, packages, packageState, packageError, packageNote, metadata, metadataState, demo, settings, autoBackports, setAutoBackports, deliveryBusy, libraryEntry, pendingUpdate, backLabel, onBack, onRetry, onVariant, onInstall, onOptions, onDock, tintOn } = props
+  const { game, packages, packageState, packageError, packageNote, metadata, metadataState, demo, settings, autoBackports, setAutoBackports, deliveryBusy, libraryEntry, pendingUpdate, backLabel, onBack, onRetry, onVariant, onInstall, onOptions, tintOn } = props
   const { inventories, loading: providersLoading, refresh: refreshProviders } = useProviders()
   const [tab, setTab] = useState<TabId>("all")
   const [checked, setChecked] = useState<string[]>([])
@@ -143,6 +141,15 @@ export function DetailsPage(props: Props) {
   ].filter(Boolean) as string[]
   const installed = libraryEntry ? installedVersion(libraryEntry) : ""
   const newer = latestUpdate && installed && compareVersions(latestUpdate.version, installed) > 0 ? latestUpdate.version : ""
+  /** How a listed base game or update compares with what the console has installed. The receiver doesn't
+      report add-ons, so DLC rows carry no mark. */
+  const installMark = (group: PackageGroup): { label: string; tone: "good" | "up" | "old" } | null => {
+    if (!libraryEntry || (group.kind !== "base" && group.kind !== "update")) return null
+    if (!group.version || !installed) return group.kind === "base" ? { label: "Installed", tone: "good" } : null
+    const order = compareVersions(group.version, installed)
+    if (order === 0) return { label: "Installed", tone: "good" }
+    return order > 0 ? { label: "Newer than installed", tone: "up" } : { label: "Older than installed", tone: "old" }
+  }
 
   /* ---------------------------------------------------------------- effects */
   useLayoutEffect(() => {
@@ -196,7 +203,7 @@ export function DetailsPage(props: Props) {
     onVariant({ ...next, variants })
   }
 
-  /* ---------------------------------------------------------------- keyboard and dock */
+  /* ---------------------------------------------------------------- keyboard */
   const live = useRef({ listed, checked, focusKey, selectedCandidates, tab })
   live.current = { listed, checked, focusKey, selectedCandidates, tab }
   const handlers = useRef({ toggleCheck, selectRecommended, installSelected, installBase, onBack, setTab, setMirrorOpen, setFocusKey })
@@ -225,18 +232,6 @@ export function DetailsPage(props: Props) {
   }), [counts.base, counts.update, counts.dlc, counts.backport])
 
   const total = selectedCandidates.length + selection.added.length
-  useEffect(() => {
-    onDock({
-      context: <>{game.name}<small>{titleId}</small></>,
-      hints: [
-        { key: "Enter", label: total ? `Install ${total} selected` : "Install base game", disabled: deliveryBusy || (!total && (!basePackage || !!installBlock)), run: () => (total ? void installSelected() : installBase()) },
-        { key: "Space", label: "Select", run: () => { const g = groups.find(group => group.key === focusKey); if (g) toggleCheck(g) } },
-        { key: "M", glyph: "M", face: "triangle", label: "Mirrors", run: () => focusKey && setMirrorOpen(open => open === focusKey ? null : focusKey) },
-        { key: "R", glyph: "R", face: "neutral", label: "Recommended", disabled: !baseGroup, run: selectRecommended },
-        { key: "Escape", label: "Back", run: onBack },
-      ],
-    })
-  }, [game.name, titleId, total, deliveryBusy, !!basePackage, !!installBlock, focusKey, groups.length, checked.join("|"), hostByKey])
 
   /* ---------------------------------------------------------------- render */
   const trayOpen = total > 0
@@ -271,6 +266,7 @@ export function DetailsPage(props: Props) {
               {deliveryBusy ? <span className="spinner" /> : <Icon name="download" />}{heroBackport ? "Install base + backport" : demo ? "Preview base game" : packageOnly ? "Package base game" : "Install base game"}{heroBytes ? <span className="muted-size">{fmtBytes(heroBytes)}</span> : null}
             </button>
             <button type="button" className="btn" disabled={!counts.update} onClick={() => setTab("update")}><Icon name="layers" />View updates</button>
+            <button type="button" className="btn ghost" disabled={!baseGroup} title="Selects the base game and the newest update (R)" onClick={selectRecommended}><Icon name="check" />Select recommended</button>
             <p className={`d-target ${installBlock ? "block" : ""}`}>{installBlock || (packageOnly ? "Packages are saved on this PC" : demo ? "Installs are off in the offline preview" : consoleAddress(settings, target) ? `Installs on your ${target.toUpperCase()} at ${consoleAddress(settings, target)}` : `Installs on your ${target.toUpperCase()}`)}</p>
           </div>
           {focusRow && <SelectedPanel row={focusRow} hosts={groupHosts(focusRow.group).length} />}
@@ -315,6 +311,7 @@ export function DetailsPage(props: Props) {
                 {packageState === "success" && groups.length > 0 && !listed.length && <p className="plist-empty">No packages of this type are listed for this region.</p>}
                 {packageState === "success" && listed.map((group, n) => {
                   const row = rowState(group)
+                  const mark = installMark(group)
                   const hosts = groupHosts(group)
                   const picked = hostByKey[group.key] && hosts.includes(hostByKey[group.key]) ? hostByKey[group.key] : hosts[0]
                   return (
@@ -330,7 +327,7 @@ export function DetailsPage(props: Props) {
                         <span className={`prow-bar ${row.tone}`} />
                         <button type="button" className={`check ${row.auto ? "auto" : ""}`} role="checkbox" aria-checked={row.checked && !row.auto} aria-label={`Select ${group.title} ${group.version}`} disabled={deliveryBusy} onClick={event => { event.stopPropagation(); toggleCheck(group) }}><Icon name="check" /></button>
                         <span className="prow-main">
-                          <span className="prow-title">{group.kind === "dlc" && row.candidate?.label ? displayText(row.candidate.label) : group.title}{group.version && <span className="ver">{group.kind === "backport" ? group.version : `v${group.version}`}</span>}</span>
+                          <span className="prow-title">{group.kind === "dlc" && row.candidate?.label ? displayText(row.candidate.label) : group.title}{group.version && <span className="ver">{group.kind === "backport" ? group.version : `v${group.version}`}</span>}{mark && <span className={`inst ${mark.tone}`}>{mark.tone === "good" && <Icon name="check" />}{mark.label}</span>}</span>
                           <span className="prow-sub">
                             <span className={row.tone === "fail" ? "fail" : ""}>{row.status}</span>
                             <span>{archiveLabel(row.parts)}</span>

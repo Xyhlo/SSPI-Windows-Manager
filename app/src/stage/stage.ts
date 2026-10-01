@@ -115,6 +115,22 @@ void main() {
 /* Retail case plastic, kept deep so the case edges read as blue without glowing. */
 const CASE_BLUE = { side: 0x223f86, back: 0x1b336b }
 
+/** Render layer for cases in flight between pages. */
+const FLIGHT_LAYER = 1
+/** How far past an unscrolled list edge the clip moves, beyond the fade and a lifted case's overhang. */
+const OPEN_EDGE = 60
+
+/* The cover art is drawn unlit and untoned so it keeps the colours of the artwork; lighting it made
+   blacks grey and colours pale (black showed as 55/255, #808080 as 184/255). Only the plastic is lit.
+   Tilting the case away from the key light (upper left) dims the cover a little, never brightens it. */
+const coverMaterial = (map: THREE.Texture) => new THREE.MeshBasicMaterial({ map, toneMapped: false, transparent: true })
+const COVER_LIGHT = new THREE.Vector3(-0.35, 0.55, 1).normalize()
+function coverShade(tiltX: number, tiltY: number) {
+  // The front normal (0, 0, 1) after rotation.set(tiltX, tiltY, 0), against the light.
+  const facing = -Math.cos(tiltY) * Math.sin(tiltX) * COVER_LIGHT.y + Math.sin(tiltY) * COVER_LIGHT.x + Math.cos(tiltY) * Math.cos(tiltX) * COVER_LIGHT.z
+  return clamp(facing / COVER_LIGHT.z, 0, 1)
+}
+
 export type CaseKind = "library" | "details" | "download"
 export type CaseSpec = CoverSpec & { key: string; kind: CaseKind }
 
@@ -209,12 +225,15 @@ function createStage() {
   const scene = new THREE.Scene()
   const camera = new THREE.PerspectiveCamera(28, W / H, 10, 20000)
   let camDist = 1
+  let flying = 0
   const pmrem = new THREE.PMREMGenerator(renderer)
   scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture
   const key = new THREE.DirectionalLight(0xffffff, 1.1)
   key.position.set(-0.35, 0.55, 1)
-  scene.add(key)
-  scene.add(new THREE.HemisphereLight(0xe8eeff, 0x141418, 0.45))
+  const sky = new THREE.HemisphereLight(0xe8eeff, 0x141418, 0.45)
+  key.layers.enable(FLIGHT_LAYER)
+  sky.layers.enable(FLIGHT_LAYER)
+  scene.add(key, sky)
 
   const CASE = buildCaseGeometry()
   const planeGeo = new THREE.PlaneGeometry(1, 1)
@@ -245,11 +264,17 @@ function createStage() {
   let viewRect = new DOMRect(0, 0, W, H)
   const rectToWorld = (rect: DOMRect) => ({ x: rect.left + rect.width / 2 - W / 2, y: H / 2 - (rect.top + rect.height / 2), w: rect.width })
 
-  /** Device-pixel clip rect (GL coordinates) for the nearest scrolling list, or the whole view. */
+  /** Device-pixel clip rect (GL coordinates) for the nearest scrolling list, or the whole view. An edge the list
+      isn't scrolled past is pushed out, so cases resting at the top or bottom are neither faded nor clipped. */
   function clipFor(el: HTMLElement, out: THREE.Vector4) {
     const scroller = el.closest("[data-case-scroll]") as HTMLElement | null
     const r = scroller ? scroller.getBoundingClientRect() : viewRect
-    out.set(r.left * DPR, (H - r.bottom) * DPR, r.right * DPR, (H - r.top) * DPR)
+    let top = r.top, bottom = r.bottom
+    if (scroller) {
+      if (scroller.scrollTop <= 0) top = Math.min(top, viewRect.top) - OPEN_EDGE
+      if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 1) bottom = Math.max(bottom, viewRect.bottom) + OPEN_EDGE
+    }
+    out.set(r.left * DPR, (H - bottom) * DPR, r.right * DPR, (H - top) * DPR)
   }
 
   /* ---------- 3D game cases */
@@ -272,10 +297,12 @@ function createStage() {
     enterDelay = 0
     hovering = false
     focused = false
+    /** The [data-hover-case] element around the anchor; "select" hosts lift only while they carry data-selected. */
+    host: HTMLElement | null = null
     textureWidth = 0
     readonly clip: ClipUniform = { value: OPEN_CLIP() }
     readonly fade = { value: 26 }
-    readonly front: THREE.MeshPhysicalMaterial
+    readonly front: THREE.MeshBasicMaterial
     readonly side: THREE.MeshPhysicalMaterial
     readonly back: THREE.MeshPhysicalMaterial
     readonly shadowMat: THREE.MeshBasicMaterial
@@ -293,7 +320,7 @@ function createStage() {
       const placeholder = placeholderFront(spec.titleId)
       const map = tex(placeholder.canvas)
       void placeholder.ready.then(() => { map.needsUpdate = true })
-      this.front = patchFade(new THREE.MeshPhysicalMaterial({ map, emissive: 0xffffff, emissiveMap: map, emissiveIntensity: 0.36, roughness: 0.5, clearcoat: 0.9, clearcoatRoughness: 0.16, envMapIntensity: 0.32, transparent: true }), this.clip, this.fade)
+      this.front = patchFade(coverMaterial(map), this.clip, this.fade)
       this.side = patchFade(new THREE.MeshPhysicalMaterial({ color: CASE_BLUE.side, roughness: 0.32, clearcoat: 0.8, clearcoatRoughness: 0.16, envMapIntensity: 0.55, transparent: true }), this.clip, this.fade)
       this.back = patchFade(new THREE.MeshPhysicalMaterial({ color: CASE_BLUE.back, roughness: 0.45, clearcoat: 0.8, clearcoatRoughness: 0.2, envMapIntensity: 0.4, transparent: true }), this.clip, this.fade)
       this.mesh = new THREE.Mesh(CASE.geometry, [this.front, this.side, this.back])
@@ -312,9 +339,7 @@ function createStage() {
       const spec = this.spec
       void caseFront(spec, width).then(canvas => {
         if (this.dead || spec !== this.spec) return
-        const map = tex(canvas)
-        this.front.map = map
-        this.front.emissiveMap = map
+        this.front.map = tex(canvas)
         this.front.needsUpdate = true
       }).catch(() => undefined)
     }
@@ -323,12 +348,19 @@ function createStage() {
       this.anchor = anchor
       byAnchor.set(anchor, this)
       this.clipEl = anchor.closest("[data-case-clip]") as HTMLElement | null
+      this.host = anchor.closest("[data-hover-case]") as HTMLElement | null
       const coverChanged = spec.cover !== this.spec.cover || spec.title !== this.spec.title
       this.spec = spec
       if (coverChanged) this.textureWidth = 0
       if (this.visible) this.loadTexture()
     }
-    kill() { this.dead = true; this.alpha.set(0) }
+    /** Fades the case out for good. A pending staggered entrance is cancelled, or it would bring the case back. */
+    kill() { this.dead = true; this.enterDelay = 0; this.alpha.set(0) }
+    /** Library cards lift with the selection, the same for mouse and keyboard; other cases lift on hover or focus. */
+    liftTarget() {
+      if (this.host?.dataset.hoverCase === "select") return this.host.hasAttribute("data-selected") ? 1 : 0
+      return this.hovering || this.focused ? 1 : 0
+    }
     dispose() {
       scene.remove(this.group)
       ;[this.front, this.side, this.back, this.shadowMat].forEach(m => m.dispose())
@@ -396,19 +428,17 @@ function createStage() {
       const strength = obj.spec.kind === "details" ? 0.6 : obj.spec.kind === "download" ? 0.7 : 1
       obj.tiltY.set(nx * 0.14 * strength)
       obj.tiltX.set(-ny * 0.1 * strength)
-      obj.lift.set(1)
     },
     leave(anchor: HTMLElement) {
       const obj = byAnchor.get(anchor)
       if (!obj) return
       obj.hovering = false
-      obj.tiltX.set(0); obj.tiltY.set(0); obj.lift.set(obj.focused ? 1 : 0); obj.press.set(0)
+      obj.tiltX.set(0); obj.tiltY.set(0); obj.press.set(0)
     },
     focus(anchor: HTMLElement, on: boolean) {
       const obj = byAnchor.get(anchor)
       if (!obj) return
       obj.focused = on
-      obj.lift.set(on || obj.hovering ? 1 : 0)
     },
     press(anchor: HTMLElement, on: boolean) { byAnchor.get(anchor)?.press.set(on ? 1 : 0) },
     /** The case's current on-screen rectangle (it can lag the anchor during a flight). */
@@ -601,8 +631,8 @@ function createStage() {
         const placeholder = placeholderFront(spec.titleId)
         const map = tex(placeholder.canvas)
         void placeholder.ready.then(() => { map.needsUpdate = true })
-        const front = new THREE.MeshPhysicalMaterial({ map, emissive: 0xffffff, emissiveMap: map, emissiveIntensity: 0.36, roughness: 0.5, clearcoat: 0.9, clearcoatRoughness: 0.16, envMapIntensity: 0.32, transparent: true })
-        void caseFront(spec, 384).then(canvas => { const t = tex(canvas); front.map = t; front.emissiveMap = t; front.needsUpdate = true }).catch(() => undefined)
+        const front = coverMaterial(map)
+        void caseFront(spec, 384).then(canvas => { front.map = tex(canvas); front.needsUpdate = true }).catch(() => undefined)
         const side = new THREE.MeshPhysicalMaterial({ color: CASE_BLUE.side, roughness: 0.32, clearcoat: 0.8, clearcoatRoughness: 0.16, envMapIntensity: 0.55, transparent: true })
         const back = new THREE.MeshPhysicalMaterial({ color: CASE_BLUE.back, roughness: 0.45, clearcoat: 0.8, transparent: true })
         const mesh = new THREE.Mesh(CASE.geometry, [front, side, back])
@@ -822,9 +852,10 @@ function createStage() {
 
     const top = viewRect.top - 400, bottom = viewRect.bottom + 400
     const now = performance.now()
+    flying = 0
     for (const obj of [...objects]) {
-      if (obj.shared && !obj.anchor && now - obj.sharedAt > 700) { obj.shared = false; obj.kill() }
-      if (obj.enterDelay > 0) { obj.enterDelay -= dt; if (obj.enterDelay <= 0) obj.alpha.set(1) }
+      if (obj.shared && !obj.anchor && now - obj.sharedAt > 300) { obj.shared = false; obj.kill() }
+      if (obj.enterDelay > 0) { obj.enterDelay -= dt; if (obj.enterDelay <= 0 && !obj.dead) obj.alpha.set(1) }
       else if (!obj.dead && obj.alpha.target === 0) obj.alpha.set(1)
       const connected = !!obj.anchor && obj.anchor.isConnected
       if (!connected && !obj.shared && !obj.dead) obj.kill()
@@ -848,11 +879,16 @@ function createStage() {
         obj.visible = r.bottom > top && r.top < bottom && r.width > 2 && obj.clipVis > 0
         if (obj.visible) obj.loadTexture()
       }
+      obj.lift.set(obj.liftTarget())
       obj.tiltX.step(dt); obj.tiltY.step(dt); obj.lift.step(dt); obj.press.step(dt)
-      const a = obj.alpha.step(dt)
+      // A case whose page or card went away leaves almost at once, so it never lingers over the next page.
+      const a = obj.alpha.step(obj.dead ? dt * 4 : dt)
       if (obj.dead && a < 0.01) { obj.dispose(); continue }
       obj.group.visible = obj.visible && a > 0.005
       if (!obj.group.visible) continue
+      const layer = obj.flight ? FLIGHT_LAYER : 0
+      if (!obj.mesh.layers.isEnabled(layer)) { obj.mesh.layers.set(layer); obj.shadow.layers.set(layer) }
+      if (layer) flying++
       const s = obj.w, lift = obj.lift.value, press = obj.press.value
       const z = -CASE.frontZ * s + lift * s * 0.06 - press * s * 0.03 + obj.flightZ
       const liftY = lift * 3 - press
@@ -860,6 +896,7 @@ function createStage() {
       obj.mesh.scale.setScalar(s * enter)
       obj.group.position.set(obj.x, obj.y + liftY, z)
       obj.mesh.rotation.set(obj.tiltX.value, obj.tiltY.value, 0)
+      obj.front.color.setScalar(coverShade(obj.tiltX.value, obj.tiltY.value))
       obj.shadow.position.set(s * 0.02, -s * 0.05 - lift * s * 0.04, -CASE.thickness * s * 0.5 - 2)
       obj.shadow.scale.set(s * (1.28 + lift * 0.12), s * CASE_ASPECT * (1.18 + lift * 0.1), 1)
       const opacity = clamp(a, 0, 1) * obj.clipVis
@@ -909,7 +946,11 @@ function createStage() {
     renderer.clearDepth()
     // The DOM is hidden during the logo intro, but this canvas lives behind it.
     // Keep its tracked artwork out of the splash while preserving the backdrop and boot mark.
-    if (!document.body.classList.contains("booting") && !boot.visible) renderer.render(scene, camera)
+    if (!document.body.classList.contains("booting") && !boot.visible) {
+      renderer.render(scene, camera)
+      // Cases in flight are drawn last on a clear depth buffer, so they pass over other cases instead of through them.
+      if (flying) { renderer.clearDepth(); camera.layers.set(FLIGHT_LAYER); renderer.render(scene, camera); camera.layers.set(0) }
+    }
     renderer.setScissorTest(false)
     if (boot.visible) { renderer.clearDepth(); renderer.render(bootScene, camera) }
   }

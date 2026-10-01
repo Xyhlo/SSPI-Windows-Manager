@@ -1,4 +1,4 @@
-//! Payload library, binloader delivery and local theme files.
+//! Payload library and binloader delivery.
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -19,7 +19,6 @@ use crate::{AppState, Settings, PS4_RECEIVER_ELF, RECEIVER_ELF, RECEIVER_VERSION
 const INDEX_NAME: &str = "payloads.json";
 const MIN_PAYLOAD_SIZE: usize = 1;
 const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
-const MAX_THEME_SIZE: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE: usize = 1024 * 1024;
 const BUILTIN_PS5: &str = "builtin:ps5-receiver";
 const BUILTIN_PS4: &str = "builtin:ps4-receiver";
@@ -42,6 +41,9 @@ pub(super) struct PayloadEntry {
     last_result: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     notes: Option<String>,
+    /// Parsed from the stored bytes each time the list is read; `None` for raw BIN files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    elf: Option<ElfInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,6 +53,104 @@ pub(super) struct PayloadSendResult {
     bytes: usize,
     port: u32,
     verified: bool,
+    /// Measured steps of this send, in order.
+    #[serde(default)]
+    steps: Vec<SendStep>,
+    total_ms: u64,
+    /// Socket write time for the payload bytes (connect excluded).
+    send_ms: Option<u64>,
+    bytes_per_second: Option<f64>,
+    host: String,
+    sha256: String,
+}
+
+impl PayloadSendResult {
+    fn new(message: String, bytes: usize, port: u32, verified: bool) -> Self {
+        Self { message, bytes, port, verified, steps: Vec::new(), total_ms: 0, send_ms: None, bytes_per_second: None, host: String::new(), sha256: String::new() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SendStep {
+    label: String,
+    detail: String,
+    ms: u64,
+    ok: bool,
+}
+
+/// Records what a send actually did and how long each part took.
+struct Trace {
+    steps: Vec<SendStep>,
+    sent: Option<(usize, Duration)>,
+}
+
+impl Trace {
+    fn new() -> Self { Self { steps: Vec::new(), sent: None } }
+    fn step(&mut self, label: impl Into<String>, detail: impl Into<String>, from: Instant, ok: bool) {
+        self.steps.push(SendStep { label: label.into(), detail: detail.into(), ms: from.elapsed().as_millis() as u64, ok });
+    }
+}
+
+/// ELF header facts shown before sending; `None` for raw BIN payloads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ElfInfo {
+    class: String,
+    endian: String,
+    kind: String,
+    machine: String,
+    entry: String,
+    segments: u16,
+    loadable: u16,
+    loadable_bytes: u64,
+}
+
+/// 1086888 -> "1,086,888" for trace details.
+fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 { out.push(','); }
+        out.push(c);
+    }
+    out
+}
+
+fn parse_elf(bytes: &[u8]) -> Option<ElfInfo> {
+    if bytes.len() < 52 || &bytes[..4] != b"\x7fELF" || !matches!(bytes[4], 1 | 2) || !matches!(bytes[5], 1 | 2) {
+        return None;
+    }
+    let (wide, little) = (bytes[4] == 2, bytes[5] == 1);
+    // Offsets come from the file; checked_add keeps a hostile header from overflowing.
+    let field = |at: usize, len: usize| at.checked_add(len).and_then(|end| bytes.get(at..end));
+    let u16_at = |at: usize| field(at, 2).map(|b| if little { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) });
+    let u32_at = |at: usize| field(at, 4).map(|b| { let a = [b[0], b[1], b[2], b[3]]; if little { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) } });
+    let u64_at = |at: usize| field(at, 8).map(|b| { let a: [u8; 8] = b.try_into().unwrap(); if little { u64::from_le_bytes(a) } else { u64::from_be_bytes(a) } });
+    let kind = match u16_at(16)? { 1 => "REL".to_string(), 2 => "EXEC".into(), 3 => "DYN".into(), 4 => "CORE".into(), other => format!("0x{other:04x}") };
+    let machine = match u16_at(18)? { 0x3e => "x86-64".to_string(), 0xb7 => "AArch64".into(), 0x03 => "x86".into(), 0x28 => "ARM".into(), other => format!("0x{other:04x}") };
+    let (entry, phoff, phentsize, phnum) = if wide {
+        (u64_at(24)?, u64_at(32)?, u16_at(54)?, u16_at(56)?)
+    } else {
+        (u64::from(u32_at(24)?), u64::from(u32_at(28)?), u16_at(42)?, u16_at(44)?)
+    };
+    let (mut loadable, mut loadable_bytes) = (0u16, 0u64);
+    // Headers beyond the bytes read are simply not counted; never index past the buffer.
+    for index in 0..u64::from(phnum.min(4096)) {
+        let Some(at) = phoff.checked_add(index * u64::from(phentsize)).and_then(|at| usize::try_from(at).ok()) else { break };
+        let Some(kind) = u32_at(at) else { break };
+        if kind == 1 {
+            loadable += 1;
+            loadable_bytes = loadable_bytes.saturating_add(if wide { u64_at(at + 40).unwrap_or(0) } else { u64::from(u32_at(at + 20).unwrap_or(0)) });
+        }
+    }
+    Some(ElfInfo {
+        class: if wide { "ELF64" } else { "ELF32" }.into(),
+        endian: if little { "LE" } else { "BE" }.into(),
+        kind, machine,
+        entry: format!("0x{entry:x}"),
+        segments: phnum, loadable, loadable_bytes,
+    })
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -147,29 +247,6 @@ pub(super) async fn send_payload(
     .await
 }
 
-#[tauri::command]
-pub(super) fn save_theme_file(path: String, contents: String) -> Result<(), String> {
-    let destination = PathBuf::from(&path);
-    validate_theme_path(&destination)?;
-    if contents.len() > MAX_THEME_SIZE {
-        return Err("Theme files must be 8 MiB or smaller.".into());
-    }
-    atomic_write(&destination, contents.as_bytes())
-        .map_err(|_| "Could not save the theme file.".to_string())
-}
-
-#[tauri::command]
-pub(super) fn load_theme_file(path: String) -> Result<String, String> {
-    let source = PathBuf::from(&path);
-    validate_theme_path(&source)?;
-    let metadata =
-        fs::metadata(&source).map_err(|_| "Could not read the theme file.".to_string())?;
-    if metadata.len() > MAX_THEME_SIZE as u64 {
-        return Err("Theme files must be 8 MiB or smaller.".into());
-    }
-    fs::read_to_string(source).map_err(|_| "The theme file must contain valid UTF-8 text.".into())
-}
-
 fn store_root(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_config_dir()
@@ -186,7 +263,16 @@ fn list_payloads_at(root: &Path) -> Result<Vec<PayloadEntry>, String> {
             entry.last_result = history.last_result.clone();
         }
     }
-    entries.extend(index.entries.into_iter().filter(|entry| !entry.builtin));
+    entries.extend(index.entries.into_iter().filter(|entry| !entry.builtin).map(|mut entry| {
+        // Program headers sit near the start; 256 KiB covers them without reading large payloads.
+        entry.elf = safe_store_file_name(&entry.file_name, &entry.id).ok().and_then(|name| {
+            use std::io::Read;
+            let mut head = Vec::new();
+            fs::File::open(root.join(name)).ok()?.take(256 * 1024).read_to_end(&mut head).ok()?;
+            parse_elf(&head)
+        });
+        entry
+    }));
     Ok(entries)
 }
 
@@ -273,6 +359,7 @@ fn add_payloads_at(
             last_sent_at: None,
             last_result: None,
             notes: None,
+            elf: None,
         });
     }
     write_index(root, &index)?;
@@ -358,6 +445,8 @@ async fn send_payload_at(
             .ok_or_else(|| "Payload not found.".to_string())?
     };
 
+    let started = Instant::now();
+    let mut trace = Trace::new();
     let outcome = async {
         if !(1..=65535).contains(&port) {
             return Err("The loader port must be between 1 and 65535.".into());
@@ -374,40 +463,44 @@ async fn send_payload_at(
         }
 
         if id == BUILTIN_PS4 {
-            let message = crate::ps4_receiver::load_ps4_receiver(
+            let step = Instant::now();
+            let loaded = crate::ps4_receiver::load_ps4_receiver(
                 host.trim().into(),
                 port as u16,
                 settings.ps4_receiver_port,
             )
-            .await?;
-            Ok(PayloadSendResult {
-                message,
-                bytes: PS4_RECEIVER_ELF.len(),
-                port,
-                verified: true,
-            })
+            .await;
+            trace.step("Load and verify PS4 receiver", format!("{} bytes to :{port}, receiver on :{}", grouped(PS4_RECEIVER_ELF.len()), settings.ps4_receiver_port), step, loaded.is_ok());
+            Ok(PayloadSendResult::new(loaded?, PS4_RECEIVER_ELF.len(), port, true))
         } else if id == BUILTIN_PS5 {
-            send_ps5_receiver(host.trim(), port, settings.ps5_port, ps5_timing).await
+            send_ps5_receiver(host.trim(), port, settings.ps5_port, ps5_timing, &mut trace).await
         } else {
             let file_name = safe_store_file_name(&entry.file_name, &entry.id)?;
+            let step = Instant::now();
             let bytes = fs::read(root.join(file_name))
                 .map_err(|_| "Could not read the stored payload.".to_string())?;
-            send_bytes(host.trim(), port as u16, &bytes).await?;
-            Ok(PayloadSendResult {
-                message: format!(
-                    "Sent {} ({} bytes) to {}:{}.",
-                    entry.name,
-                    bytes.len(),
-                    host.trim(),
-                    port
-                ),
-                bytes: bytes.len(),
+            trace.step("Read stored copy", format!("{} bytes", grouped(bytes.len())), step, true);
+            send_bytes(host.trim(), port as u16, &bytes, &mut trace).await?;
+            Ok(PayloadSendResult::new(
+                format!("Sent {} ({} bytes) to {}:{}.", entry.name, bytes.len(), host.trim(), port),
+                bytes.len(),
                 port,
-                verified: false,
-            })
+                false,
+            ))
         }
     }
     .await;
+    let outcome = outcome.map(|mut result| {
+        result.total_ms = started.elapsed().as_millis() as u64;
+        if let Some((bytes, took)) = trace.sent {
+            result.send_ms = Some(took.as_millis() as u64);
+            result.bytes_per_second = (took.as_secs_f64() > 0.).then(|| bytes as f64 / took.as_secs_f64());
+        }
+        result.steps = trace.steps;
+        result.host = host.trim().to_string();
+        result.sha256 = entry.sha256.clone();
+        result
+    });
 
     let now = unix_ms();
     let last_result = outcome
@@ -435,17 +528,21 @@ async fn send_ps5_receiver(
     loader_port: u32,
     receiver_port: u16,
     timing: Ps5Timing,
+    trace: &mut Trace,
 ) -> Result<PayloadSendResult, String> {
-    match probe_receiver(host, receiver_port).await? {
+    let step = Instant::now();
+    let probed = probe_receiver(host, receiver_port).await;
+    let found = match &probed {
+        Ok(Some(config)) => format!("v{} ({}) answered on :{receiver_port}", config.version, config.platform.as_deref().unwrap_or("unknown")),
+        Ok(None) => format!("Nothing on :{receiver_port}"),
+        Err(error) => error.clone(),
+    };
+    trace.step("Probe receiver", found, step, probed.is_ok());
+    match probed? {
         Some(config)
             if config.version == RECEIVER_VERSION && config.platform.as_deref() == Some("ps5") =>
         {
-            return Ok(PayloadSendResult {
-                message: format!("Receiver already running (v{RECEIVER_VERSION})"),
-                bytes: 0,
-                port: loader_port,
-                verified: true,
-            });
+            return Ok(PayloadSendResult::new(format!("Receiver already running (v{RECEIVER_VERSION})"), 0, loader_port, true));
         }
         Some(config) => {
             if config.platform.as_deref() == Some("ps4") {
@@ -464,35 +561,32 @@ async fn send_ps5_receiver(
                     config.version
                 ));
             }
-            send_stop(host, receiver_port).await?;
-            wait_for_port_closed(host, receiver_port, timing.stop_timeout).await?;
+            let step = Instant::now();
+            let stopped = send_stop(host, receiver_port).await;
+            trace.step("Stop old receiver", format!("v{} sent STOP", config.version), step, stopped.is_ok());
+            stopped?;
+            let step = Instant::now();
+            let closed = wait_for_port_closed(host, receiver_port, timing.stop_timeout).await;
+            trace.step("Wait for port to close", format!(":{receiver_port}"), step, closed.is_ok());
+            closed?;
         }
         None => {}
     }
 
-    send_bytes(host, loader_port as u16, RECEIVER_ELF).await?;
+    send_bytes(host, loader_port as u16, RECEIVER_ELF, trace).await?;
+    let step = Instant::now();
     let deadline = Instant::now() + timing.verify_timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Ok(PayloadSendResult {
-                message: format!(
-                    "Payload sent to {host}:{loader_port}, but the receiver hasn't answered yet."
-                ),
-                bytes: RECEIVER_ELF.len(),
-                port: loader_port,
-                verified: false,
-            });
+            trace.step("Verify receiver", format!("No answer on :{receiver_port} within {} s", timing.verify_timeout.as_secs()), step, false);
+            return Ok(PayloadSendResult::new(format!("Payload sent to {host}:{loader_port}, but the receiver hasn't answered yet."), RECEIVER_ELF.len(), loader_port, false));
         }
         if let Ok(Ok(Some(config))) = timeout(remaining, probe_receiver(host, receiver_port)).await
         {
             if config.version == RECEIVER_VERSION && config.platform.as_deref() == Some("ps5") {
-                return Ok(PayloadSendResult {
-                    message: format!("Receiver loaded and verified (v{RECEIVER_VERSION})."),
-                    bytes: RECEIVER_ELF.len(),
-                    port: loader_port,
-                    verified: true,
-                });
+                trace.step("Verify receiver", format!("v{} answered on :{receiver_port}, {} capabilities", config.version, config.capabilities.len()), step, true);
+                return Ok(PayloadSendResult::new(format!("Receiver loaded and verified (v{RECEIVER_VERSION})."), RECEIVER_ELF.len(), loader_port, true));
             }
         }
         sleep(timing.poll_interval).await;
@@ -558,19 +652,27 @@ async fn wait_for_port_closed(host: &str, port: u16, max_wait: Duration) -> Resu
     }
 }
 
-async fn send_bytes(host: &str, port: u16, bytes: &[u8]) -> Result<(), String> {
-    let mut stream = timeout(Duration::from_secs(3), TcpStream::connect((host, port)))
+async fn send_bytes(host: &str, port: u16, bytes: &[u8], trace: &mut Trace) -> Result<(), String> {
+    let step = Instant::now();
+    let connected = timeout(Duration::from_secs(3), TcpStream::connect((host, port)))
         .await
-        .map_err(|_| "The payload loader connection timed out.".to_string())?
-        .map_err(|_| "Could not connect to the payload loader.".to_string())?;
-    timeout(Duration::from_secs(90), async {
+        .map_err(|_| "The payload loader connection timed out.".to_string())
+        .and_then(|result| result.map_err(|_| "Could not connect to the payload loader.".to_string()));
+    trace.step("Connect to loader", match &connected { Ok(_) => format!("{host}:{port}"), Err(error) => error.clone() }, step, connected.is_ok());
+    let mut stream = connected?;
+    let step = Instant::now();
+    let written = timeout(Duration::from_secs(90), async {
         stream.write_all(bytes).await?;
         stream.shutdown().await?;
         Ok::<(), io::Error>(())
     })
     .await
-    .map_err(|_| "Sending the payload timed out.".to_string())?
-    .map_err(|_| "Could not send the complete payload.".to_string())?;
+    .map_err(|_| "Sending the payload timed out.".to_string())
+    .and_then(|result| result.map_err(|_| "Could not send the complete payload.".to_string()));
+    let took = step.elapsed();
+    trace.step("Send payload", match &written { Ok(_) => format!("{} bytes, connection closed", grouped(bytes.len())), Err(error) => error.clone() }, step, written.is_ok());
+    written?;
+    trace.sent = Some((bytes.len(), took));
     drop(stream);
     Ok(())
 }
@@ -673,6 +775,7 @@ fn builtin_entry(id: &str) -> PayloadEntry {
         last_sent_at: None,
         last_result: None,
         notes: None,
+        elf: parse_elf(bytes),
     }
 }
 
@@ -746,7 +849,7 @@ fn atomic_write(destination: &Path, bytes: &[u8]) -> io::Result<()> {
         destination
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("theme"),
+            .unwrap_or("index"),
         uuid::Uuid::new_v4()
     );
     let temp = parent.join(temp_name);
@@ -770,18 +873,6 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(source, destination)
 }
 
-fn validate_theme_path(path: &Path) -> Result<(), String> {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("");
-    if extension.eq_ignore_ascii_case("sspitheme") {
-        Ok(())
-    } else {
-        Err("Theme files must use the .sspitheme extension.".into())
-    }
-}
-
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -793,6 +884,29 @@ fn unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_counts_are_grouped() {
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(999), "999");
+        assert_eq!(grouped(1_086_888), "1,086,888");
+        assert_eq!(grouped(64 * 1024 * 1024), "67,108,864");
+    }
+
+    #[test]
+    fn elf_headers_are_read_without_trusting_offsets() {
+        let receiver = parse_elf(RECEIVER_ELF).expect("the built-in PS5 receiver is an ELF");
+        assert_eq!((receiver.class.as_str(), receiver.endian.as_str(), receiver.machine.as_str()), ("ELF64", "LE", "x86-64"));
+        assert!(receiver.loadable > 0 && receiver.loadable_bytes > 0 && receiver.entry.starts_with("0x"));
+        assert_eq!(parse_elf(b"not an elf payload, a raw BIN"), None);
+        assert_eq!(parse_elf(&RECEIVER_ELF[..40]), None);
+        // Program headers pointing past the buffer (or overflowing) are simply not counted.
+        let mut hostile = RECEIVER_ELF[..64].to_vec();
+        hostile[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+        hostile[56..58].copy_from_slice(&u16::MAX.to_le_bytes());
+        let parsed = parse_elf(&hostile).unwrap();
+        assert_eq!((parsed.loadable, parsed.loadable_bytes), (0, 0));
+    }
     use serde_json::json;
     use std::net::Ipv4Addr;
     use tokio::{net::TcpListener, task::JoinHandle};
@@ -1109,35 +1223,4 @@ mod tests {
         loader_task.await.unwrap();
     }
 
-    #[test]
-    fn theme_files_enforce_extension_size_and_utf8() {
-        let root = temp_root();
-        fs::create_dir_all(&root).unwrap();
-        let theme = root.join("theme.SSPITHEME");
-        save_theme_file(
-            theme.to_string_lossy().into_owned(),
-            "theme contents".into(),
-        )
-        .unwrap();
-        assert_eq!(
-            load_theme_file(theme.to_string_lossy().into_owned()).unwrap(),
-            "theme contents"
-        );
-        assert!(save_theme_file(
-            root.join("bad.json").to_string_lossy().into_owned(),
-            "{}".into()
-        )
-        .is_err());
-        assert!(save_theme_file(
-            theme.to_string_lossy().into_owned(),
-            "x".repeat(MAX_THEME_SIZE + 1)
-        )
-        .unwrap_err()
-        .contains("8 MiB"));
-        fs::write(&theme, vec![0xff, 0xfe]).unwrap();
-        assert!(load_theme_file(theme.to_string_lossy().into_owned())
-            .unwrap_err()
-            .contains("UTF-8"));
-        let _ = fs::remove_dir_all(root);
-    }
 }

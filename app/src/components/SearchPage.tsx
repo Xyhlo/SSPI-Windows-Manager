@@ -3,7 +3,7 @@
    list, which is the one list on this page that scrolls. Before typing,
    the titles opened recently stand in a row of cases.
    ===================================================================== */
-import { useEffect, useLayoutEffect, useMemo, useRef, type MutableRefObject, type ReactNode } from "react"
+import { useEffect, useLayoutEffect, useMemo, useRef, type MutableRefObject } from "react"
 import { plural } from "@/lib/format"
 import { setPageKeys, isTyping } from "@/lib/keys"
 import { installedVersion, type LibraryEntry } from "@/lib/library"
@@ -13,7 +13,6 @@ import { displayText } from "@/lib/display"
 import type { ConsoleKind, Game, LoadState, PackageSource } from "@/types"
 import { CaseAnchor, CaseThumb } from "./CaseAnchor"
 import { Icon } from "./Icon"
-import type { Hint } from "./Shell"
 import type { OptionsTab } from "./OptionsOverlay"
 
 type Props = {
@@ -36,7 +35,6 @@ type Props = {
   activeConsole: ConsoleKind
   onOptions: (tab: OptionsTab) => void
   onDemo: () => void
-  onDock: (dock: { context: ReactNode; hints: Hint[] }) => void
 }
 
 const highlight = (text: string, q: string) => {
@@ -47,7 +45,7 @@ const highlight = (text: string, q: string) => {
 }
 
 export function SearchPage(props: Props) {
-  const { query, setQuery, onSearch, searchState, onDock } = props
+  const { query, setQuery, onSearch, searchState } = props
   const inputRef = useRef<HTMLInputElement>(null)
   const timer = useRef<number | null>(null)
   const focusFirst = useRef(false)
@@ -98,12 +96,13 @@ export function SearchPage(props: Props) {
             }
           }}
         />
+        {query && <button type="button" className="search-clear" aria-label="Clear search" title="Clear search (Esc)" onClick={clear}><Icon name="x" /></button>}
         <button type="submit" className="search-go" disabled={searchState === "loading"}><span className="face cross">⏎</span>Search</button>
       </form>
       {idle
         ? <Idle {...props} />
         : <Results {...props} focusFirst={focusFirst} />}
-      <KeysAndDock idle={idle} inputRef={inputRef} type={type} onClear={clear} props={props} onDock={onDock} />
+      <SearchKeys idle={idle} inputRef={inputRef} type={type} onClear={clear} props={props} />
     </div>
   )
 }
@@ -129,7 +128,7 @@ function Idle(props: Props) {
                 aria-label={`${game.name}, ${game.titleId}`}
                 onClick={event => onOpen(game, { el: event.currentTarget.querySelector<HTMLElement>("[data-case-anchor]"), kind: "case" })}
               >
-                <CaseAnchor spec={{ key: game.titleId.toUpperCase(), cover: game.icon, title: game.name, titleId: game.titleId, kind: "library" }} delay={Math.min(n, 10) * 0.035} />
+                <CaseAnchor spec={{ key: game.titleId.toUpperCase(), cover: game.icon, title: game.name, titleId: game.titleId, kind: "library" }} delay={Math.min(n, 10) * 0.02} />
                 <span className="si-name">{game.name}</span>
                 <span className="si-line">{game.titleId}{owned.has(game.titleId.toUpperCase()) ? `, on your ${activeConsole.toUpperCase()}` : ""}</span>
               </button>
@@ -229,9 +228,9 @@ function Results(props: Props & { focusFirst: MutableRefObject<boolean> }) {
   )
 }
 
-/* ---------------------------------------------------------------- keyboard and dock */
-function KeysAndDock({ idle, inputRef, type, onClear, props, onDock }: {
-  idle: boolean; inputRef: React.RefObject<HTMLInputElement>; type: (v: string) => void; onClear: () => void; props: Props; onDock: Props["onDock"]
+/* ---------------------------------------------------------------- keyboard */
+function SearchKeys({ idle, inputRef, type, onClear, props }: {
+  idle: boolean; inputRef: React.RefObject<HTMLInputElement>; type: (v: string) => void; onClear: () => void; props: Props
 }) {
   const state = useRef({ idle, props })
   state.current = { idle, props }
@@ -252,21 +251,5 @@ function KeysAndDock({ idle, inputRef, type, onClear, props, onDock }: {
     if (k.length === 1 && /\S/.test(k) && !event.ctrlKey && !event.metaKey && !event.altKey) { event.preventDefault(); inputRef.current?.focus(); type(`${props.query}${k}`) }
   }), [])
 
-  useEffect(() => {
-    if (!idle) {
-      onDock({
-        context: props.searchState === "loading" ? "Searching" : "Search",
-        hints: [
-          { key: "Enter", label: "View packages", run: () => { const row = (document.activeElement as HTMLElement | null)?.closest(".rrow") as HTMLElement | null; (row || document.querySelector<HTMLElement>(".rrow"))?.click() } },
-          { key: "Arrows", glyph: "↑↓", face: "neutral", label: "Move" },
-          { key: "Escape", label: "Clear search", run: onClear },
-        ],
-      })
-      return
-    }
-    const hints: Hint[] = [{ key: "Type", glyph: "A–Z", face: "neutral", label: "Type to search", run: () => inputRef.current?.focus() }]
-    if (props.recent.length) hints.push({ key: "Enter", label: "Open", run: () => { const row = (document.activeElement as HTMLElement | null)?.closest(".si-case") as HTMLElement | null; (row || document.querySelector<HTMLElement>(".si-case"))?.click() } })
-    onDock({ context: "Search", hints })
-  }, [idle, props.searchState, props.recent.length])
   return null
 }

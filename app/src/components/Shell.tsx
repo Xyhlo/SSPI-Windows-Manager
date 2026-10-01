@@ -6,7 +6,7 @@ import { consoleAddress } from "@/lib/consoles"
 import type { ConsoleProbe } from "@/lib/console-types"
 import { SPRINGS, glide, motionOK, settle } from "@/lib/motion"
 import type { ConsoleKind, Settings } from "@/types"
-import { Icon } from "./Icon"
+import { ConsoleGlyph, Icon } from "./Icon"
 
 export type Tab = "library" | "search" | "downloads" | "tools"
 export const TABS: Array<[Tab, string]> = [["library", "Library"], ["search", "Search"], ["downloads", "Downloads"], ["tools", "Tools"]]
@@ -14,7 +14,7 @@ export type ConsoleState = "unknown" | "ok" | "warn" | "fail"
 
 /** The header dot for a console: the launch probe when there is one, otherwise the last connection test. */
 export function consoleDot(state: ConsoleState) {
-  return state === "ok" ? "good live" : state === "warn" ? "warn" : state === "fail" ? "fail" : ""
+  return state === "ok" ? "good" : state === "warn" ? "warn" : state === "fail" ? "fail" : ""
 }
 
 /** One plain sentence about a console's receiver, for menus and banners. */
@@ -31,7 +31,8 @@ export function probeSentence(probe: ConsoleProbe | undefined, demo = false) {
 
 const inTauri = () => "__TAURI_INTERNALS__" in window
 
-export function TitleBar() {
+/** Minimize, maximize and close, flush with the header's right edge (the window has no system title bar). */
+function WindowControls() {
   const run = (action: "minimize" | "maximize" | "close") => {
     if (!inTauri()) return
     const current = getCurrentWindow()
@@ -40,13 +41,10 @@ export function TitleBar() {
     if (action === "close") void current.close()
   }
   return (
-    <div className="titlebar" data-tauri-drag-region>
-      <div className="tb-left" data-tauri-drag-region><img src={sspiLogo} alt="" draggable={false} /><span>SSPI</span></div>
-      <div className="tb-controls">
-        <button type="button" onClick={() => run("minimize")} aria-label="Minimize"><Icon name="minus" /></button>
-        <button type="button" onClick={() => run("maximize")} aria-label="Maximize"><Icon name="square" /></button>
-        <button type="button" className="close" onClick={() => run("close")} aria-label="Close"><Icon name="x" /></button>
-      </div>
+    <div className="win-controls">
+      <button type="button" onClick={() => run("minimize")} aria-label="Minimize"><Icon name="minus" /></button>
+      <button type="button" onClick={() => run("maximize")} aria-label="Maximize"><Icon name="square" /></button>
+      <button type="button" className="close" onClick={() => run("close")} aria-label="Close"><Icon name="x" /></button>
     </div>
   )
 }
@@ -69,7 +67,7 @@ export function pulseDownloadsTab() {
   void settle(ring.animate([{ opacity: 0.9, transform: "scale(.9)" }, { opacity: 0, transform: "scale(1.18)" }], { duration: 700, easing: "cubic-bezier(.2,.8,.2,1)" })).then(() => ring.remove())
 }
 
-export function Header({ tab, activeJobs, settings, consoleState, probes, demo, brandRef, menuDisabled = false, loadingReceiver, onTab, onStep, onConsole, onOptions, onManageConsoles, onLoadReceiver }: {
+export function Header({ tab, activeJobs, settings, consoleState, probes, demo, brandRef, menuDisabled = false, optionsTabs, loadingReceiver, onTab, onStep, onConsole, onOptions, onManageConsoles, onLoadReceiver }: {
   tab: Tab
   activeJobs: number
   settings: Settings
@@ -78,6 +76,8 @@ export function Header({ tab, activeJobs, settings, consoleState, probes, demo, 
   demo: boolean
   brandRef: React.RefObject<HTMLImageElement>
   menuDisabled?: boolean
+  /** While Options is open its sections take the place of the app's, so there is only ever one row of tabs. */
+  optionsTabs?: ReactNode
   loadingReceiver: ConsoleKind | null
   onTab: (tab: Tab) => void
   onStep: (direction: -1 | 1) => void
@@ -94,6 +94,14 @@ export function Header({ tab, activeJobs, settings, consoleState, probes, demo, 
   const [menu, setMenu] = useState(false)
 
   useEffect(() => { if (menuDisabled) setMenu(false) }, [menuDisabled])
+  const inOptions = !!optionsTabs
+  useEffect(() => { brandRef.current?.parentElement?.toggleAttribute("inert", inOptions) }, [inOptions])
+  // The section tabs were hidden while Options was open; put the ink back under the current one.
+  useLayoutEffect(() => {
+    if (inOptions) return
+    const tabs = tabsRef.current
+    glide(inkRef.current, tabs?.querySelector<HTMLElement>(`.tab[data-page="${tab}"]`) || null, tabs, { inset: 14, instant: true })
+  }, [inOptions])
 
   useLayoutEffect(() => {
     const tabs = tabsRef.current
@@ -119,9 +127,10 @@ export function Header({ tab, activeJobs, settings, consoleState, probes, demo, 
   const address = demo ? "Offline preview" : consoleAddress(settings, active) || (active === "ps5" ? "Receiver not set" : "PS4 not set")
   const dot = consoleDot(consoleState[active])
   return (
-    <header className="header">
+    // The whole header drags the window; Tauri leaves its buttons, tabs and keycaps clickable.
+    <header className={`header ${inOptions ? "in-options" : ""}`} data-tauri-drag-region="deep">
       <button type="button" className="brand" aria-label="Library" onClick={() => onTab("library")}><img ref={brandRef} src={sspiLogo} alt="SSPI" draggable={false} /></button>
-      <nav className="tabs" ref={tabsRef} role="tablist" aria-label="Sections">
+      <nav className="tabs" ref={tabsRef} role="tablist" aria-label="Sections" hidden={inOptions}>
         <span className="shoulder l" id="shoulderQ" role="button" tabIndex={-1} aria-label="Previous section (Q)" onClick={() => onStep(-1)}>Q</span>
         {TABS.map(([id, label]) => (
           <button key={id} type="button" className="tab" role="tab" data-page={id} aria-selected={tab === id} onClick={() => onTab(id)}>
@@ -131,14 +140,20 @@ export function Header({ tab, activeJobs, settings, consoleState, probes, demo, 
         <span className="shoulder r" id="shoulderE" role="button" tabIndex={-1} aria-label="Next section (E)" onClick={() => onStep(1)}>E</span>
         <span className="tab-ink" ref={inkRef} />
       </nav>
-      <div className="status">
-        <button type="button" ref={chipRef} className="console-chip" disabled={menuDisabled} aria-haspopup="menu" aria-expanded={menu && !menuDisabled} onClick={() => setMenu(open => !open)} aria-label={`Managed console ${active.toUpperCase()}, ${address}`}>
-          <span className={`dot ${dot}`} />
-          <span className="cc-kind">{active.toUpperCase()}</span>
-          <span className="cc-addr">{address}</span>
-          <Icon name="chevD" />
-        </button>
-        <button type="button" className="options-btn" onClick={onOptions}><span className="options-glyph" aria-hidden="true"><i /><i /><i /></span>Options</button>
+      {optionsTabs}
+      <div className="header-end">
+        <div className="status">
+          {!inOptions && (
+            <button type="button" ref={chipRef} className="console-chip" disabled={menuDisabled} aria-haspopup="menu" aria-expanded={menu && !menuDisabled} onClick={() => setMenu(open => !open)} aria-label={`Managed console ${active.toUpperCase()}, ${address}`} title={address}>
+              <span className="cc-badge"><ConsoleGlyph kind={active} /><span className={`dot ${dot}`} /></span>
+              <span className="cc-kind">{active.toUpperCase()}</span>
+              <span className="cc-addr">{address}</span>
+              <Icon name="chevD" />
+            </button>
+          )}
+          <button type="button" className="options-btn" aria-label={inOptions ? "Close Options" : "Options"} aria-pressed={inOptions} title={inOptions ? "Close Options (Esc)" : "Options (O)"} onClick={onOptions}><span className="options-glyph" aria-hidden="true"><i /><i /><i /></span><span className="lbl">Options</span></button>
+        </div>
+        <WindowControls />
       </div>
       {menu && !menuDisabled && chipRef.current && createPortal(
         <ConsoleMenu anchor={chipRef.current} settings={settings} consoleState={consoleState} probes={probes} demo={demo} loadingReceiver={loadingReceiver} onClose={() => setMenu(false)} onPick={target => { setMenu(false); onConsole(target) }} onManage={() => { setMenu(false); onManageConsoles() }} onLoadReceiver={onLoadReceiver} />,
@@ -192,7 +207,7 @@ function ConsoleMenu({ anchor, settings, consoleState, probes, demo, loadingRece
       {items.map(item => (
         <div key={item.id} className="pop-group">
           <button type="button" className="pop-item" role="menuitemradio" aria-checked={settings.activeConsole === item.id} onClick={() => onPick(item.id)}>
-            <span className="pop-ico">{item.id.toUpperCase()}<span className={`dot ${consoleDot(consoleState[item.id]).replace(" live", "")}`} /></span>
+            <span className="pop-ico"><ConsoleGlyph kind={item.id} /><span className={`dot ${consoleDot(consoleState[item.id])}`} /></span>
             <span><strong>Manage {item.id.toUpperCase()}</strong><span>{item.detail}</span></span>
             <Icon name="check" className="ck" />
           </button>
@@ -207,33 +222,5 @@ function ConsoleMenu({ anchor, settings, consoleState, probes, demo, loadingRece
       <div className="pop-sep" />
       <div className="pop-foot"><button type="button" className="link" onClick={onManage}>Console settings in Options</button></div>
     </div>
-  )
-}
-
-export type Hint = { key: string; label: string; glyph?: string; face?: "cross" | "circle" | "square" | "triangle" | "neutral"; disabled?: boolean; run?: () => void }
-
-const FACE: Record<string, [NonNullable<Hint["face"]>, string]> = {
-  Enter: ["cross", "⏎"],
-  Escape: ["circle", "Esc"],
-  Space: ["square", "Space"],
-  Delete: ["neutral", "Del"],
-}
-
-export function Dock({ context, hints, build }: { context: ReactNode; hints: Hint[]; build: string }) {
-  return (
-    <footer className="dock">
-      <div className="dock-context">{context}</div>
-      <div className="dock-hints">
-        {hints.map(hint => {
-          const [face, glyph] = FACE[hint.key] || [hint.face || "neutral", hint.glyph || hint.key]
-          return (
-            <button key={`${hint.key}-${hint.label}`} type="button" className="hint" disabled={hint.disabled} tabIndex={hint.run ? 0 : -1} onClick={() => hint.run?.()}>
-              <span className={`face ${hint.face || face}`}>{hint.glyph || glyph}</span>{hint.label}
-            </button>
-          )
-        })}
-      </div>
-      <div className="dock-build">{build}</div>
-    </footer>
   )
 }

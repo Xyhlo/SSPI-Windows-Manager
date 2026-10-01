@@ -6,19 +6,25 @@ mod storage;
 mod package_sources;
 mod archives;
 mod fpkg;
+mod exfat;
 mod fpkg_doctor;
 mod ampr_index;
+mod ampr_pack;
+mod shadow_image;
+mod links;
+mod cloud;
 mod backport;
 mod debrid;
 mod package_details;
 mod static_catalog;
 mod discovery;
 mod payloads;
+mod ps4_theme;
 mod ps4_protocol;
 mod ps4_inbox;
 mod ps4_receiver;
 mod console_tools;
-mod ps4_theme;
+mod console_diagnostics;
 mod pkg_meta;
 mod pkg_server;
 #[cfg(test)]
@@ -54,8 +60,8 @@ use url::Url;
 use uuid::Uuid;
 
 const CONFIG_NAME: &str = "settings.json";
-const RECEIVER_VERSION: &str = "1.0.6";
-const PS4_RECEIVER_VERSION: &str = "1.0.5";
+const RECEIVER_VERSION: &str = "1.0.12";
+const PS4_RECEIVER_VERSION: &str = "1.0.11";
 
 #[derive(Debug, Clone)]
 struct ReceiverEndpoint {
@@ -157,11 +163,13 @@ struct Settings {
     #[serde(default)] keep_archives: bool,
     #[serde(default)] keep_extractions: bool,
     #[serde(default = "default_keep_packages")] keep_packages: bool,
-    /// Speed/size preset: fast | standard | smallest.
-    #[serde(default = "default_fpkg_preset")]
+    /// Remove from list / Clear inactive never delete a finished package when set.
+    #[serde(default = "default_keep_packages")] keep_packages_on_remove: bool,
+    /// Speed/size preset: fastest | balanced | smallest.
+    #[serde(default = "default_fpkg_preset", deserialize_with = "fpkg::deserialize_preset")]
     fpkg_preset: String,
     #[serde(default)]
-    fpkg_compression_level: Option<u8>,
+    fpkg_compression_level: Option<i8>,
     #[serde(default)]
     fpkg_doctor: bool,
     /// PFS filesystem version: 2 is safe everywhere, 3 needs FW >= 7.00.
@@ -176,7 +184,18 @@ struct Settings {
     /// Legacy preference; downloaded dumps are now removed only after confirmed installation.
     #[serde(default)]
     fpkg_cleanup_source: bool,
+    /// Dump packaging output: `fpkg` (installable package) or `exfat` (ShadowMount Plus image).
+    #[serde(default = "default_package_format")]
+    package_format: String,
+    /// Lizard (AMPR/LZ4) asset packing inside exFAT images. Experimental, off by default.
+    #[serde(default)]
+    lizard_packing: bool,
+    /// What adding game folders does: ask | package | package-send | send.
+    #[serde(default = "default_folder_action")]
+    folder_action: String,
 }
+fn default_folder_action() -> String { "ask".into() }
+fn default_package_format() -> String { "fpkg".into() }
 fn default_keep_packages() -> bool { true }
 fn default_console() -> String { "ps5".into() }
 fn default_ps4_transport() -> String { "receiver".into() }
@@ -193,7 +212,7 @@ fn default_upload_lanes() -> u32 {
     4
 }
 fn default_fpkg_preset() -> String {
-    "fast".into()
+    "balanced".into()
 }
 fn default_pfs_version() -> u8 {
     2
@@ -221,7 +240,7 @@ impl Default for Settings {
             transfer_mode: default_transfer_mode(),
             upload_lanes: default_upload_lanes(),
             package_dumps: false,
-            download_package_only: false, keep_archives: false, keep_extractions: false, keep_packages: true,
+            download_package_only: false, keep_archives: false, keep_extractions: false, keep_packages: true, keep_packages_on_remove: true,
             fpkg_preset: default_fpkg_preset(),
             fpkg_compression_level: None,
             fpkg_doctor: false,
@@ -229,6 +248,9 @@ impl Default for Settings {
             fpkg_engine_path: String::new(),
             target_fw: String::new(),
             fpkg_cleanup_source: false,
+            package_format: default_package_format(),
+            lizard_packing: false,
+            folder_action: default_folder_action(),
         }
     }
 }
@@ -252,7 +274,7 @@ struct AppState {
 struct PackagingInfo {
     preset: String,
     #[serde(default)]
-    compression_level: u8,
+    compression_level: i8,
     #[serde(default)]
     doctor: Option<fpkg_doctor::DoctorReport>,
     #[serde(default)]
@@ -263,6 +285,7 @@ struct PackagingInfo {
     file_count: u64,
     output_bytes: u64,
     output_path: String,
+    #[serde(default)] temp_path: String,
     elapsed_seconds: f64,
     log: Vec<String>,
     #[serde(default)] activity: String,
@@ -272,6 +295,17 @@ struct PackagingInfo {
     #[serde(default)] speed_bps: Option<f64>,
     #[serde(default)] last_activity_seconds: Option<f64>,
     #[serde(default)] heartbeat: bool,
+    /// Engine telemetry (`stages-io-v1`): stages with durations, measured process I/O,
+    /// files and the current file. The last snapshot is kept as the build summary.
+    #[serde(default)] engine: Option<Value>,
+    /// Doctor, staging and AMPR repair before the engine started.
+    #[serde(default)] workspace_seconds: Option<f64>,
+    /// Wall time from workspace preparation to the verified package.
+    #[serde(default)] total_seconds: Option<f64>,
+    /// Output format: empty or `fpkg` for packages, `exfat` for ShadowMount images.
+    #[serde(default)] format: String,
+    /// Lizard (AMPR/LZ4) packing summary for images built with it.
+    #[serde(default)] lizard: Option<Value>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default, rename_all = "camelCase")]
@@ -566,11 +600,12 @@ struct SaveSettings {
     #[serde(default)] keep_archives: Option<bool>,
     #[serde(default)] keep_extractions: Option<bool>,
     #[serde(default)] keep_packages: Option<bool>,
+    #[serde(default)] keep_packages_on_remove: Option<bool>,
 
     #[serde(default)]
     fpkg_preset: Option<String>,
     #[serde(default)]
-    fpkg_compression_level: Option<u8>,
+    fpkg_compression_level: Option<i8>,
     #[serde(default)]
     fpkg_doctor: Option<bool>,
     #[serde(default)]
@@ -581,6 +616,9 @@ struct SaveSettings {
     target_fw: Option<String>,
     #[serde(default)]
     fpkg_cleanup_source: Option<bool>,
+    #[serde(default)] package_format: Option<String>,
+    #[serde(default)] lizard_packing: Option<bool>,
+    #[serde(default)] folder_action: Option<String>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -598,6 +636,8 @@ struct DeliveryRequest {
     #[serde(default)]
     backport: Option<BackportInput>,
     #[serde(default)] provider: Option<String>,
+    /// Overrides Settings → Package extracted dumps for this request (batch folder actions).
+    #[serde(default, skip_serializing_if = "Option::is_none")] package_dumps: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1254,11 +1294,16 @@ fn accepted_submission(value: &Value) -> Result<String, String> {
         Ok(content_id.unwrap_or("").to_owned())
     } else {
         let error = value["error"].as_str().unwrap_or("rejected");
-        let stage = value["stage"].as_str().unwrap_or("");
-        Err(format!(
-            "Install submission failed: {error} {stage} (code {})",
-            code.unwrap_or(-1)
-        ))
+        let stage = value["stage"].as_str().filter(|stage| !stage.is_empty()).map(|stage| format!(" {stage}")).unwrap_or_default();
+        let code = code.unwrap_or(-1);
+        // PlayGo slot errors: the receiver already retried; a fresh receiver process clears them.
+        let hint = match code as u32 {
+            0x80B2_116F => ". PlayGo INVALID_SLOT: the PS5 installer had no free slot after three tries. Reload the receiver (Tools > Payloads), then Retry.",
+            0x80B2_100D | 0x80B2_100E => ". PlayGo is not ready. Wait for other installs on the PS5 to finish, then Retry.",
+            _ => "",
+        };
+        // Console error codes are reported and searched for in hex.
+        Err(format!("Install submission failed: {error}{stage} (code 0x{:08X}, {code}){hint}", code as u32))
     }
 }
 
@@ -1266,6 +1311,7 @@ fn accepted_submission(value: &Value) -> Result<String, String> {
 enum InstallDecision {
     Installing { status: String, progress: f64 },
     Complete,
+    Unavailable,
 }
 
 fn install_decision(value: &Value) -> Result<InstallDecision, String> {
@@ -1273,18 +1319,26 @@ fn install_decision(value: &Value) -> Result<InstallDecision, String> {
     let status = value["status"].as_str().unwrap_or(state);
     let error = value["error"].as_str().unwrap_or("");
     let error_code = value["error_code"].as_i64().unwrap_or(0);
+    // Failure to query AppInst (including an older receiver's initialization error)
+    // is not a failed installation. Credentials can also fail to restore after success.
+    if value["status_api_code"].as_i64().is_some_and(|code| code != 0)
+        || value.get("stage").is_some() || state == "unconfirmed" {
+        return Ok(InstallDecision::Unavailable);
+    }
     if state == "failed" || error_code != 0 {
         return Err(format!(
             "Install failed: {status} {error} ({error_code})"
         ));
     }
-    let api_ok = ["api_code", "status_api_code", "auth_restore_code"].iter()
-        .all(|key| value[*key].as_i64().unwrap_or(0) == 0);
+    let api_ok = value["status_api_code"].as_i64().map(|code| code == 0)
+        .unwrap_or_else(|| value["api_code"].as_i64().unwrap_or(0) == 0);
     let fully_installed = matches!(status, "installed" | "complete")
         || (status == "playable" && value["progress"].as_f64().unwrap_or(0.) >= 100.);
-    if state == "complete" && fully_installed && api_ok && error.is_empty() {
+    if state == "complete" && fully_installed && api_ok
+        && (error.is_empty() || value["auth_restore_code"].as_i64().is_some_and(|code| code != 0)) {
         return Ok(InstallDecision::Complete);
     }
+    if !api_ok || appinst_idle(status) || state != "installing" { return Ok(InstallDecision::Unavailable); }
     Ok(InstallDecision::Installing {
         status: if status.is_empty() {
             "installing".into()
@@ -1293,6 +1347,72 @@ fn install_decision(value: &Value) -> Result<InstallDecision, String> {
         },
         progress: (value["progress"].as_f64().unwrap_or(0.) / 100.).clamp(0., 1.),
     })
+}
+
+const INSTALL_CONFIRM_GRACE: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Debug, PartialEq)]
+enum InstallOutcome {
+    Complete,
+    LibraryConfirmed,
+    Installing { status: String, progress: f64 },
+    Waiting,
+    Unconfirmed,
+    Failed(String),
+}
+
+fn classify_install_outcome(value: Option<&Value>, cid: &str, library_confirmed: bool, unanswered: Duration) -> InstallOutcome {
+    if let Some(value) = value.filter(|value| value["content_id"].as_str().is_none_or(|id| id == cid)) {
+        match install_decision(value) {
+            Ok(InstallDecision::Complete) => return InstallOutcome::Complete,
+            Ok(InstallDecision::Installing { status, progress }) => return InstallOutcome::Installing { status, progress },
+            Err(error) => return InstallOutcome::Failed(error),
+            Ok(InstallDecision::Unavailable) => {},
+        }
+    }
+    if library_confirmed { InstallOutcome::LibraryConfirmed }
+    else if unanswered >= INSTALL_CONFIRM_GRACE { InstallOutcome::Unconfirmed }
+    else { InstallOutcome::Waiting }
+}
+
+fn install_library_entry_matches(entry: &Value, title: &str, cid: &str, version: Option<&str>, kind: &str) -> bool {
+    if !title_id(title) || entry["titleId"].as_str() != Some(title) || !matches!(kind, "base" | "update") { return false; }
+    if entry["sources"].as_array().is_some_and(|sources| !sources.is_empty()
+        && !sources.iter().any(|source| source == "app" || source == "appdb")) { return false; }
+    let content = entry["contentId"].as_str().filter(|id| !id.is_empty());
+    if content.is_some_and(|id| id != cid) { return false; }
+    let wanted = version.filter(|version| !version.trim().is_empty());
+    let installed = entry[if kind == "update" { "updateVersion" } else { "baseVersion" }].as_str()
+        .or_else(|| if kind == "base" { entry["version"].as_str() } else { None });
+    if let Some(wanted) = wanted {
+        // Numeric components allow zero-padding differences, never a different release.
+        let components = |text: &str| text.trim().split('.').map(str::parse::<u32>).collect::<Result<Vec<_>, _>>().ok();
+        if !installed.is_some_and(|actual| actual == wanted || components(actual).is_some_and(|a| Some(a) == components(wanted))) { return false; }
+        return true;
+    }
+    // A title alone (or a base title when installing an update/DLC) proves too little.
+    kind == "base" && content == Some(cid)
+}
+
+async fn install_cancellable<T>(tx: &mut watch::Receiver<bool>, work: impl std::future::Future<Output = T>) -> Result<T, String> {
+    tokio::pin!(work);
+    loop {
+        if *tx.borrow() { return Err("cancelled".into()); }
+        tokio::select! {
+            biased;
+            changed = tx.changed() => { if changed.is_err() || *tx.borrow() { return Err("cancelled".into()); } },
+            result = &mut work => return Ok(result),
+        }
+    }
+}
+
+async fn confirm_install_from_library(endpoint: &ReceiverEndpoint, title: &str, cid: &str, version: Option<&str>, kind: &str) -> bool {
+    let target = if endpoint.console == "PS4" { "ps4" } else { "ps5" };
+    let Ok(snapshot) = console_tools::list_console_library(target.into(), endpoint.host.clone(), endpoint.port).await else { return false; };
+    // Reuse the Library page's validated inventory/metadata path; its fields are private.
+    let Ok(snapshot) = serde_json::to_value(snapshot) else { return false; };
+    snapshot["entries"].as_array().is_some_and(|entries| entries.iter()
+        .any(|entry| install_library_entry_matches(entry, title, cid, version, kind)))
 }
 
 fn split_ranges(total: u64, lanes: u64) -> Vec<(u64, u64)> {
@@ -1470,10 +1590,7 @@ fn extract_rar_builtin(
     progress: std::sync::Arc<dyn Fn(u64, u64, f64) + Send + Sync>,
     checkpoint: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
 ) -> Result<(), String> {
-    let guessed = unrar::Archive::new(source)
-        .as_first_part()
-        .filename()
-        .to_path_buf();
+    let guessed = rar_first_volume(source);
     let path = if guessed.is_file() {
         guessed.clone()
     } else if source.is_file() {
@@ -1497,8 +1614,9 @@ fn extract_rar_builtin(
         if let Ok(open) = probe.open_for_listing() {
             if open.volume_info() == unrar::VolumeInfo::Subsequent {
                 return Err(format!(
-                    "{} is not the first volume of the set; part1 was not downloaded or was renamed",
-                    path.file_name().unwrap_or_default().to_string_lossy()
+                    "{} is not the first volume of the set; the first volume ({}) was not downloaded or was renamed",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    guessed.file_name().unwrap_or_default().to_string_lossy()
                 ));
             }
             break;
@@ -1720,7 +1838,7 @@ fn finish_pkg_install(
     job: &str,
     done: u64,
     total: u64,
-    label: &str,
+    message: &str,
     announce_complete: bool,
 ) -> Result<(), String> {
     if announce_complete {
@@ -1734,7 +1852,7 @@ fn finish_pkg_install(
                 bytes_total: total,
                 speed_bps: 0.,
                 eta_seconds: None,
-                message: format!("{label} installation confirmed"),
+                message: message.into(),
                 ..Default::default()
             },
         );
@@ -1911,6 +2029,11 @@ fn nested_rar_volumes(root: &Path) -> Vec<PathBuf> {
             {
                 continue;
             }
+            // In an old-style set the .rar is the first volume and .r00 the second;
+            // .r00 only leads when the set has no .rar.
+            if name.ends_with(".r00") && rar_first_volume(&path).is_file() {
+                continue;
+            }
             if !(name.ends_with(".rar")
                 || name.ends_with(".zip")
                 || name.ends_with(".7z")
@@ -1966,6 +2089,19 @@ fn extract_listing(root: &Path) -> String {
     } else {
         names.join(", ")
     }
+}
+
+/// First volume of the RAR set that `path` belongs to. Old-style sets are
+/// `name.rar`, `name.r00`, `name.r01`, …, so their first volume is `name.rar`;
+/// unrar's own guess for `name.r00` is `name.r01`, a continuation volume.
+/// `.partN.rar` and `.NNN` sets keep unrar's guess.
+fn rar_first_volume(path: &Path) -> PathBuf {
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    if let Some(caps) = Regex::new(r"^(.+)\.([rR])\d{2,3}$").ok().and_then(|regex| regex.captures(name)) {
+        let extension = if &caps[2] == "R" { "RAR" } else { "rar" };
+        return path.with_file_name(format!("{}.{extension}", &caps[1]));
+    }
+    unrar::Archive::new(path).as_first_part().filename().to_path_buf()
 }
 
 fn rar_part_from_name(name: &str) -> Option<u32> {
@@ -2137,7 +2273,7 @@ mod console_target_tests {
     }
     fn request(target: Option<&str>) -> DeliveryRequest {
         DeliveryRequest { transport: None, target: target.map(str::to_string), package: Package { kind: "base".into(), ..Default::default() },
-            title_id: Some("CUSA12345".into()), title_name: None, icon: None, archive_parts: vec![], backport: None, provider: None }
+            title_id: Some("CUSA12345".into()), title_name: None, icon: None, archive_parts: vec![], backport: None, provider: None, package_dumps: None }
     }
     #[test]
     fn ps4_rejects_ps5_titles_backports_and_folders() {
@@ -2208,6 +2344,12 @@ fn save_settings(
     if input.ps4_archive_mode.as_deref().is_some_and(|mode| !matches!(mode, "pc" | "ps4")) {
         return Err("PS4 archive mode must be pc or ps4.".into());
     }
+    if input.folder_action.as_deref().is_some_and(|action| !matches!(action, "ask" | "package" | "package-send" | "send")) {
+        return Err("Folder action must be ask, package, package-send or send.".into());
+    }
+    if input.package_format.as_deref().is_some_and(|format| !matches!(format, "fpkg" | "exfat")) {
+        return Err("Package format must be fpkg or exfat.".into());
+    }
     if !input.ps5_host.trim().is_empty() {
         validate_receiver_candidate(&input.ps5_host, input.ps5_port)?;
     }
@@ -2217,9 +2359,7 @@ fn save_settings(
     if input.download_dir.trim().is_empty() {
         return Err("Download folder is required".into());
     }
-    if input.fpkg_compression_level.is_some_and(|level| !(1..=9).contains(&level)) {
-        return Err("Kraken compression level must be between 1 and 9".into());
-    }
+    fpkg::validate_compression_level(input.fpkg_compression_level)?;
     if let Some(v) = input.real_debrid_token.filter(|v| !v.trim().is_empty()) {
         secret("real-debrid")?.set_password(&v).map_err(redact)?;
     }
@@ -2269,11 +2409,9 @@ fn save_settings(
         keep_archives: input.keep_archives.unwrap_or(s.keep_archives),
         keep_extractions: input.keep_extractions.unwrap_or(s.keep_extractions),
         keep_packages: input.keep_packages.unwrap_or(s.keep_packages),
+        keep_packages_on_remove: input.keep_packages_on_remove.unwrap_or(s.keep_packages_on_remove),
 
-        fpkg_preset: input
-            .fpkg_preset
-            .unwrap_or_else(default_fpkg_preset)
-            .to_ascii_lowercase(),
+        fpkg_preset: fpkg::PackagePreset::from_label(input.fpkg_preset.as_deref().unwrap_or("balanced")).label().into(),
         fpkg_compression_level: input.fpkg_compression_level,
         fpkg_doctor: input.fpkg_doctor.unwrap_or(false),
         fpkg_pfs_version: match input.fpkg_pfs_version.unwrap_or_else(default_pfs_version) {
@@ -2283,6 +2421,9 @@ fn save_settings(
         fpkg_engine_path: input.fpkg_engine_path.unwrap_or_default().trim().to_string(),
         target_fw: input.target_fw.unwrap_or_default().trim().to_string(),
         fpkg_cleanup_source: input.fpkg_cleanup_source.unwrap_or(false),
+        package_format: input.package_format.unwrap_or_else(|| s.package_format.clone()),
+        lizard_packing: input.lizard_packing.unwrap_or(s.lizard_packing),
+        folder_action: input.folder_action.unwrap_or_else(|| s.folder_action.clone()),
     };
     write_settings(&app, &s)?;
     Ok(s.clone())
@@ -3387,7 +3528,9 @@ async fn send_file_once(
 ) -> Result<(), String> {
     let n = fs::metadata(path).await.map_err(redact)?.len();
     let overall_total = overall_total.max(n + overall_done).max(1);
-    let dump = endpoint.dump_prefix.is_some_and(|prefix| remote.starts_with(&format!("{prefix}/")));
+    // Dump folders upload several files at once, so each file gets fewer lanes; an image is one file.
+    let dump = endpoint.dump_prefix.is_some_and(|prefix| remote.starts_with(&format!("{prefix}/")))
+        && !remote.starts_with(&format!("{IMAGE_STAGING}/"));
     let requested = if s.transfer_mode.eq_ignore_ascii_case("max") {
         // 1 Gb LAN: up to 12 lanes per file; dump files cap lower so 8 parallel
         // files stay well under the receiver's connection budget.
@@ -3579,22 +3722,23 @@ async fn package_and_install_dump(
     emit(app, Progress { job_id: job.into(), stage: "packaging".into(), message: "Waiting for packaging worker".into(), ..Default::default() });
     let mut queue_cancel = tx.clone();
     let package_slot = tokio::select! { slot = PACKAGING_WORK.lock() => slot, _ = queue_cancel.changed() => return Err("cancelled".into()) };
+    // Total packaging time starts once this job owns the packaging worker, not while queued.
+    let packaging_started = Instant::now();
     let engine = fpkg::locate_engine(Some(&s.fpkg_engine_path))
         .ok_or("Packaging engine unavailable. Reinstall the complete SSPI distribution or select an engine in Settings.")?;
-    let job_root = PathBuf::from(&s.download_dir).join("packaged").join(uuid::Uuid::new_v4().to_string());
+    let job_uuid = uuid::Uuid::new_v4();
+    let job_root = PathBuf::from(&s.download_dir).join("packaged").join(job_uuid.to_string());
     emit(app, Progress { job_id: job.into(), stage: "packaging".into(), work_paths: vec![job_root.clone()], message: "Creating packaging workspace".into(), ..Default::default() });
     let staging = job_root.join("source");
     let source = root.to_path_buf();
     let stage_copy = staging.clone();
     emit(app, Progress { job_id: job.into(), stage: "packaging".into(),
         message: "Preparing a package workspace; original dump retained".into(), ..Default::default() });
-    let source_probe = source.clone();
-    let (source_bytes, workspace_bytes) = tokio::task::spawn_blocking(move || fpkg::workspace_size(&source_probe)).await.map_err(redact)??;
-    storage::publish(app, job, storage::plan(Path::new(&s.download_dir), "packaging", 0, source_bytes,
-        workspace_bytes, true, source_bytes, false))?;
     let app_control = app.clone(); let job_control = job.to_string(); let control_cancel = tx.clone();
     let doctor_enabled = s.fpkg_doctor;
     let package_download_dir = s.download_dir.clone();
+    let image = s.package_format == "exfat";
+    let lizard = image && s.lizard_packing;
     let prepared = tokio::task::spawn_blocking(move || {
         let began = Instant::now();
         let last_report = std::cell::RefCell::new(Instant::now());
@@ -3615,15 +3759,31 @@ async fn package_and_install_dump(
             if !blockers.is_empty() { return Err(format!("packaging/doctor: {}", blockers.join("; "))); }
             Some(report)
         } else { None };
-        fpkg::stage_source_with_repairs(&source, &stage_copy, doctor.as_ref().map(|d| d.repairs.as_slice()).unwrap_or(&[]), &control)?;
+        let (source_bytes, workspace_bytes) = match &doctor {
+            Some(report) => (report.source_bytes, report.private_bytes),
+            None => fpkg::workspace_size(&source)?,
+        };
+        storage::publish(&app_control, &job_control, storage::plan(Path::new(&package_download_dir), "packaging", 0, source_bytes,
+            workspace_bytes, true, source_bytes, false))?;
+        let staged = fpkg::stage_source_with_repairs(&source, &stage_copy, doctor.as_ref().map(|d| d.repairs.as_slice()).unwrap_or(&[]), &control)?;
         for warning in ampr_index::prepare_staged(&stage_copy, &control).map_err(|error| format!("packaging/backport index: {error}"))? {
             emit(&app_control, Progress { job_id: job_control.clone(), stage: "packaging".into(), message: warning, ..Default::default() });
         }
-        let preflight = fpkg::preflight(&stage_copy, 2_000_000)?;
-        storage::publish(&app_control, &job_control, storage::plan(Path::new(&package_download_dir), "package output and temporary files", 0, preflight.total_bytes, 0, true, preflight.total_bytes, true))?;
+        let preflight = fpkg::preflight_staged(&stage_copy, 2_000_000, &staged)?;
+        // The FPKG notes about embedding runtimes in an installed package do not apply to images.
+        for warning in preflight.warnings.iter().filter(|w| !image || !(w.starts_with("Backport runtime files are embedded") || w.starts_with("ampr_emu.index is preserved"))) {
+            emit(&app_control, Progress { job_id: job_control.clone(), stage: "packaging".into(), message: warning.clone(), ..Default::default() });
+        }
+        if image {
+            // The image is about the size of the dump; Lizard packs are written into staging first.
+            storage::guard_bytes(Path::new(&package_download_dir), preflight.total_bytes.saturating_mul(if lizard { 2 } else { 1 }), "exFAT image")?;
+        } else {
+            storage::publish(&app_control, &job_control, storage::plan(Path::new(&package_download_dir), "package output and temporary files", 0, preflight.total_bytes, 0, true, preflight.total_bytes, true))?;
+        }
         if !preflight.ok() { return Err(format!("packaging/preflight: {}", preflight.blockers.join("; "))); }
         Ok((doctor, preflight))
     }).await.map_err(redact)?;
+    let workspace_seconds = packaging_started.elapsed().as_secs_f64();
     let (doctor_report, preflight) = match prepared {
         Ok(value) => value,
         Err(error) => {
@@ -3632,6 +3792,12 @@ async fn package_and_install_dump(
             return Err(error);
         }
     };
+    if image {
+        let result = package_image(app, s, root, job, title_id, title_name, icon, tx, cleanup, cleanup_extra,
+            packaging_started, &job_root, &staging, doctor_report, preflight, workspace_seconds).await;
+        drop(package_slot);
+        return result;
+    }
     let mut options = fpkg::PackageOptions::new(staging.clone(), job_root.join("output"));
     options.title_id = dump_title_id(root).or_else(|| title_id.map(str::to_string));
     options.kind = fpkg::PackageKind::from_label(kind);
@@ -3639,16 +3805,23 @@ async fn package_and_install_dump(
     options.compression_level = s.fpkg_compression_level;
     options.pfs_version = s.fpkg_pfs_version;
     options.target_fw = Some(s.target_fw.clone()).filter(|fw| !fw.is_empty());
-    options.threads = Some((std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) / 2).clamp(1, 8) as u16);
-    let info = PackagingInfo { preset: s.fpkg_preset.clone(), compression_level: options.effective_compression_level()?,
+    options.threads = Some(fpkg::kraken_workers());
+    let temp = fpkg::choose_temp_dir(&options.output_dir, preflight.total_bytes, &fpkg::TempEnvironment::system());
+    let temp_dir = temp.dir.join(format!("sspi-fpkg-{job_uuid}"));
+    options.temp_dir = Some(temp_dir.clone());
+    let info = PackagingInfo { preset: options.preset.label().into(), compression_level: options.effective_compression_level()?,
         doctor: doctor_report, doctor_applied: s.fpkg_doctor, pfs_version: options.effective_pfs_version(),
         threads: options.threads.unwrap(), input_bytes: preflight.total_bytes, file_count: preflight.file_count,
-        ..Default::default() };
+        temp_path: temp_dir.display().to_string(),
+        workspace_seconds: Some(workspace_seconds), ..Default::default() };
+    emit(app, Progress { job_id: job.into(), stage: "packaging".into(), packaging: Some(info.clone()),
+        message: format!("Temporary files: {}. {}", temp_dir.display(), temp.reason), ..Default::default() });
     emit(app, Progress { job_id: job.into(), stage: "packaging".into(), packaging: Some(info.clone()),
         title: title_name.clone().unwrap_or_default(), icon: icon.clone(),
         message: format!("Packing {} files at Kraken {} with {} workers", info.file_count, info.compression_level, info.threads), ..Default::default() });
     let app_event = app.clone(); let job_event = job.to_string(); let info_event = info.clone();
     let started = Instant::now();
+    let last_engine = Arc::new(Mutex::new(None::<Value>)); let engine_seen = last_engine.clone();
     let pause_app = app.clone(); let pause_job = job.to_string(); let build_cancel = tx.clone();
     let build = fpkg::build_controlled(&engine, &options, move |line| {
         let value = serde_json::from_str::<Value>(&line).ok();
@@ -3663,6 +3836,10 @@ async fn package_and_install_dump(
             info.speed_bps = v["speedBps"].as_f64();
             info.last_activity_seconds = v["lastActivitySeconds"].as_f64();
             info.heartbeat = v["heartbeat"].as_bool().unwrap_or(false);
+            if let Some(engine) = v.get("engine").filter(|engine| engine.is_object()) {
+                info.engine = Some(engine.clone());
+                *engine_seen.lock().unwrap() = Some(engine.clone());
+            }
         }
         emit(&app_event, Progress { job_id: job_event.clone(), stage: "packaging".into(),
             progress: value.as_ref().and_then(|v| v["progress"].as_f64()).unwrap_or(0.),
@@ -3680,16 +3857,24 @@ async fn package_and_install_dump(
         }
     };
     drop(package_slot);
-    let package = outcome.output;
+    // Move the verified package out of the disposable workspace before anything records
+    // its path, so removing this transfer's leftovers can never delete it.
+    let built = outcome.output;
+    let package_title = title_name.clone().filter(|name| !name.trim().is_empty()).or_else(|| options.title_id.clone()).unwrap_or_else(|| "Package".into());
+    let package_dir = Path::new(&s.download_dir).join("FPKG").join(fpkg::package_folder_name(&package_title, options.title_id.as_deref()));
+    let package = tokio::task::spawn_blocking(move || fpkg::relocate_package(&built, &package_dir)).await.map_err(redact)??;
     let size = std::fs::metadata(&package).map_err(redact)?.len();
     job_store::checkpoint(app, job, job_store::Checkpoint::Package { path: package.clone(), dump: Some(root.to_path_buf()), cleanup, backports_embedded: true, cleanup_extra: cleanup_extra.to_vec() })?;
     transfer_checkpoint(app, job, tx).await?;
     let mut info = info;
     info.output_bytes = size; info.output_path = package.display().to_string(); info.elapsed_seconds = outcome.seconds;
+    info.engine = last_engine.lock().unwrap().take(); info.total_seconds = Some(packaging_started.elapsed().as_secs_f64());
+    info.activity = "Finalized FIH package verified".into(); info.phase_progress = Some(1.); info.heartbeat = false;
     emit(app, Progress { job_id: job.into(), stage: "packaging".into(), progress: 1., packaging: Some(info),
         message: "Finalized FIH package verified".into(), ..Default::default() });
-    // Persist the verified package checkpoint before releasing downloaded inputs.
-    let mut disposable = vec![staging];
+    // Persist the verified package checkpoint before releasing downloaded inputs. The package
+    // now lives outside job_root, so the whole workspace (staging, engine work files) goes.
+    let mut disposable = vec![job_root.clone()];
     if !s.keep_extractions {
         if cleanup { disposable.push(root.to_path_buf()); }
         disposable.extend(cleanup_extra.iter().cloned());
@@ -3707,6 +3892,206 @@ async fn package_and_install_dump(
     emit(app, Progress { job_id: job.into(), stage: "complete".into(), progress: 1.,
         bytes_done: size, bytes_total: size, message, ..Default::default() });
     Ok(())
+}
+
+/// ShadowMount Plus exFAT image (optionally with Lizard asset packs) from the prepared staging copy.
+#[allow(clippy::too_many_arguments)]
+async fn package_image(
+    app: &AppHandle, s: &Settings, root: &Path, job: &str, requested_id: Option<&str>,
+    title_name: &Option<String>, icon: &Option<String>, tx: &mut watch::Receiver<bool>, cleanup: bool, cleanup_extra: &[PathBuf],
+    packaging_started: Instant, job_root: &Path, staging: &Path, doctor: Option<fpkg_doctor::DoctorReport>,
+    preflight: fpkg::Preflight, workspace_seconds: f64,
+) -> Result<(), String> {
+    let id = dump_title_id(root).or_else(|| requested_id.map(str::to_ascii_uppercase)).filter(|id| title_id(id))
+        .ok_or("An exFAT image needs a CUSA or PPSA title ID in sce_sys/param.json")?;
+    let file_name = shadow_image::image_name(staging, &id);
+    let title = title_name.clone().filter(|name| !name.trim().is_empty()).unwrap_or_else(|| id.clone());
+    let output_dir = Path::new(&s.download_dir).join("ShadowMount").join(fpkg::package_folder_name(&title, Some(&id)));
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16);
+    let runtime = if s.lizard_packing { shadow_image::ampr_runtime() } else { None };
+    let info = PackagingInfo { preset: "exfat".into(), format: "exfat".into(), doctor, doctor_applied: s.fpkg_doctor,
+        threads: workers as u16, input_bytes: preflight.total_bytes, file_count: preflight.file_count,
+        workspace_seconds: Some(workspace_seconds), ..Default::default() };
+    emit(app, Progress { job_id: job.into(), stage: "packaging".into(), packaging: Some(info.clone()),
+        title: title_name.clone().unwrap_or_default(), icon: icon.clone(),
+        message: format!("Building {file_name}{}", if s.lizard_packing { " with Lizard asset packing" } else { "" }), ..Default::default() });
+    let (app_event, job_event, info_event, cancel) = (app.clone(), job.to_string(), info.clone(), tx.clone());
+    let (staged, out, name, label, lizard) = (staging.to_path_buf(), output_dir.clone(), file_name.clone(), id.clone(), s.lizard_packing);
+    let built = tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        let control = || job_store::blocking_checkpoint(&app_event, &job_event, &cancel);
+        let request = shadow_image::Request { staged: &staged, output_dir: &out, file_name: &name, label: &label, lizard,
+            runtime: runtime.as_deref(), workers };
+        shadow_image::build(&request, &control, &mut |engine, message| {
+            let index = engine["stageIndex"].as_f64().unwrap_or(1.) - 1.;
+            let count = engine["stageCount"].as_f64().unwrap_or(1.).max(1.);
+            let progress = ((index + engine["stageProgress"].as_f64().unwrap_or(0.)) / count).clamp(0., 0.999);
+            let mut info = info_event.clone();
+            info.elapsed_seconds = started.elapsed().as_secs_f64();
+            info.activity = message.clone();
+            info.engine = Some(engine);
+            emit(&app_event, Progress { job_id: job_event.clone(), stage: "packaging".into(), progress, message, packaging: Some(info), ..Default::default() });
+        }).map(|built| (built, started.elapsed().as_secs_f64()))
+    }).await.map_err(redact)?;
+    let (built, seconds) = match built {
+        Ok(value) => value,
+        Err(error) => {
+            let workspace = job_root.to_path_buf(); let download = PathBuf::from(&s.download_dir);
+            let _ = tokio::task::spawn_blocking(move || fpkg::cleanup_extracted(&workspace, &download)).await;
+            return Err(if error == "cancelled" { error } else { format!("packaging/exFAT image: {error}") });
+        }
+    };
+    for warning in &built.warnings {
+        emit(app, Progress { job_id: job.into(), stage: "packaging".into(), message: warning.clone(), ..Default::default() });
+    }
+    job_store::checkpoint(app, job, job_store::Checkpoint::Package { path: built.path.clone(), dump: Some(root.to_path_buf()), cleanup, backports_embedded: true, cleanup_extra: cleanup_extra.to_vec() })?;
+    transfer_checkpoint(app, job, tx).await?;
+    let mut info = info;
+    info.output_bytes = built.bytes; info.output_path = built.path.display().to_string(); info.elapsed_seconds = seconds;
+    info.engine = Some(built.engine.clone()); info.lizard = built.lizard.clone(); info.total_seconds = Some(packaging_started.elapsed().as_secs_f64());
+    info.activity = "exFAT image verified".into(); info.phase_progress = Some(1.);
+    emit(app, Progress { job_id: job.into(), stage: "packaging".into(), progress: 1., packaging: Some(info),
+        message: format!("exFAT image verified: {} files, {:.2} GiB of game data in {}", built.files, built.payload_bytes as f64 / 1_073_741_824., built.path.display()), ..Default::default() });
+    let mut disposable = vec![job_root.to_path_buf()];
+    if !s.keep_extractions {
+        if cleanup { disposable.push(root.to_path_buf()); }
+        disposable.extend(cleanup_extra.iter().cloned());
+    }
+    let mut cleanup_note = job_store::release_packaged_inputs(s.download_dir.clone(), disposable).await;
+    if s.keep_extractions { cleanup_note = "Extracted files retained by settings.".into(); }
+    if job_store::package_only(app, job) {
+        emit(app, Progress { job_id: job.into(), stage: "complete".into(), progress: 1., bytes_done: built.bytes, bytes_total: built.bytes,
+            message: format!("ShadowMount image ready: {}. {cleanup_note}", built.path.display()), ..Default::default() });
+        return Ok(());
+    }
+    let delivered = deliver_image(app, s, &built.path, job, tx).await?;
+    emit(app, Progress { job_id: job.into(), stage: "complete".into(), progress: 1., bytes_done: built.bytes, bytes_total: built.bytes,
+        message: format!("{delivered} {cleanup_note}"), ..Default::default() });
+    Ok(())
+}
+
+/// Receiver folder ShadowMount Plus skips (dot-prefixed); images wait here until verified.
+const IMAGE_STAGING: &str = "/data/homebrew/.sspi-incoming";
+
+#[derive(Debug, PartialEq)]
+enum ImageUpload { Send, AlreadyThere(String), Refused(String) }
+
+/// What the receiver's image status allows: an existing image is never replaced (ShadowMount
+/// may have it mounted); the same size counts as delivered earlier.
+fn image_upload_plan(status: &Value, name: &str, size: u64) -> ImageUpload {
+    let final_path = format!("/data/homebrew/{name}");
+    if status["image"]["exists"].as_bool() == Some(true) {
+        if status["image"]["size"].as_u64() == Some(size) {
+            return ImageUpload::AlreadyThere(format!("{final_path} is already on the PS5 with the same size; it was kept."));
+        }
+        return ImageUpload::Refused(format!("{final_path} already exists on the PS5 with a different size. ShadowMount Plus may have it mounted. Remove or rename it on the console, then retry."));
+    }
+    // A partial copy from an earlier attempt is overwritten, so its bytes count as free.
+    let staged_bytes = status["staged"]["size"].as_u64().unwrap_or(0);
+    if let Some(free) = status["free"].as_u64().filter(|free| *free > 0) {
+        let need = size.saturating_sub(staged_bytes).saturating_add(1 << 30);
+        if free < need {
+            return ImageUpload::Refused(format!("The image needs {:.1} GB free on the PS5 and /data has {:.1} GB.", need as f64 / 1e9, free as f64 / 1e9));
+        }
+    }
+    ImageUpload::Send
+}
+
+async fn image_request(endpoint: &ReceiverEndpoint, op: u8, name: &str) -> Result<(u8, String), String> {
+    let mut socket = connect_receiver(endpoint, "image request").await?;
+    let mut body = vec![op];
+    body.extend_from_slice(name.as_bytes());
+    let (code, reply) = tokio::time::timeout(Duration::from_secs(60), frame(&mut socket, 0x6d, &body)).await
+        .map_err(|_| "The receiver did not answer the image request".to_string())??;
+    Ok((code, String::from_utf8_lossy(&reply).into_owned()))
+}
+
+/// Uploads a finished image into a folder ShadowMount Plus skips, then has the receiver move it
+/// into /data/homebrew, so a scan never mounts a partial file. Returns the completion message.
+pub(crate) async fn deliver_image(app: &AppHandle, s: &Settings, path: &Path, job: &str, tx: &mut watch::Receiver<bool>) -> Result<String, String> {
+    let endpoint = &ReceiverEndpoint::ps5(s);
+    let name = path.file_name().and_then(|n| n.to_str())
+        .filter(|n| n.len() <= 200 && n.bytes().all(|b| b.is_ascii_graphic()) && n.to_ascii_lowercase().ends_with(".exfat") && !n.starts_with('.'))
+        .ok_or("The image file name must be ASCII without spaces and end in .exfat")?.to_string();
+    let size = fs::metadata(path).await.map_err(redact)?.len();
+    let _delivery = console_delivery_slot(tx).await?;
+    test_ps5(endpoint.host.clone(), endpoint.port).await?;
+    let (code, reply) = image_request(endpoint, b's', &name).await?;
+    if code != 3 {
+        return Err(if reply.contains("unsupported") { "Reload the SSPI receiver ELF on the PS5; the running receiver cannot deliver ShadowMount images.".into() } else { format!("Image status failed: {reply}") });
+    }
+    let status: Value = serde_json::from_str(&reply).map_err(|_| format!("Image status failed: {reply}"))?;
+    match image_upload_plan(&status, &name, size) {
+        ImageUpload::Send => {}
+        ImageUpload::AlreadyThere(message) => return Ok(message),
+        ImageUpload::Refused(error) => return Err(error),
+    }
+    let final_path = format!("/data/homebrew/{name}");
+    let title = name.split(|c: char| !c.is_ascii_alphanumeric()).find(|part| title_id(part)).map(str::to_string);
+    set_receiver_title(app, endpoint, job, title.as_deref(), false).await?;
+    let staged = format!("{IMAGE_STAGING}/{name}");
+    if let Err(error) = send_file(app, s, endpoint, path, &staged, job, tx, &format!("Uploading {name} to the PS5"), 0, size, None).await {
+        // Receiver lanes release as their sockets close; then the partial copy can go.
+        sleep(Duration::from_secs(2)).await;
+        let _ = image_request(endpoint, b'd', &name).await;
+        return Err(error);
+    }
+    emit(app, Progress { job_id: job.into(), stage: "uploading".into(), progress: 0.99, bytes_done: size, bytes_total: size,
+        message: format!("Publishing {name} for ShadowMount Plus"), ..Default::default() });
+    let (code, reply) = image_request(endpoint, b'p', &name).await?;
+    if code != 1 { return Err(format!("The image was uploaded but could not be published: {reply}. The copy stays in {IMAGE_STAGING} on the PS5.")); }
+    if !s.keep_packages { job_store::cleanup_installed_package(app, job, path)?; }
+    Ok(format!("Image delivered to {final_path}. ShadowMount Plus mounts it on its next scan (about every 15 seconds)."))
+}
+
+#[cfg(test)]
+mod image_delivery_tests {
+    use super::*;
+
+    #[test]
+    fn an_existing_image_is_kept_or_refused_and_space_counts_the_partial_copy() {
+        let status = |image: Value, staged: u64, free: u64| json!({"image": image, "staged": {"exists": staged > 0, "size": staged, "active": false}, "free": free});
+        let gib = 1u64 << 30;
+        assert_eq!(image_upload_plan(&status(json!({"exists": false, "size": 0}), 0, 60 * gib), "PPSA00001-v01.000.000.exfat", 50 * gib), ImageUpload::Send);
+        assert!(matches!(image_upload_plan(&status(json!({"exists": true, "size": 50 * gib}), 0, 60 * gib), "a.exfat", 50 * gib), ImageUpload::AlreadyThere(m) if m.contains("/data/homebrew/a.exfat")));
+        assert!(matches!(image_upload_plan(&status(json!({"exists": true, "size": 49 * gib}), 0, 60 * gib), "a.exfat", 50 * gib), ImageUpload::Refused(m) if m.contains("different size")));
+        assert!(matches!(image_upload_plan(&status(json!({"exists": false, "size": 0}), 0, 50 * gib), "a.exfat", 50 * gib), ImageUpload::Refused(m) if m.contains("GB free")));
+        // 40 GiB of an earlier partial copy is overwritten, so 11 GiB free is enough for 50 GiB.
+        assert_eq!(image_upload_plan(&status(json!({"exists": false, "size": 0}), 40 * gib, 11 * gib + 1), "a.exfat", 50 * gib), ImageUpload::Send);
+        // A receiver that cannot report free space does not block the upload.
+        assert_eq!(image_upload_plan(&status(json!({"exists": false, "size": 0}), 0, 0), "a.exfat", 50 * gib), ImageUpload::Send);
+    }
+
+    #[tokio::test]
+    async fn image_requests_carry_the_operation_and_name() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut header = [0u8; 5];
+                socket.read_exact(&mut header).await.unwrap();
+                let mut body = vec![0; u32::from_le_bytes(header[1..].try_into().unwrap()) as usize];
+                socket.read_exact(&mut body).await.unwrap();
+                assert_eq!(header[0], 0x6d);
+                let reply: &[u8] = if body[0] == b's' { br#"{"image":{"exists":false,"size":0},"staged":{"exists":false,"size":0,"active":false},"free":1}"# } else { b"OK {}" };
+                let mut response = vec![if body[0] == b's' { 3 } else { 1 }];
+                response.extend_from_slice(&(reply.len() as u32).to_le_bytes());
+                response.extend_from_slice(reply);
+                socket.write_all(&response).await.unwrap();
+                seen.push(body);
+            }
+            seen
+        });
+        let settings = Settings { ps5_host: "127.0.0.1".into(), ps5_port: port, ..Settings::default() };
+        let endpoint = ReceiverEndpoint::ps5(&settings);
+        let (code, reply) = image_request(&endpoint, b's', "PPSA00001.exfat").await.unwrap();
+        assert_eq!(code, 3);
+        assert!(serde_json::from_str::<Value>(&reply).is_ok());
+        assert_eq!(image_request(&endpoint, b'p', "PPSA00001.exfat").await.unwrap().0, 1);
+        assert_eq!(server.await.unwrap(), vec![b"sPPSA00001.exfat".to_vec(), b"pPPSA00001.exfat".to_vec()]);
+    }
 }
 
 async fn set_receiver_title(app: &AppHandle, endpoint: &ReceiverEndpoint, job: &str, title: Option<&str>, require_fih: bool) -> Result<(), String> {
@@ -4077,122 +4462,78 @@ async fn upload(
             "Install submission returned no content ID for {label}; refusing blind poll. Package: {target}"
         ));
     }
-    // F5: carry the content ID in every install message from here on.
     let label = format!("{label} [{cid}]");
-    let unconfirmed = |label: &str, cid: &str| {
-        format!(
-            "AppInst never acknowledged {label} (content id '{cid}'). The package is on the PS5 but was not confirmed installed — check the home menu, then retry."
-        )
-    };
-    let mut saw_work = false;
-    let mut idle_ticks = 0u32;
-    // F4: longer honest window (5 min); worst case is a slower honest answer.
-    for tick in 0..150 {
-        if *tx.borrow() {
-            return Err("cancelled".into());
-        }
-        sleep(Duration::from_secs(2)).await;
-        let mut status_sock = connect_receiver(endpoint, "install status").await?;
-        let (_frame_code, v) = frame(&mut status_sock, 0x51, cid.as_bytes()).await?;
-        let parsed = match serde_json::from_slice::<Value>(&v) {
-            Ok(value) => value,
-            Err(_) => {
-                idle_ticks += 1;
-                emit(
-                    app,
-                    Progress {
-                        job_id: job.into(),
-                        stage: "installing".into(),
-                        progress: ((tick + 1) as f64 / 20.).min(0.95),
-                        bytes_done: done,
-                        bytes_total: total,
-                        speed_bps: 0.,
-                        eta_seconds: None,
-                        message: format!("Waiting for {label} AppInst"),
-                        ..Default::default()
-                    },
-                );
-                if idle_ticks >= 45 {
-                    // F1/F2: unparseable replies are idle time — never a silent complete.
-                    if saw_work {
-                        return Err(
-                            "Install remains in progress; check receiver status later".into(),
-                        );
-                    }
-                    return Err(unconfirmed(&label, &cid));
-                }
-                continue;
-            }
+    let metadata = pkg_meta::read(path).ok();
+    let install_title = cid.split(|c: char| !c.is_ascii_alphanumeric()).find(|id| title_id(id))
+        .or(title).unwrap_or("");
+    let version = metadata.as_ref().and_then(|meta| meta.version.as_deref());
+    let kind = metadata.as_ref().map(|meta| meta.kind.as_str()).unwrap_or_else(|| pkg_role_label(path));
+    let mut last_answer = Instant::now();
+    let mut last_library_check = None::<Instant>;
+    let mut receiver_lost = false;
+    let mut last_progress = 0.;
+    loop {
+        install_cancellable(tx, sleep(Duration::from_secs(2))).await?;
+        let remaining = INSTALL_CONFIRM_GRACE.saturating_sub(last_answer.elapsed());
+        let poll = async {
+            let mut socket = connect_receiver(endpoint, "install status").await?;
+            frame(&mut socket, 0x51, cid.as_bytes()).await
         };
-        match install_decision(&parsed)? {
-            InstallDecision::Complete => {
-                if !s.keep_packages { job_store::cleanup_installed_package(app, job, path)?; }
-                return finish_pkg_install(app, job, done, total, &label, announce_complete);
-            }
-            InstallDecision::Installing { status, progress } => {
-                if appinst_idle(&status) {
-                    idle_ticks += 1;
-                    emit(
-                        app,
-                        Progress {
-                            job_id: job.into(),
-                            stage: "installing".into(),
-                            progress: if saw_work {
-                                0.95
-                            } else {
-                                ((tick + 1) as f64 / 20.).min(0.9)
-                            },
-                            bytes_done: done,
-                            bytes_total: total,
-                            speed_bps: 0.,
-                            eta_seconds: None,
-                            message: format!(
-                                "{label}: AppInst idle ({status}). {}",
-                                if saw_work {
-                                    "Install likely finished, confirming"
-                                } else {
-                                    "Waiting for promote"
-                                }
-                            ),
-                            ..Default::default()
-                        },
-                    );
-                    if saw_work && idle_ticks >= 20 {
-                        // F2: saw real progress, then silence — uncertain, not complete.
-                        return Err(
-                            "Install remains in progress; check receiver status later".into(),
-                        );
-                    }
-                    if !saw_work && idle_ticks >= 45 {
-                        // F1: never acknowledged — fail honestly.
-                        return Err(unconfirmed(&label, &cid));
-                    }
+        let reply = install_cancellable(tx, tokio::time::timeout(remaining.min(Duration::from_secs(15)), poll)).await?;
+        let (answered, parsed) = match reply {
+            Ok(Ok((_code, body))) => (true, serde_json::from_slice::<Value>(&body).ok()),
+            _ => (false, None),
+        };
+        receiver_lost |= !answered;
+        let mut outcome = classify_install_outcome(parsed.as_ref(), &cid, false, last_answer.elapsed());
+        if matches!(outcome, InstallOutcome::Waiting | InstallOutcome::Unconfirmed) {
+            emit(app, Progress {
+                job_id: job.into(), stage: "installing".into(), progress: last_progress,
+                bytes_done: done, bytes_total: total,
+                message: if !answered {
+                    format!("{} receiver stopped answering after AppInst accepted {label}. Reload it in Tools > Payloads so SSPI can confirm the install.", endpoint.console)
                 } else {
-                    saw_work = true;
-                    idle_ticks = 0;
-                    emit(
-                        app,
-                        Progress {
-                            job_id: job.into(),
-                            stage: "installing".into(),
-                            progress: progress.max(0.1),
-                            bytes_done: done,
-                            bytes_total: total,
-                            speed_bps: 0.,
-                            eta_seconds: None,
-                            message: format!("{label}: {status}"),
-                            ..Default::default()
-                        },
-                    );
-                }
+                    format!("AppInst accepted {label}; install status is unavailable. Checking the console's library for confirmation.")
+                }, ..Default::default()
+            });
+            if last_library_check.is_none_or(|checked| checked.elapsed() >= Duration::from_secs(30)) {
+                last_library_check = Some(Instant::now());
+                let remaining = INSTALL_CONFIRM_GRACE.saturating_sub(last_answer.elapsed());
+                let confirmed = install_cancellable(tx, tokio::time::timeout(remaining.min(Duration::from_secs(30)),
+                    confirm_install_from_library(endpoint, install_title, &cid, version, kind))).await?.unwrap_or(false);
+                outcome = classify_install_outcome(parsed.as_ref(), &cid, confirmed, last_answer.elapsed());
             }
         }
+        match outcome {
+            InstallOutcome::Complete | InstallOutcome::LibraryConfirmed => {
+                let from_library = outcome == InstallOutcome::LibraryConfirmed;
+                let mut message = if from_library { format!("{label} installation confirmed from the console's library") }
+                    else { format!("{label} installation confirmed") };
+                if !s.keep_packages && job_store::cleanup_installed_package(app, job, path).is_err() {
+                    message.push_str(". The local package was kept because cleanup could not finish");
+                }
+                // Report each package's confirmation even when a set has more packages to install.
+                if !announce_complete {
+                    emit(app, Progress { job_id: job.into(), stage: "installing".into(), progress: 1.,
+                        bytes_done: done, bytes_total: total, message: message.clone(), ..Default::default() });
+                }
+                return finish_pkg_install(app, job, done, total, &message, announce_complete);
+            }
+            InstallOutcome::Installing { status, progress } => {
+                last_answer = Instant::now();
+                last_progress = progress.min(0.99);
+                emit(app, Progress {
+                    job_id: job.into(), stage: "installing".into(), progress: last_progress,
+                    bytes_done: done, bytes_total: total, message: format!("{label}: {status}"), ..Default::default()
+                });
+            }
+            InstallOutcome::Failed(error) => return Err(error),
+            InstallOutcome::Unconfirmed => return Err(format!(
+                "AppInst accepted {label}, but {} SSPI could not confirm the result within 10 minutes. The install may have finished; check the {} home screen.",
+                if receiver_lost { "the receiver stopped answering and" } else { "install status remained unavailable and" }, endpoint.console)),
+            InstallOutcome::Waiting => {},
+        }
     }
-    // Loop exhausted with no terminal state: same honesty rule as the idle breaks.
-    if saw_work {
-        return Err("Install remains in progress; check receiver status later".into());
-    }
-    Err(unconfirmed(&label, &cid))
 }
 
 async fn upload_pkg_set(
@@ -4738,9 +5079,10 @@ async fn queue_delivery(app: AppHandle, state: &AppState, mut request: DeliveryR
     let mut s = state.settings.lock().unwrap().clone();
     snapshot_transport(&mut request, &s, retry_id.is_some())?;
     let receiver = request.target.as_deref() == Some("ps4") && ps4_transport(&request) == "receiver";
-    let package_only = if request.target.as_deref() == Some("ps4") {
-        resume.as_ref().map(|r| r.package_only).unwrap_or(s.package_dumps && s.download_package_only)
-    } else { resume.as_ref().is_some_and(|r| r.package_only) || (s.package_dumps && s.download_package_only) };
+    // An existing record (a local import, Send to PS5 or Retry) keeps its own choice; the
+    // "Download and package only" setting decides for new downloads only.
+    let package_only = resume.as_ref().map(|r| r.package_only).unwrap_or(s.package_dumps && s.download_package_only);
+    if let Some(pack) = request.package_dumps { s.package_dumps = pack; }
     let target = validate_delivery_target(&request, package_only, false)?.to_string();
     if target == "ps4" && !receiver {
         if let Some(saved) = resume.as_ref().and_then(|record| record.ps4_delivery.as_ref()) { ps4_inbox::validate_delivery(saved)?; }
@@ -5183,6 +5525,24 @@ fn manual_dump(root: &Path) -> ManualCandidate {
     }
 }
 
+/// `\\?\D:\x` -> `D:\x` and `\\?\UNC\s\x` -> `\\s\x`, for display and Explorer.
+fn plain_path(path: &Path) -> PathBuf {
+    let text = path.display().to_string();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") { return PathBuf::from(format!(r"\\{rest}")); }
+    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
+}
+
+/// Shows a file SSPI produced in Explorer. Only paths inside the download folder qualify.
+#[tauri::command]
+async fn reveal_path(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let root = PathBuf::from(&state.settings.lock().unwrap().download_dir);
+    let target = std::fs::canonicalize(&path).map_err(|_| "That file is no longer there.".to_string())?;
+    let root = std::fs::canonicalize(&root).map_err(redact)?;
+    if !target.starts_with(&root) { return Err("Only files in the download folder can be shown.".into()); }
+    std::process::Command::new("explorer.exe").arg(format!("/select,{}", plain_path(&target).display())).spawn().map_err(redact)?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn scan_manual_folder(path: String) -> Result<Vec<ManualCandidate>, String> {
     tokio::task::spawn_blocking(move || scan_manual_folder_sync(path)).await.map_err(redact)?
@@ -5259,6 +5619,7 @@ async fn start_manual_install(
     items: Vec<ManualItem>,
     package_only: Option<bool>,
     target: Option<String>,
+    package: Option<bool>,
 ) -> Result<String, String> {
     if items.is_empty() { return Err("Nothing to install".into()); }
     for item in &items {
@@ -5267,7 +5628,7 @@ async fn start_manual_install(
     }
     let mut first = None;
     for item in items {
-        let id = job_store::queue_local(app.clone(), &state, PathBuf::from(item.path), Some(item.kind), item.title_id, package_only.unwrap_or(false), target.clone()).await?;
+        let id = job_store::queue_local(app.clone(), &state, PathBuf::from(item.path), Some(item.kind), item.title_id, package_only.unwrap_or(false), target.clone(), package).await?;
         first.get_or_insert(id);
     }
     first.ok_or_else(|| "Nothing was queued".into())
@@ -5281,7 +5642,7 @@ async fn start_local_install(
     target: Option<String>,
 ) -> Result<String, String> {
     let source = PathBuf::from(path);
-    job_store::queue_local(app.clone(), &state, source, None, None, false, target).await
+    job_store::queue_local(app.clone(), &state, source, None, None, false, target, None).await
 }
 
 pub fn run() {
@@ -5323,10 +5684,24 @@ pub fn run() {
             console_tools::restore_title_icon,
             console_tools::refresh_console_shell,
             console_tools::console_system_info,
+            job_store::send_packaged,
+            links::parse_download_links,
+            links::start_link_downloads,
+            cloud::list_cloud_files,
+            console_diagnostics::console_kernel_log,
+            console_diagnostics::console_process_control,
             ps4_theme::build_ps4_theme,
+            console_diagnostics::export_zip_file,
             console_tools::list_console_themes,
             console_tools::apply_console_theme,
             console_tools::remove_console_theme,
+            console_diagnostics::export_text_file,
+            console_diagnostics::console_processes,
+            console_diagnostics::console_log_files,
+            console_diagnostics::console_read_log,
+            console_diagnostics::probe_debug_services,
+            console_diagnostics::start_klog_stream,
+            console_diagnostics::stop_klog_stream,
             get_settings,
             save_settings,
             inspect_package_dump,
@@ -5355,6 +5730,7 @@ pub fn run() {
             start_delivery,
             job_store::retry_job,
             job_store::remove_job,
+            reveal_path,
             package_details::inspect_package_sizes,
             package_details::refresh_job_details,
             storage::delivery_space,
@@ -5373,8 +5749,6 @@ pub fn run() {
             payloads::update_payload,
             payloads::remove_payload,
             payloads::send_payload,
-            payloads::save_theme_file,
-            payloads::load_theme_file
         ])
         .run(tauri::generate_context!())
         .expect("Tauri error")
@@ -5473,6 +5847,13 @@ mod tests {
     }
 
     #[test]
+    fn plain_paths_drop_the_verbatim_prefix() {
+        assert_eq!(plain_path(Path::new(r"\\?\D:\Games\FPKG\a.pkg")), PathBuf::from(r"D:\Games\FPKG\a.pkg"));
+        assert_eq!(plain_path(Path::new(r"\\?\UNC\nas\share\a.pkg")), PathBuf::from(r"\\nas\share\a.pkg"));
+        assert_eq!(plain_path(Path::new(r"D:\Games\a.pkg")), PathBuf::from(r"D:\Games\a.pkg"));
+    }
+
+    #[test]
     fn manual_loose_dump_detected() {
         // Backport layout: eboot.bin + fakelib, no sce_sys.
         let base = test_output_root().join(format!("gs-manual-test-{}", std::process::id()));
@@ -5548,6 +5929,10 @@ mod tests {
             "content_id":""
         }))
         .is_err());
+        assert_eq!(
+            accepted_submission(&json!({"api_code":-2135813777,"install_api_code":-2135813777,"state":"failed","error":"AppInst rejected PKG"})).unwrap_err(),
+            "Install submission failed: AppInst rejected PKG (code 0x80B2116F, -2135813777). PlayGo INVALID_SLOT: the PS5 installer had no free slot after three tries. Reload the receiver (Tools > Payloads), then Retry."
+        );
         let installing_in_error_frame = json!({
             "api_code":-99,
             "status_api_code":0,
@@ -5573,12 +5958,11 @@ mod tests {
             .unwrap(),
             InstallDecision::Complete
         );
-        assert!(install_decision(&json!({
+        assert_eq!(install_decision(&json!({
             "status_api_code":-7,
             "state":"failed",
             "status":"error"
-        }))
-        .is_err());
+        })).unwrap(), InstallDecision::Unavailable);
         assert_eq!(
             install_decision(&json!({
                 "api_code":-99,
@@ -5587,10 +5971,7 @@ mod tests {
                 "progress":10
             }))
             .unwrap(),
-            InstallDecision::Installing {
-                status: "transferring".into(),
-                progress: 0.10
-            }
+            InstallDecision::Unavailable
         );
         assert_eq!(pkg_role(Path::new("Game CUSA12345 Update v1.10.pkg")), 1);
         assert_eq!(pkg_role(Path::new("Game CUSA12345 DLC.pkg")), 2);
@@ -5617,10 +5998,100 @@ mod tests {
         for code in ["api_code", "status_api_code", "auth_restore_code"] {
             let mut value = json!({"state":"complete", "status":"installed", "progress":100});
             value[code] = json!(-7);
-            assert!(matches!(install_decision(&value).unwrap(), InstallDecision::Installing { .. }));
+            assert_eq!(install_decision(&value).unwrap(), if code == "auth_restore_code" { InstallDecision::Complete } else { InstallDecision::Unavailable });
         }
-        assert!(matches!(install_decision(&json!({"state":"complete", "status":"playable", "progress":20})).unwrap(), InstallDecision::Installing { .. }));
+        assert_eq!(install_decision(&json!({"state":"complete", "status":"playable", "progress":20})).unwrap(), InstallDecision::Unavailable);
         assert!(install_decision(&json!({"state":"complete", "status":"installed", "error_code":-7})).is_err());
+    }
+
+    #[test]
+    fn accepted_install_outcomes_distinguish_lost_status_from_package_failure() {
+        let cid = "UP0000-PPSA12345_00-TEST000000000000";
+        assert_eq!(classify_install_outcome(None, cid, false, Duration::from_secs(599)), InstallOutcome::Waiting);
+        assert_eq!(classify_install_outcome(None, cid, false, INSTALL_CONFIRM_GRACE), InstallOutcome::Unconfirmed);
+        assert_eq!(classify_install_outcome(None, cid, true, INSTALL_CONFIRM_GRACE), InstallOutcome::LibraryConfirmed);
+        for value in [json!({}), json!({"stage":"AppInst initialization failed", "state":"failed", "api_code":-9}),
+            json!({"state":"failed", "status_api_code":-5, "error_code":-5}),
+            json!({"state":"installing", "status":"none", "status_api_code":0}),
+            json!({"state":"complete", "status":"installed", "content_id":"another package"})] {
+            assert_eq!(classify_install_outcome(Some(&value), cid, false, Duration::ZERO), InstallOutcome::Waiting);
+            assert_eq!(classify_install_outcome(Some(&value), cid, true, Duration::ZERO), InstallOutcome::LibraryConfirmed);
+        }
+        let working = json!({"state":"installing", "status":"transferring", "progress":42, "status_api_code":0, "content_id":cid});
+        assert_eq!(classify_install_outcome(Some(&working), cid, true, INSTALL_CONFIRM_GRACE),
+            InstallOutcome::Installing { status:"transferring".into(), progress:0.42 });
+        let completed = json!({"state":"complete", "status":"installed", "status_api_code":0, "api_code":-4,
+            "auth_restore_code":-4, "error":"SYSTEM AuthID restore failed", "content_id":cid});
+        assert_eq!(classify_install_outcome(Some(&completed), cid, false, INSTALL_CONFIRM_GRACE), InstallOutcome::Complete);
+        let failed = json!({"state":"failed", "status":"error", "status_api_code":0, "error_code":-7, "content_id":cid});
+        assert!(matches!(classify_install_outcome(Some(&failed), cid, true, Duration::ZERO), InstallOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn library_confirmation_matches_identity_and_exact_installed_version() {
+        let cid = "UP0000-PPSA12345_00-TEST000000000000";
+        let mut entry = json!({"titleId":"PPSA12345", "contentId":cid, "baseVersion":"01.000.000", "updateVersion":"01.002.000", "version":"01.002.000"});
+        assert!(install_library_entry_matches(&entry, "PPSA12345", cid, Some("1.0.0"), "base"));
+        assert!(install_library_entry_matches(&entry, "PPSA12345", cid, Some("01.002.000"), "update"));
+        assert!(!install_library_entry_matches(&entry, "PPSA54321", cid, Some("1.0.0"), "base"));
+        assert!(!install_library_entry_matches(&entry, "PPSA12345", "different", Some("1.0.0"), "base"));
+        assert!(!install_library_entry_matches(&entry, "PPSA12345", cid, Some("01.003.000"), "update"));
+        assert!(!install_library_entry_matches(&entry, "PPSA12345", cid, Some("1.0.0"), "dlc"));
+        assert!(!install_library_entry_matches(&entry, "PPSA12345", cid, None, "update"));
+        entry["contentId"] = Value::Null;
+        assert!(install_library_entry_matches(&entry, "PPSA12345", cid, Some("1.0.0"), "base"));
+        assert!(!install_library_entry_matches(&entry, "PPSA12345", cid, None, "base"));
+        entry["updateVersion"] = Value::Null;
+        assert!(!install_library_entry_matches(&entry, "PPSA12345", cid, Some("01.002.000"), "update"));
+        entry["contentId"] = json!(cid); entry["baseVersion"] = Value::Null; entry["version"] = Value::Null;
+        assert!(install_library_entry_matches(&entry, "PPSA12345", cid, None, "base"));
+        assert!(!install_library_entry_matches(&entry, "PPSA12345", cid, Some("1.0.0"), "base"));
+        entry["sources"] = json!(["appmeta", "shadowmount"]);
+        assert!(!install_library_entry_matches(&entry, "PPSA12345", cid, None, "base"));
+        entry["sources"] = json!(["app", "appmeta"]);
+        assert!(install_library_entry_matches(&entry, "PPSA12345", cid, None, "base"));
+    }
+
+    #[tokio::test]
+    async fn install_grace_waits_are_interruptible_by_cancel() {
+        let (sender, mut receiver) = watch::channel(false);
+        let work = install_cancellable(&mut receiver, std::future::pending::<()>());
+        let cancel = async { tokio::task::yield_now().await; sender.send(true).unwrap(); };
+        let (result, _) = tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(work, cancel) }).await.unwrap();
+        assert_eq!(result.unwrap_err(), "cancelled");
+        assert_eq!(install_cancellable(&mut receiver, async { 7 }).await.unwrap_err(), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn install_fallback_reads_the_console_library_protocol() {
+        let cid = "UP0000-PPSA12345_00-TEST000000000000";
+        for (wanted, confirmed) in [("01.000.000", true), ("01.002.000", false)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut settings = Settings::default();
+            settings.ps5_host = "127.0.0.1".into(); settings.ps5_port = listener.local_addr().unwrap().port();
+            let peer = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let meta = serde_json::to_vec(&json!({"titleId":"PPSA12345", "contentId":cid, "contentVersion":"01.000.000"})).unwrap();
+                let mut metadata = (meta.len() as u32).to_le_bytes().to_vec();
+                metadata.extend(meta); metadata.extend([0u8; 8]); // Empty patch metadata and icon.
+                let replies = [
+                    (0x53, vec![], serde_json::to_vec(&json!({"platform":"ps5", "version":RECEIVER_VERSION, "capabilities":["installed-library-v1"]})).unwrap()),
+                    (0x5e, vec![], serde_json::to_vec(&json!({"titles":["PPSA12345"], "complete":true, "truncated":false, "errors":[], "sources":{"PPSA12345":["app"]}})).unwrap()),
+                    (0x5f, b"PPSA12345\0".to_vec(), metadata),
+                ];
+                for (command, expected, reply) in replies {
+                    let mut header = [0u8; 5]; socket.read_exact(&mut header).await.unwrap();
+                    assert_eq!(header[0], command);
+                    let mut body = vec![0; u32::from_le_bytes(header[1..].try_into().unwrap()) as usize];
+                    socket.read_exact(&mut body).await.unwrap(); assert_eq!(body, expected);
+                    header[0] = 3; header[1..].copy_from_slice(&(reply.len() as u32).to_le_bytes());
+                    socket.write_all(&header).await.unwrap(); socket.write_all(&reply).await.unwrap();
+                }
+            });
+            let result = tokio::time::timeout(Duration::from_secs(3), confirm_install_from_library(
+                &ReceiverEndpoint::ps5(&settings), "PPSA12345", cid, Some(wanted), "base")).await.unwrap();
+            assert_eq!(result, confirmed); peer.await.unwrap();
+        }
     }
 
     #[test]

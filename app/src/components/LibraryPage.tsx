@@ -1,8 +1,11 @@
 /* =====================================================================
    Library — the SSPI PS4 "Your library" as its own section: a row of
-   cases (L expands it to a grid) with installed and update versions,
-   and the selected title underneath. The PS5 | PS4 switch picks the
-   console. Clicking a case changes its cover on the console.
+   cases (L expands it to a grid), each with its title and installed or
+   update version, and a quiet line underneath with the selected title's
+   details and actions. The PS5 | PS4 switch picks the console. Clicking
+   a case opens its game page; right-clicking it changes its cover on the
+   console. The pointer selects what it rests on but never scrolls the
+   row; the keyboard and the mouse wheel do.
    ===================================================================== */
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import type { LibraryView, UpdateInfo } from "@/App"
@@ -25,7 +28,6 @@ import { CoverEditor } from "./CoverEditor"
 import { Icon } from "./Icon"
 import type { OptionsTab } from "./OptionsOverlay"
 import { useProviders } from "./ProviderContext"
-import type { Hint } from "./Shell"
 import { toast } from "./toasts"
 
 type Props = {
@@ -52,7 +54,6 @@ type Props = {
   onOptions: (tab: OptionsTab) => void
   onSearch: () => void
   onDemo: () => void
-  onDock: (dock: { context: ReactNode; hints: Hint[] }) => void
   tintOn: boolean
 }
 
@@ -66,7 +67,7 @@ function updateView(entry: LibraryEntry, updates: Record<string, UpdateInfo>, pe
   const id = entry.titleId.toUpperCase()
   if (pending[id] !== undefined) {
     const v = pending[id]
-    return { tone: "up", card: v ? `Update ${v} on its way` : "Update on its way", meta: v ? `Update ${v} is on its way` : "An update is on its way", pending: true }
+    return { tone: "up", card: v ? `Updating to ${v}` : "Update on its way", meta: v ? `Update ${v} is on its way` : "An update is on its way", pending: true }
   }
   const info = updates[id]
   if (!info) return { tone: "", card: "", meta: "" }
@@ -78,6 +79,12 @@ function updateView(entry: LibraryEntry, updates: Record<string, UpdateInfo>, pe
   const shown = candidate?.version?.trim().replace(/^v(?:ersion)?\s*/i, "") || latest
   if (candidate && compareVersions(latest, installedVersion(entry)) > 0) return { tone: "up", card: `Update ${shown}`, meta: `Update ${shown} available`, available: shown, candidate, packages: usable }
   return { tone: "ok", card: "Up to date", meta: "No newer update is listed" }
+}
+
+/** The native tooltip names a card only when its title is cut off. */
+const nameIfCut = (card: HTMLElement) => {
+  const label = card.querySelector<HTMLElement>(".lib-name")
+  card.title = label && label.scrollWidth > label.clientWidth ? label.textContent || "" : ""
 }
 
 const ageText = (at?: number) => {
@@ -106,7 +113,7 @@ function useCaseArt(entries: LibraryEntry[]) {
 }
 
 export function LibraryPage(props: Props) {
-  const { target, libraries, probes, settings, demo, expanded, setExpanded, updates, pendingUpdates, onCheckUpdate, onQueueUpdate, onDock, tintOn } = props
+  const { target, libraries, probes, settings, demo, expanded, setExpanded, updates, pendingUpdates, onCheckUpdate, onQueueUpdate, tintOn } = props
   const view = libraries[target]
   const other: ConsoleKind = target === "ps5" ? "ps4" : "ps5"
   const name = target.toUpperCase()
@@ -123,17 +130,28 @@ export function LibraryPage(props: Props) {
   const entry = library[index]
   const host = receiverEndpoint(settings, target).host
   const canWrite = demo || hasCapability(probe, "title-icons-v1")
-  const select = (n: number) => { const next = library[n]; if (next) props.onSelect(next.key) }
+  // How the selection last changed: the keyboard brings it into view, the pointer never moves the row under itself.
+  const selectedBy = useRef<"key" | "pointer">("key")
+  const select = (n: number, by: "key" | "pointer" = "key") => { const next = library[n]; if (!next) return; selectedBy.current = by; props.onSelect(next.key) }
+  const hoverTimer = useRef(0)
+  useEffect(() => () => window.clearTimeout(hoverTimer.current), [])
+  const changeCover = (item: LibraryEntry) => {
+    if (canWrite) { setEditing(item); return }
+    const needs = probe?.receiver.expectedVersion ? `receiver ${probe.receiver.expectedVersion}` : "the latest receiver"
+    toast({ tone: "info", title: "Covers can't be changed yet", text: `Load ${needs} on your ${name} to change covers.`, actions: [{ label: "Load receiver", run: () => props.onLoadReceiver(target) }] })
+  }
 
   /* ---------------------------------------------------------------- strip layout (from the PS4 library) */
   const libRef = useRef<HTMLElement>(null)
   const stripRef = useRef<HTMLDivElement>(null)
   const trackRef = useRef<HTMLDivElement>(null)
-  const layout = useRef({ cols: 7, caseW: 150, x: new Spring(0, 170, 24) })
+  const layout = useRef({ cols: 7, caseW: 150, first: 0, x: new Spring(0, 170, 24) })
   const live = useRef({ index, expanded, count: library.length })
   live.current = { index, expanded, count: library.length }
 
-  const place = (instant = false) => {
+  /** Lays out the strip. "follow" keeps the selection one case from the right edge (the PS4 row), "reveal" only
+      scrolls when the selection is out of view, and "stay" keeps the row where the wheel left it. */
+  const place = (instant = false, mode: "follow" | "reveal" | "stay" = "reveal") => {
     const strip = stripRef.current, lib = libRef.current
     if (!strip || !lib) return
     const { index, expanded, count } = live.current
@@ -141,7 +159,7 @@ export function LibraryPage(props: Props) {
     const width = strip.clientWidth - 24
     const caseW = expanded
       ? clamp((width + gap) / Math.max(2, Math.round((width + gap) / (148 + gap))) - gap, 112, 168)
-      : clamp((strip.clientHeight - 24 - 70) / CASE_ASPECT, 104, 208)
+      : clamp((strip.clientHeight - 24 - 58) / CASE_ASPECT, 104, 208)
     const cols = clamp(Math.floor((width + gap) / (caseW + gap)), 2, 14)
     layout.current.cols = cols
     layout.current.caseW = caseW
@@ -149,13 +167,18 @@ export function LibraryPage(props: Props) {
     lib.style.setProperty("--lib-cols", String(cols))
     lib.style.setProperty("--lib-gap", `${gap}px`)
     if (expanded) { layout.current.x.snap(0); return }
-    const first = Math.max(0, Math.min(index - (cols - 2), count - cols))
+    let first = layout.current.first
+    if (mode === "follow") first = index - (cols - 2)
+    else if (mode === "reveal" && index < first) first = index
+    else if (mode === "reveal" && index > first + cols - 1) first = index - (cols - 1)
+    first = clamp(first, 0, Math.max(0, count - cols))
+    layout.current.first = first
     const targetX = -first * (caseW + gap)
     layout.current.x.set(targetX)
     if (instant || !motionOK()) layout.current.x.snap(targetX)
   }
-  useLayoutEffect(() => { place(true) }, [expanded, library.length])
-  useEffect(() => { place() }, [index])
+  useLayoutEffect(() => { place(true, "follow") }, [expanded, library.length])
+  useEffect(() => { place(false, selectedBy.current === "key" ? "follow" : "reveal") }, [index])
   useEffect(() => {
     const observer = new ResizeObserver(() => place(true))
     if (stripRef.current) observer.observe(stripRef.current)
@@ -168,9 +191,21 @@ export function LibraryPage(props: Props) {
     return () => { observer.disconnect(); stop() }
   }, [expanded])
 
-  // The expanded grid scrolls; keep the selected case in view there.
+  // The mouse wheel scrolls the row a case at a time without changing the selection.
+  const wheel = useRef(0)
+  const onWheel = (event: React.WheelEvent) => {
+    if (expanded) return
+    wheel.current += Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY
+    const steps = Math.trunc(wheel.current / 60)
+    if (!steps) return
+    wheel.current -= steps * 60
+    layout.current.first += steps
+    place(false, "stay")
+  }
+
+  // The expanded grid scrolls; keep a case chosen with the keyboard in view there.
   useEffect(() => {
-    if (!expanded || !entry) return
+    if (!expanded || !entry || selectedBy.current !== "key") return
     stripRef.current?.querySelector<HTMLElement>(`.lib-card[data-key="${CSS.escape(entry.key)}"]`)?.scrollIntoView({ block: "nearest", behavior: motionOK() ? "smooth" : "auto" })
   }, [entry?.key, expanded])
 
@@ -225,13 +260,13 @@ export function LibraryPage(props: Props) {
     finally { setRestoring(false) }
   }
 
-  /* ---------------------------------------------------------------- keys and dock */
+  /* ---------------------------------------------------------------- keys */
   const view2 = entry ? updateView(entry, updates, pendingUpdates, eligible) : null
   const anchorOf = (item?: LibraryEntry) => item ? document.querySelector<HTMLElement>(`.lib-card[data-key="${CSS.escape(item.key)}"] [data-case-anchor]`) : null
-  const keys = useRef({ library, index, expanded, entry, view: view2, editing, canWrite, props, toggle, select })
-  keys.current = { library, index, expanded, entry, view: view2, editing, canWrite, props, toggle, select }
+  const keys = useRef({ library, index, expanded, entry, view: view2, editing, props, toggle, select, changeCover })
+  keys.current = { library, index, expanded, entry, view: view2, editing, props, toggle, select, changeCover }
   useEffect(() => setPageKeys(event => {
-    const { library, index, expanded, entry, view, editing, canWrite, props, toggle, select } = keys.current
+    const { library, index, expanded, entry, view, editing, props, toggle, select, changeCover } = keys.current
     if (editing || isTyping()) return
     const k = event.key
     const cols = expanded ? layout.current.cols : 1
@@ -244,22 +279,13 @@ export function LibraryPage(props: Props) {
       document.querySelector<HTMLElement>(`.lib-card[data-key="${CSS.escape(library[next].key)}"]`)?.focus({ preventScroll: true })
       return
     }
-    if (k === "Enter" && entry && canWrite && !(document.activeElement as HTMLElement | null)?.closest?.("button:not(.lib-card), input")) { event.preventDefault(); setEditing(entry); return }
+    if (k === "Enter" && entry && !(document.activeElement as HTMLElement | null)?.closest?.("button:not(.lib-card), input")) { event.preventDefault(); props.onOpenGame(entry, anchorOf(entry)); return }
+    if ((k === "c" || k === "C") && entry) { event.preventDefault(); changeCover(entry); return }
     if (k === " " && entry && view?.candidate && !view.pending) { event.preventDefault(); props.onQueueUpdate(entry, view.candidate, view.packages || [view.candidate], anchorOf(entry)); return }
     if ((k === "i" || k === "I") && entry) { event.preventDefault(); props.onOpenGame(entry, anchorOf(entry)); return }
     if (k === "l" || k === "L") { event.preventDefault(); toggle(); return }
     if (k === "r" || k === "R") { event.preventDefault(); props.onRefresh(props.target) }
   }), [])
-
-  useEffect(() => {
-    const hints: Hint[] = [
-      { key: "Enter", label: "Change cover", disabled: !entry || !canWrite, run: () => entry && setEditing(entry) },
-      { key: "Space", label: view2?.pending ? "Update queued" : view2?.available ? `Queue update ${view2.available}` : "Queue update", disabled: !view2?.candidate || !!view2.pending || props.deliveryBusy, run: () => { if (entry && view2?.candidate) onQueueUpdate(entry, view2.candidate, view2.packages || [view2.candidate], anchorOf(entry)) } },
-      { key: "I", glyph: "I", face: "triangle", label: "Game page", disabled: !entry, run: () => entry && props.onOpenGame(entry, anchorOf(entry)) },
-      { key: "L", glyph: "L", face: "neutral", label: expanded ? "Collapse library" : "Expand library", disabled: !library.length, run: toggle },
-    ]
-    onDock({ context: entry ? <>Library<small>{entry.name}</small></> : "Library", hints })
-  }, [entry?.key, view2?.card, view2?.pending, props.deliveryBusy, canWrite, expanded, library.length, target])
 
   /* ---------------------------------------------------------------- receiver notice */
   const sync = view.sync
@@ -330,26 +356,34 @@ export function LibraryPage(props: Props) {
           </div>
         ) : (
           <>
-            <div ref={stripRef} className="lib-strip" data-case-clip={expanded ? undefined : ""} data-case-scroll={expanded ? "" : undefined}>
+            <div ref={stripRef} className="lib-strip" data-case-clip={expanded ? undefined : ""} data-case-scroll={expanded ? "" : undefined} onWheel={onWheel}>
               <div ref={trackRef} className="lib-track">
                 {library.map((item, n) => {
                   const v = updateView(item, updates, pendingUpdates, eligible)
+                  const installed = installedVersion(item)
                   return (
                     <button
-                      key={item.key} type="button" data-key={item.key} data-hover-case
+                      key={item.key} type="button" data-key={item.key} data-hover-case="select" data-selected={n === index ? "" : undefined}
                       className={`lib-card ${n === index ? "is-selected" : ""}`}
-                      aria-label={`${item.name}, installed ${installedVersion(item) || ""} on your ${name}${canWrite ? ". Change cover" : ""}`}
-                      onPointerEnter={() => select(n)}
-                      onFocus={() => select(n)}
-                      onClick={() => { select(n); if (canWrite) setEditing(item); else props.onOpenGame(item, anchorOf(item)) }}
+                      aria-label={`${item.name}, installed ${installed || ""} on your ${name}${v.tone === "up" ? `, ${v.meta}` : ""}`}
+                      onPointerEnter={event => {
+                        nameIfCut(event.currentTarget)
+                        window.clearTimeout(hoverTimer.current)
+                        hoverTimer.current = window.setTimeout(() => select(n, "pointer"), 100)
+                      }}
+                      onPointerLeave={() => window.clearTimeout(hoverTimer.current)}
+                      onFocus={event => select(n, event.currentTarget.matches(":focus-visible") ? "key" : "pointer")}
+                      onClick={() => { select(n, "pointer"); props.onOpenGame(item, anchorOf(item)) }}
+                      onContextMenu={event => { event.preventDefault(); window.clearTimeout(hoverTimer.current); select(n, "pointer"); changeCover(item) }}
                     >
-                      <CaseAnchor spec={{ key: item.titleId.toUpperCase(), cover: artFor(item), title: item.name, titleId: item.titleId, kind: "library" }} delay={Math.min(n, 14) * 0.035}>
+                      <CaseAnchor spec={{ key: item.titleId.toUpperCase(), cover: artFor(item), title: item.name, titleId: item.titleId, kind: "library" }} delay={Math.min(n, 10) * 0.02}>
                         {v.available && <i className={`update-dot ${v.pending ? "" : "pulse"}`} />}
                         {v.pending && <i className="update-dot" />}
                       </CaseAnchor>
                       <span className="lib-name">{item.name}</span>
-                      <span className="lib-line">{installedVersion(item) ? `Installed ${installedVersion(item)}` : "Installed"}</span>
-                      <span className={`lib-line ${v.tone}`}>{v.card || " "}</span>
+                      <span className="lib-line">
+                        {v.tone === "up" ? <>{installed && !v.pending ? `${installed} · ` : ""}<em>{v.card}</em></> : installed ? `Installed ${installed}` : "Installed"}
+                      </span>
                     </button>
                   )
                 })}
@@ -357,24 +391,19 @@ export function LibraryPage(props: Props) {
             </div>
             {entry && view2 && (
               <div className="lib-info">
-                <div key={entry.key} className="lib-info-main swap">
-                  <strong>{entry.name}</strong>
-                  <div className="lib-meta">
-                    <span>{entry.titleId}</span>
-                    <span>{installedVersion(entry) ? `Installed ${installedVersion(entry)} on your ${name}` : `Installed on your ${name}`}</span>
-                    {entry.requiredFirmware && <span>Needs firmware {entry.requiredFirmware}</span>}
-                    {elsewhere.has(entry.titleId.toUpperCase()) && <span>Also on your {other.toUpperCase()}</span>}
-                    {entry.customIcon && <span>Custom cover</span>}
-                    {view2.meta && <span className={view2.tone === "up" ? "up" : ""}>{view2.meta}</span>}
-                  </div>
-                </div>
+                <p key={entry.key} className="lib-meta swap">
+                  <span>{entry.titleId}</span>
+                  {entry.requiredFirmware && <span>Needs firmware {entry.requiredFirmware}</span>}
+                  {elsewhere.has(entry.titleId.toUpperCase()) && <span>Also on your {other.toUpperCase()}</span>}
+                  {entry.customIcon && <span>Custom cover</span>}
+                  {view2.meta && view2.tone !== "up" && <span>{view2.meta}</span>}
+                </p>
                 <div className="lib-actions">
-                  {view2.candidate && !view2.pending && <button type="button" className="btn sm" disabled={props.deliveryBusy} onClick={event => onQueueUpdate(entry, view2.candidate!, view2.packages || [view2.candidate!], event.currentTarget)}><Icon name="download" />Queue update</button>}
-                  {canWrite && <button type="button" className="btn sm" onClick={() => setEditing(entry)}><Icon name="image" />Change cover</button>}
+                  {view2.candidate && !view2.pending && <button type="button" className="btn sm" disabled={props.deliveryBusy} title="Queue update (Space)" onClick={event => onQueueUpdate(entry, view2.candidate!, view2.packages || [view2.candidate!], event.currentTarget)}><Icon name="download" />Queue update {view2.available}</button>}
+                  {canWrite && <button type="button" className="btn sm" title="Change cover (right-click a case, or C)" onClick={() => setEditing(entry)}><Icon name="image" />Change cover</button>}
                   {entry.customIcon && canWrite && <button type="button" className="btn ghost sm" disabled={restoring} onClick={() => void restore(entry)}>{restoring ? <span className="spinner" /> : <Icon name="undo" />}Restore</button>}
-                  <button type="button" className="btn ghost sm" onClick={() => props.onOpenGame(entry, anchorOf(entry))}>Game page</button>
+                  <button type="button" className="btn ghost sm" title="Game page (click a case, or Enter)" onClick={() => props.onOpenGame(entry, anchorOf(entry))}>Game page</button>
                 </div>
-                <span className="lib-pos">{index + 1} / {library.length}</span>
               </div>
             )}
           </>

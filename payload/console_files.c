@@ -33,6 +33,12 @@ const char *const ct_metadata_roots[] = {
 #endif
 };
 const size_t ct_metadata_root_count = sizeof(ct_metadata_roots) / sizeof(ct_metadata_roots[0]);
+#ifdef CT_PS4
+#define CT_ICON_SLOTS ct_metadata_root_count
+#else
+extern int ps5_icon_path(const char *id,char *path,size_t cap);
+#define CT_ICON_SLOTS (ct_metadata_root_count+1)
+#endif
 
 bool ct_valid_id(const char *id) {
     if (!id || strlen(id) != 9) return false;
@@ -190,24 +196,28 @@ static int ct_backup_dir(const char *root) {
 #endif
     return rc || ct_kind(path)!=2 ? -1 : 0;
 }
-static void ct_icon_paths(const char *root, const char *id, size_t slot, char *target, char *backup) {
-    snprintf(target,512,"%s/%s/icon0.png",ct_metadata_roots[slot],id);
+static int ct_icon_paths(const char *root, const char *id, size_t slot, char *target, char *backup) {
     snprintf(backup,512,"%s/icon-originals/%s-%u.png",root,id,(unsigned)slot);
+    if (slot<ct_metadata_root_count) snprintf(target,512,"%s/%s/icon0.png",ct_metadata_roots[slot],id);
+#ifndef CT_PS4
+    else if (ps5_icon_path(id,target,512)) return -1;
+#endif
+    return 0;
 }
 bool ct_custom_icon(const char *root, const char *id) {
     if (!ct_valid_id(id)) return false;
-    for (size_t i=0;i<ct_metadata_root_count;i++) { char target[512],backup[512]; ct_icon_paths(root,id,i,target,backup); if (ct_kind(backup)==1) return true; }
+    for (size_t i=0;i<CT_ICON_SLOTS;i++) { char backup[512]; snprintf(backup,sizeof(backup),"%s/icon-originals/%s-%u.png",root,id,(unsigned)i); if (ct_kind(backup)==1) return true; }
     return false;
 }
 int ct_icon_get(const char *root, const char *id, bool original, uint8_t *out, size_t *size) {
     if (!ct_valid_id(id)) return -1;
-    if (original) for (size_t i=0;i<ct_metadata_root_count;i++) {
-        char target[512],backup[512]; ct_icon_paths(root,id,i,target,backup);
+    if (original) for (size_t i=0;i<CT_ICON_SLOTS;i++) {
+        char backup[512]; snprintf(backup,sizeof(backup),"%s/icon-originals/%s-%u.png",root,id,(unsigned)i);
         int k=ct_kind(backup); if (k<0) return -1;
         if (k) return ct_read(backup,out,CT_MAX_PNG,size) || !ct_valid_png(out,*size) ? -1 : 0;
     }
-    for (size_t i=0;i<ct_metadata_root_count;i++) {
-        char target[512],backup[512]; ct_icon_paths(root,id,i,target,backup);
+    for (size_t i=0;i<CT_ICON_SLOTS;i++) {
+        char target[512],backup[512]; if (ct_icon_paths(root,id,i,target,backup)) continue;
         if (!ct_read(target,out,CT_MAX_PNG,size) && ct_valid_png(out,*size)) return 0;
     }
     return -1;
@@ -218,10 +228,15 @@ int ct_icon_change(const char *root, const char *platform, const char *id,
     if (!ct_valid_id(id) || (!restore && !ct_valid_png(png,size))) { error="Use a square PNG from 256 to 1024 pixels, at most 2 MiB, and a valid title ID."; goto fail; }
     if (ct_backup_dir(root)) { error="The receiver could not open its original-icon folder."; goto fail; }
     uint8_t *original=malloc(CT_MAX_PNG); if (!original) { error="Not enough memory to save the icon."; goto fail; }
-    bool selected[8]={0}, backed=false, durable=true; unsigned count=0, written=0;
+    bool selected[9]={0}, backed=false, durable=true; unsigned count=0, written=0;
+    char targets[9][512],backups[9][512];
     /* Preflight every existing copy and save originals before changing any icon. */
-    for (size_t i=0;i<ct_metadata_root_count;i++) {
-        char target[512],backup[512]; ct_icon_paths(root,id,i,target,backup);
+    for (size_t i=0;i<CT_ICON_SLOTS;i++) {
+        char *target=targets[i],*backup=backups[i];
+        if (ct_icon_paths(root,id,i,target,backup)) {
+            if (restore && ct_kind(backup)==1) { error="An original icon still belongs to unavailable storage. Reconnect it and retry."; goto failed_buffer; }
+            continue;
+        }
         int tk=ct_kind(target), bk=ct_kind(backup); size_t length=0;
         if (tk<0 || bk<0 || tk==2 || bk==2) { error="An icon metadata path is linked or inaccessible."; goto failed_buffer; }
         if (restore ? !bk : !tk) continue;
@@ -231,8 +246,8 @@ int ct_icon_change(const char *root, const char *platform, const char *id,
         selected[i]=true; count++;
     }
     if (!count) { error=restore ? "No saved original icon is available for this title." : "Installed icon metadata is unavailable."; goto failed_buffer; }
-    for (size_t i=0;i<ct_metadata_root_count;i++) if (selected[i]) {
-        char target[512],backup[512]; ct_icon_paths(root,id,i,target,backup); size_t length=size; const uint8_t *bytes=png;
+    for (size_t i=0;i<CT_ICON_SLOTS;i++) if (selected[i]) {
+        const char *target=targets[i],*backup=backups[i]; size_t length=size; const uint8_t *bytes=png;
         if (restore) { if (ct_read(backup,original,CT_MAX_PNG,&length) || !ct_valid_png(original,length)) break; bytes=original; }
         if (ct_kind(target)!=1) break;
         int rc=ct_atomic_write(target,bytes,length);
@@ -241,8 +256,8 @@ int ct_icon_change(const char *root, const char *platform, const char *id,
         if (rc>0) { durable=false; break; }
     }
     bool cleanup=true;
-    if (restore && written==count && durable) for (size_t i=0;i<ct_metadata_root_count;i++) if (selected[i]) {
-        char target[512],backup[512]; ct_icon_paths(root,id,i,target,backup); if (ct_remove(backup)) cleanup=false;
+    if (restore && written==count && durable) for (size_t i=0;i<CT_ICON_SLOTS;i++) if (selected[i]) {
+        if (ct_remove(backups[i])) cleanup=false;
     }
     free(original);
     if (!written) { error="Could not replace the icon. Originals are preserved; retry the operation."; goto fail; }
@@ -257,6 +272,91 @@ failed_buffer:
 fail:
     snprintf(out,cap,"%s",error); return -1;
 }
+
+#ifdef CT_PS4
+/* A PS4 title keeps its icon twice in each metadata folder: icon0.png and icon0.dds, which the
+   home screen draws (DXT1, so a mask's transparent corners are its one-bit alpha). Some titles add
+   per-language copies, icon0_00 to icon0_30. Every copy present is replaced; every original is
+   saved before any copy changes, and restore puts back whatever was saved. */
+#define CT_ICON_VARIANTS 32u
+static uint32_t ct_le32(const uint8_t *p) { return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24); }
+/* New icons must look like the ones the console ships: square DXT1, one level, 256 to 1024 px. */
+bool ct_valid_dds(const uint8_t *p, size_t n) {
+    if (!p || n<128 || n>CT_MAX_DDS || memcmp(p,"DDS ",4) || ct_le32(p+4)!=124) return false;
+    uint32_t h=ct_le32(p+12), w=ct_le32(p+16), mips=ct_le32(p+28);
+    if (w!=h || (w!=256 && w!=512 && w!=1024) || mips>1 || ct_le32(p+76)!=32 || !(ct_le32(p+80)&4u) || memcmp(p+84,"DXT1",4)) return false;
+    return n==128u+(size_t)(w/4u)*(h/4u)*8u;
+}
+/* Originals only need to be DDS files; games may ship other block formats. */
+static bool ct_dds_file(const uint8_t *p, size_t n) { return p && n>=128 && n<=CT_MAX_PNG && !memcmp(p,"DDS ",4) && ct_le32(p+4)==124; }
+typedef struct { char target[160]; char backup[192]; bool dds; } CtIconCopy;
+static void ct_copy_paths(CtIconCopy *c, const char *root, const char *id, size_t slot, unsigned variant, bool dds) {
+    const char *ext=dds?"dds":"png";
+    if (!variant) snprintf(c->target,sizeof(c->target),"%s/%s/icon0.%s",ct_metadata_roots[slot],id,ext);
+    else snprintf(c->target,sizeof(c->target),"%s/%s/icon0_%02u.%s",ct_metadata_roots[slot],id,variant-1,ext);
+    /* The base PNG keeps the name older receivers used, so their changes restore too. */
+    if (!variant) snprintf(c->backup,sizeof(c->backup),"%s/icon-originals/%s-%u.%s",root,id,(unsigned)slot,ext);
+    else snprintf(c->backup,sizeof(c->backup),"%s/icon-originals/%s-%u-%02u.%s",root,id,(unsigned)slot,variant-1,ext);
+    c->dds=dds;
+}
+int ct_ps4_icon_change(const char *root, const char *id, const uint8_t *png, size_t png_size,
+    const uint8_t *dds, size_t dds_size, bool restore, char *out, size_t cap) {
+    const char *error="Installed icon metadata is unavailable.";
+    CtIconCopy *copies=NULL; uint8_t *original=NULL;
+    size_t count=0; unsigned written=0, home=0; bool backed=false, durable=true;
+    if (!ct_valid_id(id) || (!restore && (!ct_valid_png(png,png_size) || (dds && !ct_valid_dds(dds,dds_size))))) {
+        error="Use a square PNG from 256 to 1024 pixels (at most 2 MiB), a matching DXT1 DDS, and a valid title ID."; goto fail;
+    }
+    if (ct_backup_dir(root)) { error="The receiver could not open its original-icon folder."; goto fail; }
+    copies=calloc(ct_metadata_root_count*CT_ICON_VARIANTS*2u,sizeof(*copies)); original=malloc(CT_MAX_PNG);
+    if (!copies || !original) { error="Not enough memory to save the icon."; goto fail; }
+    /* Preflight every copy and save originals before changing any icon. */
+    for (size_t slot=0;slot<ct_metadata_root_count;slot++) {
+        char folder[160]; snprintf(folder,sizeof(folder),"%s/%s",ct_metadata_roots[slot],id);
+        int fk=ct_kind(folder);
+        if (fk<0 || fk==1) { error="An icon metadata path is linked or inaccessible."; goto fail; }
+        if (!fk && !restore) continue;
+        for (unsigned v=0;v<CT_ICON_VARIANTS;v++) for (int kind=0;kind<2;kind++) {
+            bool is_dds=kind==1;
+            if (!restore && is_dds && !dds) continue;
+            CtIconCopy *c=&copies[count]; ct_copy_paths(c,root,id,slot,v,is_dds);
+            int tk=fk ? ct_kind(c->target) : 0, bk=ct_kind(c->backup); size_t length=0;
+            if (tk<0 || bk<0 || tk==2 || bk==2) { error="An icon metadata path is linked or inaccessible."; goto fail; }
+            if (restore ? !bk : !tk) continue;
+            if (tk!=1) { error="An original icon still belongs to unavailable storage. Reconnect it and retry."; goto fail; }
+            if (ct_read(bk ? c->backup : c->target,original,CT_MAX_PNG,&length) || !(is_dds ? ct_dds_file(original,length) : ct_valid_png(original,length))) {
+                error="An original icon is invalid or unreadable; no originals were overwritten."; goto fail;
+            }
+            if (!restore && !bk) { if (ct_atomic_write(c->backup,original,length)) { error="Could not save the original icon."; goto fail; } backed=true; }
+            count++;
+        }
+    }
+    if (!count) { error=restore ? "No saved original icon is available for this title." : "Installed icon metadata is unavailable."; goto fail; }
+    for (size_t i=0;i<count;i++) {
+        const CtIconCopy *c=&copies[i]; size_t length=c->dds ? dds_size : png_size; const uint8_t *bytes=c->dds ? dds : png;
+        if (restore) { if (ct_read(c->backup,original,CT_MAX_PNG,&length)) break; bytes=original; }
+        if (ct_kind(c->target)!=1) break;
+        int rc=ct_atomic_write(c->target,bytes,length);
+        if (rc<0) break;
+        written++; if (c->dds) home++;
+        if (rc>0) { durable=false; break; }
+    }
+    bool cleanup=true;
+    if (restore && written==count && durable) for (size_t i=0;i<count;i++) if (ct_remove(copies[i].backup)) cleanup=false;
+    free(original); free(copies); original=NULL; copies=NULL;
+    if (!written) { error="Could not replace the icon. Originals are preserved; retry the operation."; goto fail; }
+    char message[256];
+    if (written!=count || !durable) snprintf(message,sizeof(message),"%u of %u icon copies written. Originals are preserved; retry before restarting your PS4.",written,(unsigned)count);
+    else if (!cleanup) snprintf(message,sizeof(message),"Original icons restored; some saved copies could not be removed. Retry before restarting your PS4.");
+    else if (restore) snprintf(message,sizeof(message),"Original icons restored. Restart your PS4 to see them.");
+    else snprintf(message,sizeof(message),"%u icon copies saved%s. Restart your PS4 to see the new icons.",written,home ? ", including the home screen's" : "");
+    int n=snprintf(out,cap,"{\"titleId\":\"%s\",\"written\":%u,\"backedUp\":%s,\"refresh\":\"restart-required\",\"message\":\"%s\"}",id,written,backed?"true":"false",message);
+    return n<0 || (size_t)n>=cap ? -1 : 0;
+fail:
+    free(original); free(copies);
+    snprintf(out,cap,"%s",error); return -1;
+}
+#endif
 void ct_json_quote(char *out, size_t cap, const char *text) {
     size_t n=0; if (cap<3) return; out[n++]='"';
     for (;*text && n+7<cap;text++) {

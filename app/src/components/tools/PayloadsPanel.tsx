@@ -4,31 +4,34 @@
    Built-in receivers come first; added files are kept by the app.
    ===================================================================== */
 import { open as openDialog } from "@tauri-apps/plugin-dialog"
-import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react"
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode } from "react"
 import { Collapse } from "../Collapse"
 import { Seg } from "../Controls"
 import { Icon } from "../Icon"
-import type { Hint } from "../Shell"
 import { toast } from "../toasts"
 import { addPayloads, listPayloads, removePayload, sendPayload, updatePayload } from "@/lib/console-api"
 import { loaderEndpoint } from "@/lib/console-helpers"
-import type { PayloadEntry, PayloadTarget } from "@/lib/console-types"
-import { errorText, fmtBytes } from "@/lib/format"
+import type { PayloadEntry, PayloadSendResult, PayloadTarget } from "@/lib/console-types"
+import { errorText, fmtBytes, fmtSpeed } from "@/lib/format"
 import { isTyping, setPanelKeys } from "@/lib/keys"
 import { clamp } from "@/lib/motion"
 import type { ConsoleKind, Settings } from "@/types"
 
-type Props = { target: ConsoleKind; settings: Settings; demo: boolean; onReceiverLoaded: (target: ConsoleKind) => void; onHints: (hints: Hint[]) => void }
-type SessionSend = { id: string; name: string; at: number; result: string; ok: boolean }
+type Props = { target: ConsoleKind; settings: Settings; demo: boolean; onReceiverLoaded: (target: ConsoleKind) => void }
+type SessionSend = { id: string; name: string; at: number; result: string; ok: boolean; totalMs?: number; bytesPerSecond?: number | null }
+type Traced = PayloadSendResult & { at: number }
 
 const PREVIEW = "Offline preview: nothing was sent to the console."
 const time = (at: number) => new Date(at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+const fmtMs = (ms: number) => ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(2)} s`
+/** One monospace line of header facts; raw payloads have none to show. */
+const techLine = (entry: PayloadEntry) => entry.elf ? `${entry.elf.class} ${entry.elf.endian} · ${entry.elf.machine} · ${entry.elf.kind} · entry ${entry.elf.entry}` : "Raw binary, no ELF header"
 const when = (at: number) => {
   const day = new Date(at), today = new Date()
   return day.toDateString() === today.toDateString() ? time(at) : day.toLocaleDateString([], { month: "short", day: "numeric" })
 }
 
-export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onHints }: Props) {
+export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Props) {
   const endpoint = loaderEndpoint(settings, target)
   const name = target.toUpperCase()
   const loader = target === "ps4" ? "GoldHEN BinLoader" : "ELF loader"
@@ -40,6 +43,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onHint
   const [editing, setEditing] = useState("")
   const [removing, setRemoving] = useState("")
   const [history, setHistory] = useState<SessionSend[]>([])
+  const [traces, setTraces] = useState<Record<string, Traced>>({})
   const fileRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
 
@@ -79,7 +83,8 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onHint
     try {
       const result = await sendPayload({ id: entry.id, target, host: endpoint.host, port: endpoint.port, demo })
       setPayloads(old => old.map(item => item.id === entry.id ? { ...item, lastSentAt: Date.now(), lastResult: result.message } : item))
-      setHistory(old => [{ id: `${entry.id}-${Date.now()}`, name: entry.name, at: Date.now(), result: result.message, ok: true }, ...old].slice(0, 20))
+      setHistory(old => [{ id: `${entry.id}-${Date.now()}`, name: entry.name, at: Date.now(), result: result.message, ok: true, totalMs: result.totalMs, bytesPerSecond: result.bytesPerSecond }, ...old].slice(0, 20))
+      setTraces(old => ({ ...old, [entry.id]: { ...result, at: Date.now() } }))
       toast({ tone: "success", title: entry.builtin && result.verified ? `${name} receiver is running` : `${entry.name} sent`, text: result.message })
       if (entry.builtin && result.verified) onReceiverLoaded(target)
     } catch (reason) {
@@ -102,7 +107,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onHint
     finally { setBusy("") }
   }
 
-  /* ---------------------------------------------------------------- keys and dock */
+  /* ---------------------------------------------------------------- keys */
   const live = useRef({ shown, current, editing, removing, send, choose })
   live.current = { shown, current, editing, removing, send, choose }
   useEffect(() => setPanelKeys(event => {
@@ -123,13 +128,6 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onHint
     if (k === "Delete" && current && !current.builtin) { event.preventDefault(); setRemoving(current.id); setEditing(""); return true }
     return false
   }), [])
-  useEffect(() => {
-    onHints([
-      { key: "Enter", label: current ? `Send ${current.name}` : "Send", disabled: !current || !endpoint.host || !!busy, run: () => current && void send(current) },
-      { key: "A", glyph: "A", face: "square", label: "Add payloads", run: () => void choose() },
-      ...(current && !current.builtin ? [{ key: "R", glyph: "R", face: "neutral", label: "Rename", run: () => setEditing(current.id) } as Hint, { key: "Delete", label: "Remove", run: () => setRemoving(current.id) } as Hint] : []),
-    ])
-  }, [current?.id, endpoint.host, busy])
 
   /* ---------------------------------------------------------------- render */
   return (
@@ -160,16 +158,26 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onHint
                 <span className="pl-main">
                   <strong>{entry.name}</strong>
                   <span>{entry.fileName}&ensp;{fmtBytes(entry.size)}{entry.builtin ? <>&ensp;Built in</> : entry.target === "any" ? <>&ensp;Any console</> : null}</span>
+                  <span className="pl-tech">{techLine(entry)}</span>
                 </span>
                 <span className={`pl-last ${failed ? "fail" : ""}`}>
                   {entry.lastSentAt ? <><b>Sent {when(entry.lastSentAt)}</b><small>{entry.lastResult}</small></> : <b>Not sent yet</b>}
                 </span>
+                {isCurrent && !entry.builtin && (
+                  <span className="pl-tools">
+                    <button type="button" className="btn sm ghost icon" aria-label={`Rename ${entry.name}`} title="Rename (R)" aria-expanded={editing === entry.id} onClick={event => { event.stopPropagation(); setRemoving(""); setEditing(editing === entry.id ? "" : entry.id) }}><Icon name="pencil" /></button>
+                    <button type="button" className="btn sm ghost icon" aria-label={`Remove ${entry.name}`} title="Remove (Delete)" aria-expanded={removing === entry.id} onClick={event => { event.stopPropagation(); setEditing(""); setRemoving(removing === entry.id ? "" : entry.id) }}><Icon name="trash" /></button>
+                  </span>
+                )}
                 <button type="button" className={`btn sm ${isCurrent ? "primary" : ""} pl-send`} disabled={!endpoint.host || !!busy} onClick={event => { event.stopPropagation(); setSelected(entry.id); void send(entry) }}>
                   {busy === entry.id ? <span className="spinner" /> : <Icon name="send" />}{busy === entry.id ? "Sending" : "Send"}
                 </button>
               </div>
               <Collapse open={editing === entry.id} className="pl-drawer">
                 <PayloadEditor entry={entry} busy={busy === entry.id} onCancel={() => setEditing("")} onSave={draft => void save(entry, draft)} />
+              </Collapse>
+              <Collapse open={isCurrent && editing !== entry.id && removing !== entry.id} className="pl-drawer">
+                <PayloadSheet entry={entry} destination={endpoint.host ? `${endpoint.host}:${endpoint.port}` : ""} loader={loader} trace={traces[entry.id]} sending={busy === entry.id} />
               </Collapse>
               <Collapse open={removing === entry.id} className="pl-drawer">
                 <div className="remove-confirm">
@@ -194,9 +202,52 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onHint
         <details className="tech pl-log">
           <summary>This session: {history.length === 1 ? "1 send" : `${history.length} sends`}, last {history[0].name} at {time(history[0].at)}</summary>
           <div className="tech-body">
-            {history.map(item => <p key={item.id} className={item.ok ? "" : "fail"}><span>{time(item.at)}</span>{item.name}: {item.result}</p>)}
+            {history.map(item => <p key={item.id} className={item.ok ? "" : "fail"}><span>{time(item.at)}</span>{item.name}: {item.result}{item.totalMs != null ? ` (${fmtMs(item.totalMs)}${item.bytesPerSecond ? `, ${fmtSpeed(item.bytesPerSecond)}` : ""})` : ""}</p>)}
           </div>
         </details>
+      )}
+    </div>
+  )
+}
+
+/** Header facts for the selected payload and, after a send, what the send measured. */
+function PayloadSheet({ entry, destination, loader, trace, sending }: { entry: PayloadEntry; destination: string; loader: string; trace?: Traced; sending: boolean }) {
+  const elf = entry.elf
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(entry.sha256); toast({ tone: "success", title: "SHA-256 copied", text: entry.sha256 }) }
+    catch (reason) { toast({ tone: "error", title: "The hash wasn't copied", text: errorText(reason) }) }
+  }
+  const row = (key: string, value: ReactNode) => <div className="pl-kv"><span className="k">{key}</span><span className="v">{value}</span></div>
+  return (
+    <div className="pl-sheet">
+      <div className="pl-facts">
+        {row("Format", elf ? `${elf.class} ${elf.endian} · ${elf.kind}` : "Raw binary")}
+        {row("Machine", elf?.machine || "–")}
+        {row("Entry point", elf?.entry || "–")}
+        {row("Segments", elf ? `${elf.loadable} of ${elf.segments} loadable · ${fmtBytes(elf.loadableBytes)} in memory` : "–")}
+        {row("Size", `${fmtBytes(entry.size)} (${entry.size.toLocaleString()} bytes)`)}
+        {row("Sends to", destination ? `${destination} · ${loader}` : "No console address")}
+        <div className="pl-kv wide"><span className="k">SHA-256</span><span className="v hash">{entry.sha256}<button type="button" className="btn sm ghost icon" aria-label="Copy SHA-256" title="Copy" onClick={() => void copy()}><Icon name="copy" /></button></span></div>
+      </div>
+      {(trace || sending) && (
+        <div className="pl-trace" aria-live="polite">
+          <div className="pl-trace-head">
+            <strong>{sending ? "Sending" : "Last send"}</strong>
+            {trace && !sending && <span>{time(trace.at)} · {fmtMs(trace.totalMs ?? 0)} total{trace.bytesPerSecond ? ` · ${fmtBytes(trace.bytes)} at ${fmtSpeed(trace.bytesPerSecond)}` : ""}{trace.verified ? " · verified" : ""}</span>}
+          </div>
+          {sending ? <p className="pl-trace-wait"><span className="spinner" />Waiting for the loader and the console.</p> : (
+            <ol>
+              {(trace?.steps || []).map((step, n) => (
+                <li key={n} className={step.ok ? "" : "fail"}>
+                  <Icon name={step.ok ? "check" : "x"} />
+                  <span className="l">{step.label}</span>
+                  <span className="d">{step.detail}</span>
+                  <span className="t">{fmtMs(step.ms)}</span>
+                </li>
+              ))}
+            </ol>
+          )}
+        </div>
       )}
     </div>
   )

@@ -17,7 +17,20 @@ pub(super) struct LibraryTitle {
     required_firmware: Option<String>,
     content_id: Option<String>,
     platform: String,
+    sources: Vec<String>,
 }
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct LibraryDiagnostics {
+    appdb: String,
+    counts: HashMap<String, u32>,
+    skipped: Vec<LibrarySkipped>,
+    skipped_truncated: bool,
+    budget_exceeded: bool,
+    elapsed_ms: Option<u64>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct LibrarySkipped { id: String, reason: String }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ConsoleLibrarySnapshot {
@@ -27,6 +40,7 @@ pub(super) struct ConsoleLibrarySnapshot {
     truncated: bool,
     errors: Vec<String>,
     metadata_warnings: Vec<String>,
+    diagnostics: Option<LibraryDiagnostics>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,15 +56,18 @@ pub(super) struct IconWriteResult {
 pub(super) struct ConsoleStorage { label: String, path: String, total_bytes: u64, free_bytes: u64 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(super) struct InstalledTheme { content_id: String, title: String }
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ConsoleThemes { themes: Vec<InstalledTheme>, active_content_id: Option<String>, truncated: bool }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct ConsoleMemory { total_bytes: u64, free_bytes: u64 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ConsoleNetwork { ip: Option<String>, mac: Option<String> }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct InstalledTheme { content_id: String, title: String }
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct ConsoleThemes { themes: Vec<InstalledTheme>, active_content_id: Option<String>, truncated: bool }
+pub(super) struct ConsoleMount { from: String, on: String, r#type: String, read_only: bool, total_bytes: u64, free_bytes: u64 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ConsoleSystemInfo {
@@ -67,8 +84,14 @@ pub(super) struct ConsoleSystemInfo {
     memory: Option<ConsoleMemory>,
     network: Option<ConsoleNetwork>,
     running_title_id: Option<String>,
+    /// Every mounted filesystem; receivers before diagnostics-v1 omit it.
+    #[serde(default)]
+    mounts: Option<Vec<ConsoleMount>>,
     capabilities: Vec<String>,
     extras: HashMap<String, String>,
+}
+fn storage_path(path: &str) -> bool {
+    matches!(path,"/user"|"/data"|"/mnt/ext0"|"/mnt/ext1") || path.strip_prefix("/mnt/usb").is_some_and(|n| n.len()==1 && n.as_bytes()[0].is_ascii_digit())
 }
 
 fn label(target: &str) -> Result<&'static str, String> {
@@ -86,7 +109,7 @@ fn id_request(id: &str) -> Result<Vec<u8>, String> {
     }
     let mut result=b.to_vec(); result.push(0); Ok(result)
 }
-async fn exchange(socket: &mut TcpStream, command: u8, body: &[u8], max: usize) -> Result<Vec<u8>, String> {
+pub(super) async fn exchange(socket: &mut TcpStream, command: u8, body: &[u8], max: usize) -> Result<Vec<u8>, String> {
     tokio::time::timeout(Duration::from_secs(30), async {
         let mut header=[0u8;5]; header[0]=command; header[1..].copy_from_slice(&(body.len() as u32).to_le_bytes());
         socket.write_all(&header).await.map_err(|_| "The receiver connection closed. Reload the receiver and retry.".to_string())?;
@@ -101,13 +124,13 @@ async fn exchange(socket: &mut TcpStream, command: u8, body: &[u8], max: usize) 
             let value=serde_json::from_slice::<Value>(&bytes).ok();
             return Err(clean(value.as_ref().and_then(|v| v["error"].as_str()).unwrap_or(&text)));
         }
-        let ok_reply=matches!(command,0x63|0x67|0x68);
+        let ok_reply=command==0x63;
         if (ok_reply && header[0]!=1) || (!ok_reply && header[0]!=3) { return Err("The receiver returned an unexpected response code.".into()); }
         if size>max { return Err("The receiver response exceeds its size limit.".into()); }
         Ok(bytes)
     }).await.map_err(|_| "The receiver did not respond in time. Retry the operation.".to_string())?
 }
-async fn checked(target: &str, host: &str, port: u16, capability: &str, action: &str) -> Result<(TcpStream, Value), String> {
+pub(super) async fn checked(target: &str, host: &str, port: u16, capability: &str, action: &str) -> Result<(TcpStream, Value), String> {
     let console=label(target)?;
     validate_receiver_candidate(host.trim(),port)?;
     let mut socket=tokio::time::timeout(Duration::from_secs(5),TcpStream::connect((host.trim(),port))).await
@@ -142,7 +165,7 @@ fn validate_png(bytes: &[u8]) -> Result<(), String> {
 }
 fn icon_result(bytes: &[u8], id: &str) -> Result<IconWriteResult,String> {
     let mut result: IconWriteResult=serde_json::from_slice(bytes).map_err(|_| "The receiver returned an invalid icon-write result.".to_string())?;
-    if result.title_id!=id || result.written==0 || result.written>16 || !matches!(result.refresh.as_str(),"live"|"restart-required") || result.message.trim().is_empty() {
+    if result.title_id!=id || result.written==0 || result.written>640 || !matches!(result.refresh.as_str(),"live"|"restart-required") || result.message.trim().is_empty() {
         return Err("The receiver returned an invalid icon-write result.".into());
     }
     result.message=clean(&result.message); Ok(result)
@@ -160,51 +183,30 @@ pub(super) async fn set_title_icon(target: String, host: String, port: u16, titl
     if png.len()>MAX_PNG.div_ceil(3)*4 { return Err("The icon exceeds the 2 MiB limit.".into()); }
     let bytes=BASE64.decode(png).map_err(|_| "The icon must contain base64 PNG bytes without a data URL prefix.".to_string())?;
     let bytes=tokio::task::spawn_blocking(move || { validate_png(&bytes)?; Ok::<_,String>(bytes) }).await.map_err(|_| "Could not validate the icon.".to_string())??;
+    let (mut socket,config)=checked(&target,&host,port,"title-icons-v1","change icons").await?;
+    // The PS4 home screen draws icon0.dds, so v2 receivers get that copy too.
+    if target=="ps4" && config["capabilities"].as_array().is_some_and(|caps| caps.iter().any(|c| c=="title-icons-v2")) {
+        let dds=tokio::task::spawn_blocking(move || icon_dds_from_png(&bytes).map(|dds| (bytes,dds))).await.map_err(|_| "Could not convert the icon.".to_string())??;
+        body.extend_from_slice(&(dds.0.len() as u32).to_le_bytes());
+        body.extend_from_slice(&dds.0);
+        body.extend_from_slice(&dds.1);
+        return icon_result(&exchange(&mut socket,0x6f,&body,4096).await?,&title_id);
+    }
     body.extend_from_slice(&bytes);
-    let (mut socket,_)=checked(&target,&host,port,"title-icons-v1","change icons").await?;
     icon_result(&exchange(&mut socket,0x61,&body,4096).await?,&title_id)
+}
+/// The `icon0.dds` copy of a title icon: square, a power of two from 256 to 1024 (512 otherwise).
+fn icon_dds_from_png(png: &[u8]) -> Result<Vec<u8>,String> {
+    let image=image::load_from_memory_with_format(png,image::ImageFormat::Png).map_err(|_| "The PNG image could not be decoded.".to_string())?;
+    let side=image.width();
+    let image=if matches!(side,256|512|1024) && image.height()==side { image } else { image.resize_exact(512,512,image::imageops::FilterType::Lanczos3) };
+    Ok(super::ps4_theme::icon_dds(&image.to_rgba8()))
 }
 #[tauri::command]
 pub(super) async fn restore_title_icon(target: String, host: String, port: u16, title_id: String) -> Result<IconWriteResult,String> {
     let body=id_request(&title_id)?;
     let (mut socket,_)=checked(&target,&host,port,"title-icons-v1","restore icons").await?;
     icon_result(&exchange(&mut socket,0x62,&body,4096).await?,&title_id)
-}
-fn theme_request(content_id: &str) -> Result<Vec<u8>,String> {
-    let valid = content_id.len()==36 && content_id.is_char_boundary(36) && content_id.as_bytes()[6]==b'-' && content_id.as_bytes()[16]==b'_' && content_id.as_bytes()[19]==b'-'
-        && content_id.bytes().enumerate().all(|(i,b)| matches!(i,6|16|19) || b.is_ascii_uppercase() || b.is_ascii_digit() || b==b'_');
-    if !valid { return Err("That is not a PS4 theme content ID.".into()); }
-    let mut body=content_id.as_bytes().to_vec(); body.push(0); Ok(body)
-}
-#[tauri::command]
-pub(super) async fn list_console_themes(host: String, port: u16) -> Result<ConsoleThemes,String> {
-    let (mut socket,_)=checked("ps4",&host,port,"themes-v1","list installed themes").await?;
-    let value: Value=serde_json::from_slice(&exchange(&mut socket,0x66,&[],256*1024).await?).map_err(|_| "The receiver returned an invalid theme list.".to_string())?;
-    let items=value["themes"].as_array().ok_or("The receiver returned an invalid theme list.")?;
-    let mut themes=Vec::new();
-    for item in items.iter().take(128) {
-        let Some(id)=item["contentId"].as_str().filter(|id| theme_request(id).is_ok()) else { continue };
-        let title: String=item["title"].as_str().unwrap_or("").chars().filter(|c| !c.is_control()).take(127).collect();
-        themes.push(InstalledTheme { content_id: id.into(), title: if title.trim().is_empty() { id[20..].into() } else { title } });
-    }
-    // The console stores the selected theme as its 16-character label.
-    let active=value["active"].as_str().unwrap_or("");
-    let active_content_id=(!active.is_empty()).then(|| themes.iter().find(|t| t.content_id[20..]==*active).map(|t| t.content_id.clone())).flatten();
-    Ok(ConsoleThemes { themes, active_content_id, truncated: value["truncated"].as_bool().unwrap_or(false) })
-}
-#[tauri::command]
-pub(super) async fn apply_console_theme(host: String, port: u16, content_id: String) -> Result<String,String> {
-    let body=theme_request(&content_id)?;
-    let (mut socket,_)=checked("ps4",&host,port,"themes-v1","apply themes").await?;
-    exchange(&mut socket,0x67,&body,4096).await?;
-    Ok("Theme selected on the PS4.".into())
-}
-#[tauri::command]
-pub(super) async fn remove_console_theme(host: String, port: u16, content_id: String) -> Result<String,String> {
-    let body=theme_request(&content_id)?;
-    let (mut socket,_)=checked("ps4",&host,port,"themes-v1","remove themes").await?;
-    exchange(&mut socket,0x68,&body,4096).await?;
-    Ok("Theme removed from the PS4.".into())
 }
 #[tauri::command]
 pub(super) async fn refresh_console_shell(target: String, host: String, port: u16) -> Result<String,String> {
@@ -217,9 +219,10 @@ pub(super) async fn refresh_console_shell(target: String, host: String, port: u1
 #[tauri::command]
 pub(super) async fn console_system_info(target: String, host: String, port: u16) -> Result<ConsoleSystemInfo,String> {
     let (mut socket,config)=checked(&target,&host,port,"system-info-v1","read system information").await?;
-    let mut info: ConsoleSystemInfo=serde_json::from_slice(&exchange(&mut socket,0x64,&[],64*1024).await?).map_err(|_| "The receiver returned invalid system information.".to_string())?;
+    let mut info: ConsoleSystemInfo=serde_json::from_slice(&exchange(&mut socket,0x64,&[],256*1024).await?).map_err(|_| "The receiver returned invalid system information.".to_string())?;
     if info.target!=target || config["version"]!=info.receiver_version || info.storage.len()>16 || info.capabilities.len()>64 || info.extras.len()>64 ||
-        info.storage.iter().any(|s| s.free_bytes>s.total_bytes || !matches!(s.path.as_str(),"/user"|"/data"|"/mnt/ext0"|"/mnt/ext1")) ||
+        info.storage.iter().any(|s| s.free_bytes>s.total_bytes || !storage_path(&s.path)) ||
+        info.mounts.as_ref().is_some_and(|m| m.len()>256 || m.iter().any(|m| m.free_bytes>m.total_bytes)) ||
         info.memory.as_ref().is_some_and(|m| m.free_bytes>m.total_bytes) ||
         info.running_title_id.as_ref().is_some_and(|id| id_request(id).is_err()) ||
         [info.cpu_temp_c,info.soc_temp_c].into_iter().flatten().any(|t| !t.is_finite()) {
@@ -281,10 +284,42 @@ fn decode_metadata(id: &str, bytes: &[u8]) -> Result<Metadata,String> {
     }) };
     Ok(Metadata { name,version:string("contentVersion").or_else(|| string("masterVersion")),firmware,content:string("contentId") })
 }
+const LIBRARY_SOURCES: [&str; 4] = ["appdb", "app", "appmeta", "shadowmount"];
+fn library_details(response: &Value) -> Result<(HashMap<String, Vec<String>>, Option<LibraryDiagnostics>), String> {
+    let mut sources=HashMap::new();
+    if let Some(value)=response.get("sources") {
+        let items=value.as_object().ok_or("The library sources are malformed.")?;
+        if items.len()>2048 { return Err("The library sources exceed the title limit.".into()); }
+        for (id,value) in items {
+            if !title_id(id) { continue; }
+            let names=value.as_array().ok_or("The title sources are malformed.")?;
+            if names.len()>16 || names.iter().any(|name| !name.is_string()) { return Err("The title sources are malformed.".into()); }
+            sources.insert(id.clone(),LIBRARY_SOURCES.iter().filter(|name| names.iter().any(|v| v.as_str()==Some(**name))).map(|name| (*name).into()).collect());
+        }
+    }
+    let diagnostics=if let Some(value)=response.get("diagnostics").filter(|v| !v.is_null()) {
+        let status=value["appdb"].as_str().filter(|s| *s=="ok" || s.starts_with("unavailable:")).ok_or("The library diagnostics have no app.db status.")?;
+        let mut counts=HashMap::new();
+        for source in LIBRARY_SOURCES {
+            let count=value["counts"][source].as_u64().filter(|n| *n<=2048).ok_or("The library source count is invalid.")?;
+            counts.insert(source.into(),count as u32);
+        }
+        let skipped=value["skipped"].as_array().ok_or("The library skipped list is malformed.")?;
+        let entries=skipped.iter().take(32).map(|item| {
+            Ok(LibrarySkipped { id:clean(item["id"].as_str().ok_or("A skipped title is malformed.")?),
+                reason:clean(item["reason"].as_str().ok_or("A skipped reason is malformed.")?) })
+        }).collect::<Result<Vec<_>,String>>()?;
+        Some(LibraryDiagnostics { appdb:clean(status),counts,skipped:entries,
+            skipped_truncated:skipped.len()>32 || value["skippedTruncated"].as_bool().unwrap_or(false),
+            budget_exceeded:value["budgetExceeded"].as_bool().unwrap_or(false),elapsed_ms:value["elapsedMs"].as_u64() })
+    } else { None };
+    Ok((sources,diagnostics))
+}
 #[tauri::command]
 pub(super) async fn list_console_library(target: String, host: String, port: u16) -> Result<ConsoleLibrarySnapshot,String> {
     let (mut socket,_)=checked(&target,&host,port,"installed-library-v1","read the library").await?;
-    let response: Value=serde_json::from_slice(&exchange(&mut socket,0x5e,&[],128*1024).await?).map_err(|_| "The receiver returned an invalid library snapshot.".to_string())?;
+    let response: Value=serde_json::from_slice(&exchange(&mut socket,0x5e,&[],256*1024).await?).map_err(|_| "The receiver returned an invalid library snapshot.".to_string())?;
+    let (sources,diagnostics)=library_details(&response)?;
     let ids=response["titles"].as_array().ok_or("The library snapshot has no title list.")?;
     let truncated=response["truncated"].as_bool().ok_or("The library snapshot has no truncation status.")?;
     let mut complete=response["complete"].as_bool().ok_or("The library snapshot has no completion status.")? && !truncated;
@@ -292,6 +327,12 @@ pub(super) async fn list_console_library(target: String, host: String, port: u16
         .map(|v| v.as_str().map(clean).ok_or("The library error list is malformed.")).collect::<Result<_,_>>()?;
     if response["errorsTruncated"].as_bool().unwrap_or(false) { errors.push("Some inventory errors were omitted.".into()); }
     if !errors.is_empty() { complete=false; }
+    if let Some(info)=&diagnostics {
+        if info.budget_exceeded || info.appdb!="ok" {
+            complete=false;
+            if errors.is_empty() { errors.push("Some library sources were unavailable; the snapshot is partial.".into()); }
+        }
+    }
     let mut custom=HashSet::new();
     if let Some(values)=response.get("customIcons") {
         for value in values.as_array().ok_or("The custom-icon list is malformed.")? {
@@ -300,14 +341,14 @@ pub(super) async fn list_console_library(target: String, host: String, port: u16
         }
     }
     if ids.len()>2048 { complete=false; errors.push("The library exceeded the 2,048-title limit.".into()); }
-    let mut snapshot=ConsoleLibrarySnapshot { target:target.clone(),entries:Vec::new(),complete,truncated:truncated||ids.len()>2048,errors,metadata_warnings:Vec::new() };
+    let mut snapshot=ConsoleLibrarySnapshot { target:target.clone(),entries:Vec::new(),complete,truncated:truncated||ids.len()>2048,errors,metadata_warnings:Vec::new(),diagnostics };
     let mut seen=HashSet::new(); let mut connection_ok=true;
     for value in ids.iter().take(2048) {
         let Some(id)=value.as_str().filter(|id| title_id(id) && (target=="ps5" || id.starts_with("CUSA"))) else {
             snapshot.complete=false; snapshot.errors.push("The library contained an invalid title ID.".into()); continue;
         };
         if !seen.insert(id) { snapshot.complete=false; snapshot.errors.push("The library contained a duplicate title ID.".into()); continue; }
-        let mut entry=LibraryTitle { title_id:id.into(),name:id.into(),version:None,base_version:None,update_version:None,icon:None,custom_icon:custom.contains(id),required_firmware:None,content_id:None,platform:if id.starts_with("CUSA") {"ps4"} else {"ps5"}.into() };
+        let mut entry=LibraryTitle { title_id:id.into(),name:id.into(),version:None,base_version:None,update_version:None,icon:None,custom_icon:custom.contains(id),required_firmware:None,content_id:None,platform:if id.starts_with("CUSA") {"ps4"} else {"ps5"}.into(),sources:sources.get(id).cloned().unwrap_or_default() };
         if connection_ok {
             let bytes=exchange(&mut socket,0x5f,&id_request(id)?,12+2*MAX_META+MAX_PNG).await;
             match bytes {
@@ -340,6 +381,43 @@ pub(super) async fn list_console_library(target: String, host: String, port: u16
     snapshot.errors.truncate(64); snapshot.metadata_warnings.truncate(256); Ok(snapshot)
 }
 
+fn theme_request(content_id: &str) -> Result<Vec<u8>,String> {
+    let valid = content_id.len()==36 && content_id.is_char_boundary(36) && content_id.as_bytes()[6]==b'-' && content_id.as_bytes()[16]==b'_' && content_id.as_bytes()[19]==b'-'
+        && content_id.bytes().enumerate().all(|(i,b)| matches!(i,6|16|19) || b.is_ascii_uppercase() || b.is_ascii_digit() || b==b'_');
+    if !valid { return Err("That is not a PS4 theme content ID.".into()); }
+    let mut body=content_id.as_bytes().to_vec(); body.push(0); Ok(body)
+}
+#[tauri::command]
+pub(super) async fn list_console_themes(host: String, port: u16) -> Result<ConsoleThemes,String> {
+    let (mut socket,_)=checked("ps4",&host,port,"themes-v1","list installed themes").await?;
+    let value: Value=serde_json::from_slice(&exchange(&mut socket,0x66,&[],256*1024).await?).map_err(|_| "The receiver returned an invalid theme list.".to_string())?;
+    let items=value["themes"].as_array().ok_or("The receiver returned an invalid theme list.")?;
+    let mut themes=Vec::new();
+    for item in items.iter().take(128) {
+        let Some(id)=item["contentId"].as_str().filter(|id| theme_request(id).is_ok()) else { continue };
+        let title: String=item["title"].as_str().unwrap_or("").chars().filter(|c| !c.is_control()).take(127).collect();
+        themes.push(InstalledTheme { content_id: id.into(), title: if title.trim().is_empty() { id[20..].into() } else { title } });
+    }
+    // The console stores the selected theme as its 16-character label.
+    let active=value["active"].as_str().unwrap_or("");
+    // The console stores the full content ID; older SSPI receivers wrote the 16-character label.
+    let active_content_id=(!active.is_empty()).then(|| themes.iter().find(|t| t.content_id==active || t.content_id[20..]==*active).map(|t| t.content_id.clone())).flatten();
+    Ok(ConsoleThemes { themes, active_content_id, truncated: value["truncated"].as_bool().unwrap_or(false) })
+}
+#[tauri::command]
+pub(super) async fn apply_console_theme(host: String, port: u16, content_id: String) -> Result<String,String> {
+    let body=theme_request(&content_id)?;
+    let (mut socket,_)=checked("ps4",&host,port,"themes-v1","apply themes").await?;
+    exchange(&mut socket,0x67,&body,4096).await?;
+    Ok("Theme selected on the PS4.".into())
+}
+#[tauri::command]
+pub(super) async fn remove_console_theme(host: String, port: u16, content_id: String) -> Result<String,String> {
+    let body=theme_request(&content_id)?;
+    let (mut socket,_)=checked("ps4",&host,port,"themes-v1","remove themes").await?;
+    exchange(&mut socket,0x68,&body,4096).await?;
+    Ok("Theme removed from the PS4.".into())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +429,7 @@ mod tests {
             assert!(theme_request(bad).is_err(), "{bad}");
         }
     }
+
     use tokio::net::TcpListener;
     const ID: &str = "CUSA12345";
     const HOST: &str = "127.0.0.1";
@@ -430,6 +509,21 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn ps4_v2_receivers_get_the_home_screen_dds_with_the_png() {
+        let bytes=png();
+        let dds=icon_dds_from_png(&bytes).unwrap();
+        assert_eq!(&dds[..4],b"DDS "); assert_eq!(dds.len(),128+(dds_side(&dds)/4).pow(2)*8);
+        let mut request=id_request(ID).unwrap(); request.extend_from_slice(&(bytes.len() as u32).to_le_bytes()); request.extend_from_slice(&bytes); request.extend_from_slice(&dds);
+        let caps=[CAPS,&["title-icons-v2"]].concat();
+        let fake=Fake::start("ps4",&caps,vec![(0x6f,request,3,write_result(ID))]).await;
+        assert_eq!(set_title_icon("ps4".into(),HOST.into(),fake.port,ID.into(),BASE64.encode(&bytes)).await.unwrap().title_id,ID); fake.done().await;
+        // A PS5 never gets the DDS form, whatever it advertises.
+        let mut request=id_request(ID).unwrap(); request.extend_from_slice(&bytes);
+        let fake=Fake::start("ps5",&caps,vec![(0x61,request,3,write_result(ID))]).await;
+        set_title_icon("ps5".into(),HOST.into(),fake.port,ID.into(),BASE64.encode(&bytes)).await.unwrap(); fake.done().await;
+    }
+    fn dds_side(dds: &[u8]) -> usize { u32::from_le_bytes(dds[16..20].try_into().unwrap()) as usize }
+    #[tokio::test]
     async fn shell_only_sends_explicit_capability_supported_request() {
         let fake=Fake::start("ps5",CAPS,vec![(0x63,vec![],1,b"Home screen refreshed.".to_vec())]).await;
         assert_eq!(refresh_console_shell("ps5".into(),HOST.into(),fake.port).await.unwrap(),"Home screen refreshed."); fake.done().await;
@@ -460,6 +554,7 @@ mod tests {
             let fake=Fake::start(target,CAPS,steps).await;
             let result=list_console_library(target.into(),HOST.into(),fake.port).await.unwrap();
             assert!(result.complete); assert!(result.metadata_warnings.is_empty()); assert_eq!(result.entries[0].name,"Host title");
+            assert!(result.diagnostics.is_none()); assert!(result.entries[0].sources.is_empty());
             assert_eq!(result.entries[0].required_firmware.as_deref(),Some("9.00")); assert!(result.entries[0].content_id.is_some()); assert!(result.entries[0].custom_icon);
             assert_eq!(result.entries[0].platform,"ps4"); assert!(result.entries[0].icon.as_ref().unwrap().starts_with("data:image/jpeg;base64,"));
             if target=="ps5" { assert_eq!(result.entries[1].platform,"ps5"); assert_eq!(result.entries[1].name,"PS5 host title"); assert_eq!(result.entries[1].required_firmware.as_deref(),Some("5.20")); }
@@ -521,6 +616,37 @@ mod tests {
         let listing=json!({"titles":[ID,ID,"../a12345"],"complete":true,"truncated":false,"errors":[],"customIcons":[]});
         let fake=Fake::start("ps4",CAPS,vec![(0x5e,vec![],3,serde_json::to_vec(&listing).unwrap()),(0x5f,id_request(ID).unwrap(),3,vec![0xff])]).await;
         let result=list_console_library("ps4".into(),HOST.into(),fake.port).await.unwrap(); assert!(!result.complete); assert_eq!(result.entries.len(),1); assert_eq!(result.metadata_warnings.len(),1); fake.done().await;
+    }
+    #[test]
+    fn optional_library_details_are_bounded_and_forward_compatible() {
+        let (sources,diagnostics)=library_details(&json!({})).unwrap();
+        assert!(sources.is_empty()); assert!(diagnostics.is_none());
+        let value=json!({"sources":{"PPSA12345":["shadowmount","appdb","appdb","future-source"],"NPXS12345":["appdb"]},
+            "diagnostics":{"appdb":"ok","counts":{"appdb":1,"app":0,"appmeta":0,"shadowmount":1},
+            "skipped":[{"id":"PPSA99999","reason":"Cannot read /user/private/game from 192.0.2.2"}],"elapsedMs":45}});
+        let (sources,diagnostics)=library_details(&value).unwrap();
+        assert_eq!(sources.len(),1); assert_eq!(sources["PPSA12345"],["appdb","shadowmount"]);
+        let diagnostics=diagnostics.unwrap(); assert_eq!(diagnostics.elapsed_ms,Some(45));
+        assert!(!diagnostics.skipped[0].reason.contains("/user/")); assert!(!diagnostics.skipped[0].reason.contains("192.168"));
+        let mut bad=value.clone(); bad["sources"]["PPSA12345"]=json!(true); assert!(library_details(&bad).is_err());
+        let mut bad=value.clone(); bad["diagnostics"]["counts"]["appdb"]=json!(2049); assert!(library_details(&bad).is_err());
+        let mut capped=value; capped["diagnostics"]["skipped"]=json!((0..40).map(|_| json!({"id":"scan","reason":"skipped"})).collect::<Vec<_>>());
+        let (_,diagnostics)=library_details(&capped).unwrap(); let diagnostics=diagnostics.unwrap();
+        assert_eq!(diagnostics.skipped.len(),32); assert!(diagnostics.skipped_truncated);
+    }
+    #[tokio::test]
+    async fn library_exposes_sources_and_preserves_partial_diagnostics() {
+        for budget in [false,true] {
+            let listing=json!({"titles":["PPSA12345"],"complete":true,"truncated":false,"errors":[],
+                "sources":{"PPSA12345":["appdb","appmeta","shadowmount"]},
+                "diagnostics":{"appdb":"ok","counts":{"appdb":1,"app":0,"appmeta":1,"shadowmount":1},"skipped":[],"budgetExceeded":budget}});
+            let param=br#"{"titleId":"PPSA12345","titleName":"Mixed source title"}"#;
+            let fake=Fake::start("ps5",CAPS,vec![(0x5e,vec![],3,serde_json::to_vec(&listing).unwrap()),
+                (0x5f,id_request("PPSA12345").unwrap(),3,metadata(&[param,&[],&[]]))]).await;
+            let result=list_console_library("ps5".into(),HOST.into(),fake.port).await.unwrap();
+            assert_eq!(result.complete,!budget); assert_eq!(result.entries[0].sources,["appdb","appmeta","shadowmount"]);
+            assert_eq!(result.diagnostics.unwrap().budget_exceeded,budget); fake.done().await;
+        }
     }
     #[test]
     fn metadata_lengths_firmware_and_settings_defaults_are_checked() {

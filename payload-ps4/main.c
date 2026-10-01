@@ -5,6 +5,7 @@
 #include "installed_library.h"
 #include "console_tools.h"
 #include "../payload/console_files.h"
+#include "../payload/process_control.h"
 #include "notify.h"
 #include "log.h"
 #include <arpa/inet.h>
@@ -82,24 +83,30 @@ static int config_reply(int fd) {
     ReceiverConfig c={port,receiver_uid,jailbroken,writable,s.bgft,s.appinst,s.userservice};
     int rc=config_json(text,49152,&c)?text_reply(fd,RESP_ERROR,"configuration JSON overflow"):text_reply(fd,RESP_DATA,text); free(text); return rc;
 }
-static bool empty_command(unsigned cmd) { return cmd==CMD_PING||cmd==CMD_GET_CONFIG||cmd==CMD_END_UPLOAD||cmd==CMD_INSTALL_PREFLIGHT||cmd==CMD_STOP||cmd==CMD_LIST_INSTALLED||cmd==CMD_THEME_LIST; }
+static bool empty_command(unsigned cmd) { return cmd==CMD_PING||cmd==CMD_GET_CONFIG||cmd==CMD_END_UPLOAD||cmd==CMD_INSTALL_PREFLIGHT||cmd==CMD_STOP||cmd==CMD_LIST_INSTALLED||cmd==CMD_THEME_LIST||
+    cmd==CMD_KERNEL_LOG||cmd==CMD_PROCESSES||cmd==CMD_LOG_LIST; }
 static uint32_t command_limit(unsigned cmd) {
     if (cmd==CMD_SHELL_REFRESH || cmd==CMD_SYSTEM_INFO) return 0;
     if (cmd==CMD_TITLE_ICON_GET) return 11;
     if (cmd==CMD_TITLE_ICON_RESTORE) return 10;
     if (cmd==CMD_TITLE_ICON_SET) return CT_MAX_PNG+10;
+    if (cmd==CMD_TITLE_ICON_SET2) return 14+CT_MAX_PNG+CT_MAX_DDS;
     if (empty_command(cmd)) return 0;
     if (cmd==CMD_PROGRESS_NOTIFICATION) return 512u*1024u+16400u;
     if (cmd==CMD_INSTALL_URL) return 8193;
     if (cmd==CMD_INSTALLED_METADATA) return 10;
+    if (cmd==CMD_LOG_READ) return 4+480+1;
+    if (cmd==CMD_PROCESS_CONTROL) return 5+PC_NAME_MAX;
     if (cmd==CMD_START_UPLOAD) return MAX_PATH_BYTES+25;
     return MAX_PATH_BYTES+1;
 }
 static int dispatch(int fd, uint8_t cmd, const uint8_t *b, uint32_t n, Lane *lane) {
     const char *path;
     switch(cmd) {
-        case CMD_TITLE_ICON_GET: case CMD_TITLE_ICON_SET: case CMD_TITLE_ICON_RESTORE:
-        case CMD_SHELL_REFRESH: case CMD_SYSTEM_INFO: return console_tools_request(fd,cmd,b,n);
+        case CMD_TITLE_ICON_GET: case CMD_TITLE_ICON_SET: case CMD_TITLE_ICON_RESTORE: case CMD_TITLE_ICON_SET2:
+        case CMD_SHELL_REFRESH: case CMD_SYSTEM_INFO: case CMD_KERNEL_LOG: case CMD_PROCESSES: case CMD_LOG_LIST: case CMD_LOG_READ:
+        case CMD_PROCESS_CONTROL:
+            return console_tools_request(fd,cmd,b,n);
         case CMD_PING: return text_reply(fd,RESP_OK,"SSPI");
         case CMD_GET_CONFIG: return config_reply(fd);
         case CMD_SET_PORT: {

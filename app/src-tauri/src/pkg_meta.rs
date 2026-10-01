@@ -40,6 +40,9 @@ pub(super) fn read(path: &Path) -> Result<PkgMeta, String> {
 
     let mut header = [0u8; HEADER_SIZE];
     file.read_exact(&mut header).map_err(|_| "PKG header is truncated".to_string())?;
+    if &header[..4] == b"\x7fFIH" {
+        return read_fih(&mut file, &header, file_size);
+    }
     if &header[..4] != b"\x7fCNT" {
         return Err("File is not a PS4 PKG".into());
     }
@@ -209,6 +212,60 @@ pub(super) fn is_valid_png(bytes: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Finalized PS5 packages (FIH) wrap a CNT whose entries hold `param.json` (0x2000) and
+/// `icon0.png` (0x1200). Entry offsets are relative to the CNT; there is no param.sfo.
+fn read_fih(file: &mut File, fih: &[u8], file_size: u64) -> Result<PkgMeta, String> {
+    let base = u64::from_le_bytes(fih[0x58..0x60].try_into().unwrap());
+    if base < HEADER_SIZE as u64 || base.saturating_add(HEADER_SIZE as u64) > file_size {
+        return Err("PS5 package CNT offset is invalid".into());
+    }
+    let mut header = [0u8; HEADER_SIZE];
+    file.seek(SeekFrom::Start(base)).and_then(|_| file.read_exact(&mut header)).map_err(|_| "PS5 package CNT is truncated".to_string())?;
+    if &header[..4] != b"\x7fCNT" { return Err("PS5 package has no CNT header".into()); }
+    let content_id = std::str::from_utf8(&header[0x40..0x40 + 36]).map_err(|_| "PKG content ID is invalid".to_string())?.to_string();
+    let title_id = content_id.get(7..16).filter(|id| content_id.len() == 36 && (id[..4].eq_ignore_ascii_case("PPSA") || id[..4].eq_ignore_ascii_case("CUSA")) && id[4..].bytes().all(|b| b.is_ascii_digit()))
+        .map(str::to_ascii_uppercase).ok_or_else(|| "PKG content ID is invalid".to_string())?;
+    let entry_count = be_u32(&header, 0x10) as usize;
+    let table_offset = base + be_u32(&header, 0x18) as u64;
+    if entry_count > MAX_ENTRY_COUNT || table_offset + (entry_count * ENTRY_SIZE) as u64 > file_size {
+        return Err("PKG entry table is invalid".into());
+    }
+    let mut table = vec![0u8; entry_count * ENTRY_SIZE];
+    file.seek(SeekFrom::Start(table_offset)).and_then(|_| file.read_exact(&mut table)).map_err(|_| "PKG entry table is truncated".to_string())?;
+    let (mut param, mut icon0) = (None, None);
+    for raw in table.chunks_exact(ENTRY_SIZE) {
+        let entry = Entry { id: be_u32(raw, 0), encrypted: be_u32(raw, 8) & 0x8000_0000 != 0, offset: base + be_u32(raw, 0x10) as u64, size: be_u32(raw, 0x14) as u64 };
+        if entry.encrypted || entry.offset > file_size || entry.size > file_size - entry.offset { continue; }
+        match entry.id {
+            0x2000 if entry.size <= MAX_SFO_SIZE as u64 => param = serde_json::from_slice::<serde_json::Value>(&read_entry(file, entry)?).ok(),
+            0x1200 if entry.size <= MAX_ICON_SIZE as u64 => icon0 = Some(read_entry(file, entry)?).filter(|png| is_valid_png(png)),
+            _ => {}
+        }
+    }
+    let text = |key: &str| param.as_ref().and_then(|p| p.get(key)).and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+    let title = param.as_ref().and_then(|p| {
+        let localized = p.get("localizedParameters")?;
+        let language = localized.get("defaultLanguage").and_then(|v| v.as_str()).unwrap_or("en-US");
+        localized.get(language).or_else(|| localized.get("en-US"))?.get("titleName")?.as_str().map(str::to_string)
+    });
+    if text("titleId").is_some_and(|id| !id.eq_ignore_ascii_case(&title_id)) {
+        return Err("PKG param.json title ID does not match the package content ID".into());
+    }
+    let mut digest_hex = String::with_capacity(64);
+    for byte in &header[0xfe0..0x1000] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut digest_hex, "{byte:02x}");
+    }
+    Ok(PkgMeta {
+        content_id, title_id,
+        // Finalized FIH packages built here are applications; patches and add-ons are not FIH-wrapped.
+        category: "gd".into(), kind: "base".into(),
+        title, version: text("contentVersion").or_else(|| text("masterVersion")),
+        digest_hex, content_type: be_u32(&header, 0x74), header_sha256: format!("{:x}", Sha256::digest(header)),
+        original_size: file_size, file_size, icon0,
+    })
 }
 
 fn read_entry(file: &mut File, entry: Entry) -> Result<Vec<u8>, String> {
@@ -552,5 +609,18 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+#[cfg(test)]
+mod fih_tests {
+    /// Reads title, version and artwork from a real finalized PS5 package when one is supplied.
+    #[test]
+    #[ignore = "set SSPI_FIH_PKG to a finalized PS5 package"]
+    fn finalized_ps5_packages_give_title_version_and_artwork() {
+        let path = std::path::PathBuf::from(std::env::var("SSPI_FIH_PKG").unwrap());
+        let meta = super::read(&path).unwrap();
+        eprintln!("FIH {} {:?} {:?} kind={} icon={:?}", meta.title_id, meta.title, meta.version, meta.kind, meta.icon0.as_ref().map(Vec::len));
+        assert!(meta.title_id.starts_with("PPSA") && meta.title.is_some() && meta.version.is_some() && meta.icon0.is_some());
     }
 }

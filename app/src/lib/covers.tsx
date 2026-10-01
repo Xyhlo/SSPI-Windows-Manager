@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core"
 import { useEffect, useState } from "react"
 
+import { PLAIN_ART_PREFIX } from "@/lib/image"
 import { cn } from "@/lib/utils"
 import ps4Case from "@/assets/PS4.png"
 import ps5Case from "@/assets/PS5.png"
@@ -47,6 +48,7 @@ function chromeRatio(data: Uint8ClampedArray, w: number, h: number, axis: "row" 
 }
 
 export function cropBoxedCover(dataUrl: string) {
+  if (dataUrl.startsWith(PLAIN_ART_PREFIX)) return Promise.resolve(dataUrl)
   const existing = plainCache.get(dataUrl)
   if (existing) return existing
   const request = new Promise<string>((resolve) => {

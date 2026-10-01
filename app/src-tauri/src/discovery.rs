@@ -650,15 +650,15 @@ mod tests {
         server.await.unwrap();
 
         let (port, server) = fake_receiver(
-            json!({"version":"1.0.5", "platform":"ps5", "capabilities":["dump-mount"]}),
+            json!({"version":"1.0.6", "platform":"ps5", "capabilities":["dump-mount"]}),
             false,
         )
         .await;
-        let outdated = probe_one("ps5", "127.0.0.1".into(), port, "1.0.6").await;
+        let outdated = probe_one("ps5", "127.0.0.1".into(), port, "1.0.7").await;
         assert_eq!(outdated.receiver.state, "outdated");
         assert_eq!(
             outdated.receiver.message.as_deref(),
-            Some("The PS5 receiver 1.0.5 is loaded; this app needs 1.0.6.")
+            Some("The PS5 receiver 1.0.6 is loaded; this app needs 1.0.7.")
         );
         server.await.unwrap();
 
@@ -667,14 +667,14 @@ mod tests {
             false,
         )
         .await;
-        let foreign = probe_one("ps5", "127.0.0.1".into(), port, "1.0.6").await;
+        let foreign = probe_one("ps5", "127.0.0.1".into(), port, "1.0.7").await;
         assert_eq!(foreign.receiver.state, "error");
         server.await.unwrap();
 
         let unused = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let port = unused.local_addr().unwrap().port();
         drop(unused);
-        let offline = probe_one("ps5", "127.0.0.1".into(), port, "1.0.6").await;
+        let offline = probe_one("ps5", "127.0.0.1".into(), port, "1.0.7").await;
         assert_eq!(offline.receiver.state, "offline");
         assert_eq!(
             offline.receiver.message.as_deref(),
@@ -688,11 +688,11 @@ mod tests {
     #[tokio::test]
     async fn probe_treats_a_malformed_receiver_reply_as_an_error() {
         let (port, server) = fake_receiver(
-            json!({"version":"1.0.6", "platform":"ps5", "capabilities":[]}),
+            json!({"version":"1.0.7", "platform":"ps5", "capabilities":[]}),
             true,
         )
         .await;
-        let result = probe_one("ps5", "127.0.0.1".into(), port, "1.0.6").await;
+        let result = probe_one("ps5", "127.0.0.1".into(), port, "1.0.7").await;
         assert_eq!(result.receiver.state, "error");
         server.await.unwrap();
     }

@@ -42,29 +42,53 @@ impl PackageKind {
 /// Speed/weight presets, mapped to engine parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackagePreset {
-    /// Fastest: Kraken level 2, store already-compressed assets.
-    Fast,
-    /// Default: Kraken level 4.
-    Standard,
-    /// Smallest output: Kraken level 7 optimal.
+    Fastest,
+    Balanced,
     Smallest,
 }
+
+// Full Gollum dump: level 3 is 24.56 GB, level 1 is 2.3% larger and HyperFast4 44% larger,
+// so Balanced stays on level 3 and Fastest drops only to SuperFast. On a 3 GiB slice,
+// level 7 compressed 10x slower than level 3 for 3.9% less; level 5 took 7x for 2.1%.
+const FASTEST_COMPRESSION_LEVEL: i8 = 1; // SuperFast
+const BALANCED_COMPRESSION_LEVEL: i8 = 3; // Fast
+const SMALLEST_COMPRESSION_LEVEL: i8 = 7; // Optimal3
 
 impl PackagePreset {
     pub fn from_label(label: &str) -> Self {
         match label.trim().to_ascii_lowercase().as_str() {
-            "fast" => Self::Fast,
+            "fastest" | "fast" => Self::Fastest,
             "smallest" | "small" => Self::Smallest,
-            _ => Self::Standard,
+            _ => Self::Balanced,
         }
     }
 
-    pub fn level(self) -> u8 {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Fast => 2,
-            Self::Standard => 4,
-            Self::Smallest => 7,
+            Self::Fastest => "fastest",
+            Self::Balanced => "balanced",
+            Self::Smallest => "smallest",
         }
+    }
+
+    pub fn level(self) -> i8 {
+        match self {
+            Self::Fastest => FASTEST_COMPRESSION_LEVEL,
+            Self::Balanced => BALANCED_COMPRESSION_LEVEL,
+            Self::Smallest => SMALLEST_COMPRESSION_LEVEL,
+        }
+    }
+}
+
+pub fn deserialize_preset<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(PackagePreset::from_label(&value).label().into())
+}
+
+pub fn validate_compression_level(level: Option<i8>) -> Result<(), String> {
+    match level {
+        None | Some(-4..=-1 | 1..=9) => Ok(()),
+        Some(_) => Err("Kraken compression level must be -4 through -1 or 1 through 9".into()),
     }
 }
 
@@ -72,11 +96,13 @@ impl PackagePreset {
 pub struct PackageOptions {
     pub source: PathBuf,
     pub output_dir: PathBuf,
+    /// This build's unique sspi-fpkg-<uuid> directory, removed after the engine exits.
+    pub temp_dir: Option<PathBuf>,
     pub title_id: Option<String>,
     pub kind: PackageKind,
     pub preset: PackagePreset,
-    /// Explicit Kraken level 1..9; None keeps the saved speed preset.
-    pub compression_level: Option<u8>,
+    /// Explicit Kraken level -4..-1 or 1..9; None keeps the saved speed preset.
+    pub compression_level: Option<i8>,
     /// PFS filesystem version: 2 (all firmware) or 3 (FW >= 7.00).
     pub pfs_version: u8,
     /// Console firmware the package is meant for; gates PFS v3 and is written
@@ -92,9 +118,10 @@ impl PackageOptions {
         Self {
             source: source.into(),
             output_dir: output_dir.into(),
+            temp_dir: None,
             title_id: None,
             kind: PackageKind::Base,
-            preset: PackagePreset::Standard,
+            preset: PackagePreset::Balanced,
             compression_level: None,
             pfs_version: 2,
             target_fw: None,
@@ -103,12 +130,9 @@ impl PackageOptions {
         }
     }
 
-    pub fn effective_compression_level(&self) -> Result<u8, String> {
-        match self.compression_level {
-            Some(level @ 1..=9) => Ok(level),
-            Some(_) => Err("Kraken compression level must be between 1 and 9".into()),
-            None => Ok(self.preset.level()),
-        }
+    pub fn effective_compression_level(&self) -> Result<i8, String> {
+        validate_compression_level(self.compression_level)?;
+        Ok(self.compression_level.unwrap_or_else(|| self.preset.level()))
     }
 
     /// PFS v3 only reads on FW >= 7.00; downgrade silently rather than ship a
@@ -124,12 +148,129 @@ impl PackageOptions {
     }
 }
 
+// Keep this reserve while building too; the planner may tune it after the benchmark.
+pub const TEMP_RESERVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+pub struct TempVolume {
+    pub letter: char,
+    pub fixed: bool,
+    pub free_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct TempEnvironment {
+    pub volumes: Vec<TempVolume>,
+    pub system_temp: PathBuf,
+}
+
+impl TempEnvironment {
+    pub fn system() -> Self {
+        let mut volumes = Vec::new();
+        #[cfg(windows)] {
+            #[link(name = "kernel32")]
+            extern "system" { fn GetDriveTypeW(root: *const u16) -> u32; }
+            for letter in b'A'..=b'Z' {
+                let root = [letter as u16, b':' as u16, b'\\' as u16, 0];
+                if unsafe { GetDriveTypeW(root.as_ptr()) } != 3 { continue; } // DRIVE_FIXED
+                if let Some(free_bytes) = super::free_space(Path::new(&format!("{}:\\", letter as char))) {
+                    volumes.push(TempVolume { letter: letter as char, fixed: true, free_bytes });
+                }
+            }
+        }
+        Self { volumes, system_temp: std::env::temp_dir() }
+    }
+}
+
+#[derive(Debug)]
+pub struct TempChoice {
+    pub dir: PathBuf,
+    pub reason: String,
+}
+
+/// Choose the parent directory; the caller adds its unique sspi-fpkg-<job uuid> child.
+pub fn choose_temp_dir(output_dir: &Path, input_bytes: u64, env: &TempEnvironment) -> TempChoice {
+    let output_volume = super::archives::volume_of(&super::plain_path(output_dir));
+    let temp_volume = super::archives::volume_of(&super::plain_path(&env.system_temp));
+    let reason = match (output_volume, temp_volume) {
+        (Some(output), Some(temp)) if output.eq_ignore_ascii_case(&temp) => "System temp shares the output volume",
+        (Some(_), Some(temp)) => match env.volumes.iter().find(|v| temp.eq_ignore_ascii_case(&format!("{}:", v.letter))) {
+            Some(volume) if volume.fixed => {
+                if input_bytes.checked_add(TEMP_RESERVE_BYTES).is_some_and(|need| volume.free_bytes >= need) {
+                    return TempChoice { dir: env.system_temp.clone(), reason: "System temp is on another fixed volume with room for the inner image and reserve".into() };
+                }
+                "System temp lacks room for the inner image and reserve"
+            },
+            _ => "System temp is not on a known fixed volume",
+        },
+        _ => "Cannot determine separate temp and output volumes",
+    };
+    TempChoice { dir: output_dir.join("work"), reason: format!("{reason}; using output work directory") }
+}
+
+struct TempWorkspace { dir: PathBuf, parent: PathBuf }
+
+impl TempWorkspace {
+    fn create(path: &Path) -> Result<Self, String> {
+        let name = path.file_name().and_then(|name| name.to_str()).ok_or("Invalid packaging temp directory")?;
+        if name.strip_prefix("sspi-fpkg-").and_then(|id| uuid::Uuid::parse_str(id).ok()).is_none() {
+            return Err("Packaging temp directory must be named sspi-fpkg-<uuid>".into());
+        }
+        let parent = path.parent().ok_or("Packaging temp directory needs a parent")?;
+        std::fs::create_dir_all(parent).map_err(redact)?;
+        let parent = parent.canonicalize().map_err(redact)?;
+        let dir = parent.join(name);
+        std::fs::create_dir(&dir).map_err(redact)?; // Never take ownership of an existing directory.
+        Ok(Self { dir, parent })
+    }
+
+    fn cleanup(&self) -> Result<(), String> {
+        let metadata = match std::fs::symlink_metadata(&self.dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(redact(error)),
+        };
+        let resolved = self.dir.canonicalize().map_err(redact)?;
+        if metadata.file_type().is_symlink() || is_reparse(&metadata) || resolved.parent() != Some(self.parent.as_path()) || resolved != self.dir {
+            return Err("Packaging temp directory moved outside its workspace".into());
+        }
+        std::fs::remove_dir_all(&resolved).map_err(redact)
+    }
+}
+
+impl Drop for TempWorkspace {
+    fn drop(&mut self) { let _ = self.cleanup(); }
+}
+
 pub fn parse_fw(value: &str) -> Option<(u32, u32)> {
     let cleaned = value.trim().trim_start_matches("FW").trim();
     let mut parts = cleaned.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next().unwrap_or("0").parse().ok()?;
     Some((major, minor))
+}
+
+/// A 3 GiB slice favoured 16 workers, but the full 47 GiB Gollum dump at Kraken 3 compressed
+/// in 95 s with 23 workers against 119 s with 16, so the cap only guards very wide CPUs.
+const MAX_KRAKEN_WORKERS: usize = 32;
+
+fn worker_budget(cores: usize, available: u64) -> u16 {
+    // Leave one logical core and 2 GiB free; allow 512 MiB per Kraken worker.
+    cores.saturating_sub(1).max(1).min(MAX_KRAKEN_WORKERS).min((available.saturating_sub(2 << 30) / (512 << 20)).max(1) as usize) as u16
+}
+
+pub fn kraken_workers() -> u16 {
+    let mut available = 4u64 << 30;
+    #[cfg(windows)] {
+        #[repr(C)]
+        struct MemoryStatus { length: u32, load: u32, physical: u64, available: u64, page: u64, available_page: u64, virtual_bytes: u64, available_virtual: u64, extended: u64 }
+        #[link(name = "kernel32")]
+        extern "system" { fn GlobalMemoryStatusEx(status: *mut MemoryStatus) -> i32; }
+        let mut status: MemoryStatus = unsafe { std::mem::zeroed() };
+        status.length = std::mem::size_of::<MemoryStatus>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 { available = status.available; }
+    }
+    worker_budget(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4), available)
 }
 
 /// Structural checks before building. Passing these is not a console launch test.
@@ -150,10 +291,47 @@ impl Preflight {
 const F_SELF_MAGIC: [u8; 4] = [0x4F, 0x15, 0x3D, 0x1D];
 const PROSPERO_SELF_MAGIC: [u8; 4] = [0x54, 0x14, 0xF5, 0xEE];
 const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
-const BACKUP_SUFFIX: &str = ".esbak";
+pub(crate) const BACKUP_SUFFIXES: [&str; 4] = [".esbak", ".bak", ".orig", ".origbak"];
+
+pub(crate) fn private_staging_file(relative: &Path) -> bool {
+    relative.components().any(|c| c.as_os_str().eq_ignore_ascii_case("sce_sys"))
+        || relative.extension().and_then(|e| e.to_str()).is_some_and(|e| ["bin", "elf", "prx", "sprx", "self"].iter().any(|known| e.eq_ignore_ascii_case(known)))
+}
+
+fn excluded_staging_name(lower: &str) -> bool {
+    lower == "decrypted" || BACKUP_SUFFIXES.iter().any(|suffix| lower.ends_with(suffix))
+        || (lower.starts_with("playgo") && lower.ends_with(".dat"))
+}
+
+#[derive(Default)]
+pub struct StagedFiles {
+    files: std::collections::HashMap<PathBuf, u64>,
+    pub warnings: Vec<String>,
+}
 
 /// Inspect the staged executable. Doctor repairs are applied separately.
 pub fn preflight(source: &Path, max_files: u64) -> Result<Preflight, String> {
+    let mut report = preflight_metadata(source)?;
+    if source.is_dir() { walk_counts(source, &mut report, max_files, 0)?; }
+    Ok(report)
+}
+
+/// The staging walk already validated every entry; only index replacement sizes change.
+pub fn preflight_staged(source: &Path, max_files: u64, staged: &StagedFiles) -> Result<Preflight, String> {
+    let mut report = preflight_metadata(source)?;
+    report.file_count = staged.files.len() as u64;
+    report.total_bytes = staged.files.values().sum();
+    for name in ["ampr_emu.index", "ampr_assets.index"] {
+        if let Some(old) = staged.files.get(Path::new(name)) {
+            report.total_bytes = report.total_bytes.saturating_sub(*old).saturating_add(std::fs::metadata(source.join(name)).map_err(redact)?.len());
+        }
+    }
+    if report.file_count > max_files { report.blockers.push(format!("Package has {} files; limit is {max_files}", report.file_count)); }
+    report.warnings.extend(staged.warnings.iter().cloned());
+    Ok(report)
+}
+
+fn preflight_metadata(source: &Path) -> Result<Preflight, String> {
     let mut report = Preflight::default();
     if !source.is_dir() {
         report.blockers.push("Package source is not a directory".into());
@@ -163,6 +341,10 @@ pub fn preflight(source: &Path, max_files: u64) -> Result<Preflight, String> {
         report
             .blockers
             .push("Missing sce_sys/param.json at the dump root".into());
+    } else {
+        let mut metadata = crate::fpkg_doctor::DoctorReport::default();
+        crate::fpkg_doctor::inspect_metadata(source, &mut metadata)?;
+        report.blockers.extend(metadata.blockers());
     }
     let eboot = source.join("eboot.bin");
     if !eboot.is_file() {
@@ -182,6 +364,8 @@ pub fn preflight(source: &Path, max_files: u64) -> Result<Preflight, String> {
             report.blockers.push(
                 "eboot.bin is neither a plain ELF nor a known fSELF container".into(),
             );
+        } else if let Err(error) = crate::fpkg_doctor::validate_executable(executable) {
+            report.blockers.push(format!("eboot.bin: {error}; restore a validated executable backup"));
         }
     }
     if source.join("fakelib").is_dir() || source.join("fakelib2").is_dir() {
@@ -203,7 +387,6 @@ pub fn preflight(source: &Path, max_files: u64) -> Result<Preflight, String> {
             .warnings
             .push("decrypted/ backup tree present; do not include it in the package".into());
     }
-    walk_counts(source, &mut report, max_files, 0)?;
     Ok(report)
 }
 
@@ -213,28 +396,25 @@ fn walk_counts(
     max_files: u64,
     depth: u32,
 ) -> Result<(), String> {
-    if depth > 32 || report.file_count > max_files {
-        return Ok(());
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(()),
-    };
-    for entry in entries.flatten() {
+    if depth > 32 { return Err("Package directory depth exceeds 32".into()); }
+    for entry in std::fs::read_dir(dir).map_err(redact)? {
+        let entry = entry.map_err(redact)?;
         let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(redact)?;
+        if metadata.file_type().is_symlink() || is_reparse(&metadata) { return Err("Packaging refuses linked source paths".into()); }
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        if path.is_dir() {
+        if metadata.is_dir() {
             if name == "decrypted" {
                 continue;
             }
             walk_counts(&path, report, max_files, depth + 1)?;
             continue;
         }
-        if name.ends_with(BACKUP_SUFFIX) {
+        if BACKUP_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) {
             report.warnings.push(format!(
                 "backup file in package tree: {}",
                 path.file_name().unwrap_or_default().to_string_lossy()
@@ -242,16 +422,17 @@ fn walk_counts(
             continue;
         }
         if name.starts_with("playgo") && name.ends_with(".dat") {
-            report.blockers.push(format!(
-                "stale playgo chunk map must be deleted before packaging: {}",
+            report.warnings.push(format!(
+                "stale playgo chunk map will be excluded during staging: {}",
                 path.file_name().unwrap_or_default().to_string_lossy()
             ));
             continue;
         }
         report.file_count += 1;
+        if report.file_count > max_files { return Err(format!("Package file count exceeds limit {max_files}")); }
         report.total_bytes = report
             .total_bytes
-            .saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
+            .saturating_add(metadata.len());
     }
     Ok(())
 }
@@ -376,8 +557,7 @@ pub fn workspace_size(source: &Path) -> Result<(u64, u64), String> {
             else if metadata.is_file() {
                 bytes = bytes.saturating_add(metadata.len());
                 let relative = path.strip_prefix(source).map_err(redact)?;
-                if relative.components().any(|c| c.as_os_str() == "sce_sys")
-                    || ["bin", "elf", "prx", "sprx", "self"].contains(&path.extension().and_then(|e| e.to_str()).unwrap_or("")) {
+                if private_staging_file(relative) {
                     private_bytes = private_bytes.saturating_add(metadata.len());
                 }
             }
@@ -387,11 +567,14 @@ pub fn workspace_size(source: &Path) -> Result<(u64, u64), String> {
 }
 
 pub fn stage_source_controlled(source: &Path, staging: &Path, checkpoint: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
-    stage_source_with_repairs(source, staging, &[], checkpoint)
+    stage_source_with_repairs(source, staging, &[], checkpoint).map(|_| ())
 }
 
-pub fn stage_source_with_repairs(source: &Path, staging: &Path, repairs: &[crate::fpkg_doctor::DoctorRepair], checkpoint: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
+pub fn stage_source_with_repairs(source: &Path, staging: &Path, repairs: &[crate::fpkg_doctor::DoctorRepair], checkpoint: &dyn Fn() -> Result<(), String>) -> Result<StagedFiles, String> {
+    let mut staged = StagedFiles::default();
+    let mut excluded = 0; let mut scene = 0;
     std::fs::create_dir_all(staging).map_err(redact)?;
+    if std::fs::read_dir(staging).map_err(redact)?.next().is_some() { return Err("Packaging staging directory must be empty".into()); }
     let mut stack = vec![(source.to_path_buf(), staging.to_path_buf())];
     while let Some((from, to)) = stack.pop() {
         for entry in std::fs::read_dir(&from).map_err(redact)? {
@@ -404,9 +587,12 @@ pub fn stage_source_with_repairs(source: &Path, staging: &Path, repairs: &[crate
             }
             let name = entry.file_name();
             let lower = name.to_string_lossy().to_ascii_lowercase();
-            if lower == "decrypted"
-                || lower.ends_with(BACKUP_SUFFIX)
-                || (lower.starts_with("playgo") && lower.ends_with(".dat")) { continue; }
+            if excluded_staging_name(&lower) {
+                excluded += 1;
+                if excluded <= 8 { staged.warnings.push(format!("Staging excluded backup or regenerated metadata: {}", path.strip_prefix(source).map_err(redact)?.display())); }
+                continue;
+            }
+            if lower == "_duplex_" || [".nfo", ".sfv", ".diz"].iter().any(|suffix| lower.ends_with(suffix)) { scene += 1; }
             let dest = to.join(&name);
             if metadata.is_dir() {
                 std::fs::create_dir_all(&dest).map_err(redact)?;
@@ -414,10 +600,10 @@ pub fn stage_source_with_repairs(source: &Path, staging: &Path, repairs: &[crate
             } else if metadata.is_file() {
                 let relative = path.strip_prefix(source).map_err(redact)?;
                 let original = path.clone();
-                let private = relative.components().any(|c| c.as_os_str() == "sce_sys")
-                    || ["bin", "elf", "prx", "sprx", "self"].contains(&path.extension().and_then(|e| e.to_str()).unwrap_or(""));
+                staged.files.insert(relative.to_path_buf(), metadata.len());
+                let private = private_staging_file(relative);
                 if private || std::fs::hard_link(&original, &dest).is_err() {
-                    super::storage::guard_bytes(staging, std::fs::metadata(&original).map_err(redact)?.len(), "packaging workspace")?;
+                    super::storage::guard_bytes(staging, metadata.len(), "packaging workspace")?;
                     use std::io::{Read, Write};
                     let mut input = std::fs::File::open(&original).map_err(redact)?;
                     let mut output = std::fs::File::create(&dest).map_err(redact)?;
@@ -440,11 +626,14 @@ pub fn stage_source_with_repairs(source: &Path, staging: &Path, repairs: &[crate
         super::storage::guard_bytes(staging, std::fs::metadata(&repair.backup).map_err(redact)?.len(), "doctor repair")?;
         use std::io::{Read, Write};
         let mut input = std::fs::File::open(&repair.backup).map_err(redact)?;
+        staged.files.insert(repair.relative.clone(), input.metadata().map_err(redact)?.len());
         let mut output = std::fs::File::create(&dest).map_err(redact)?;
         let mut buffer = vec![0u8; 4 * 1024 * 1024];
         loop { checkpoint()?; let n = input.read(&mut buffer).map_err(redact)?; if n == 0 { break; } output.write_all(&buffer[..n]).map_err(redact)?; }
     }
-    Ok(())
+    if excluded > 0 { staged.warnings.push(format!("Staging excluded {excluded} backup/metadata entries in total; AMPR references keep their file IDs.")); }
+    if scene > 0 { staged.warnings.push(format!("Staging kept {scene} scene/release entries (.nfo/.sfv/.diz/_DUPLEX_); their AMPR sizes are reconciled with the staged bytes.")); }
+    Ok(staged)
 }
 
 fn is_reparse(metadata: &std::fs::Metadata) -> bool {
@@ -453,6 +642,40 @@ fn is_reparse(metadata: &std::fs::Metadata) -> bool {
         metadata.file_attributes() & 0x400 != 0
     }
     #[cfg(not(windows))] { let _ = metadata; false }
+}
+
+/// `<Title> [PPSA12345]`, safe as one Windows folder name.
+pub fn package_folder_name(title: &str, title_id: Option<&str>) -> String {
+    let mut name: String = title.chars()
+        .map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { ' ' } else { c })
+        .collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+    name = name.chars().take(80).collect::<String>().trim_end_matches(['.', ' ']).to_string();
+    if name.is_empty() { name = "Package".into(); }
+    match title_id.filter(|id| !id.is_empty() && !name.contains(*id)) {
+        Some(id) => format!("{name} [{id}]"),
+        None => name,
+    }
+}
+
+/// Moves a verified package out of its disposable workspace. The destination is a plain
+/// (non-verbatim) path; an existing file with the same name gets a ` (2)`-style suffix.
+pub fn relocate_package(built: &Path, folder: &Path) -> Result<PathBuf, String> {
+    let file = built.file_name().ok_or("Package has no file name")?;
+    std::fs::create_dir_all(folder).map_err(redact)?;
+    let stem = Path::new(file).file_stem().unwrap_or(file).to_string_lossy().into_owned();
+    let extension = Path::new(file).extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let mut destination = folder.join(file);
+    for n in 2.. {
+        if !destination.exists() { break; }
+        if n > 999 { return Err("Too many packages with the same name in the FPKG folder".into()); }
+        destination = folder.join(format!("{stem} ({n}){extension}"));
+    }
+    if std::fs::rename(built, &destination).is_err() {
+        // Different volume: copy, then remove the workspace copy only after the copy is complete.
+        std::fs::copy(built, &destination).map_err(redact)?;
+        std::fs::remove_file(built).map_err(redact)?;
+    }
+    Ok(destination)
 }
 
 pub fn cleanup_extracted(source: &Path, download_root: &Path) -> Result<(), String> {
@@ -654,6 +877,32 @@ pub async fn build_controlled(
     }
 
     std::fs::create_dir_all(&options.output_dir).map_err(redact)?;
+    let temp_dir = options.temp_dir.clone().unwrap_or_else(|| {
+        choose_temp_dir(&options.output_dir, pre.total_bytes, &TempEnvironment::system()).dir
+            .join(format!("sspi-fpkg-{}", uuid::Uuid::new_v4()))
+    });
+    let temp = TempWorkspace::create(&temp_dir)?;
+    let outcome = build_in_temp(engine, options, &temp.dir, on_line, on_progress, paused).await;
+    let cleanup = temp.cleanup().map_err(|error| format!("Cannot clean packaging temp {}: {error}", temp.dir.display()));
+    match (outcome, cleanup) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),
+    }
+}
+
+fn guard_build_space(output: &Path, temp: &Path) -> Result<(), String> {
+    super::storage::guard_bytes(output, 0, "packaging")?;
+    if let Some(free) = super::free_space(temp) {
+        if free < TEMP_RESERVE_BYTES {
+            return Err(format!("Not enough space during packaging temporary files: {:.2} GiB reserve required, {:.2} GiB free at {}. Free space, then Retry; retained inputs are kept.",
+                TEMP_RESERVE_BYTES as f64 / (1u64 << 30) as f64, free as f64 / (1u64 << 30) as f64, temp.display()));
+        }
+    }
+    Ok(())
+}
+
+fn build_command(engine: &Path, options: &PackageOptions, temp: &Path) -> Result<Command, String> {
     let pfs = options.effective_pfs_version();
 
     let mut cmd = Command::new(engine);
@@ -662,6 +911,8 @@ pub async fn build_controlled(
         .arg(&options.source)
         .arg("--output")
         .arg(&options.output_dir)
+        .arg("--temp")
+        .arg(temp)
         .arg("--level")
         .arg(options.effective_compression_level()?.to_string())
         .arg("--pfs")
@@ -670,6 +921,9 @@ pub async fn build_controlled(
         .arg(options.block_size_kib.to_string())
         .arg("--kind")
         .arg(options.kind.engine_flag())
+        // BelowNormal lost 20-30 s on the 47 GiB Kraken 3 dump to ordinary desktop load.
+        .arg("--priority")
+        .arg("normal")
         .arg("--json-progress");
     if let Some(title) = options.title_id.as_deref() {
         cmd.arg("--title-id").arg(title);
@@ -682,12 +936,22 @@ pub async fn build_controlled(
     }
 
     #[cfg(windows)]
-    cmd.creation_flags(0x08004000); // CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS.
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW; the engine runs at Normal priority.
     cmd.kill_on_drop(true);
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::piped());
+    Ok(cmd)
+}
 
+async fn build_in_temp(
+    engine: &Path, options: &PackageOptions, temp: &Path,
+    on_line: impl Fn(String) + Send + 'static,
+    on_progress: impl Fn(f64, String) + Send + 'static,
+    paused: impl Fn() -> Result<bool, String> + Send + 'static,
+) -> Result<BuildOutcome, String> {
+    guard_build_space(&options.output_dir, temp)?;
+    let mut cmd = build_command(engine, options, temp)?;
     let started = Instant::now();
     let mut child = cmd
         .spawn()
@@ -716,7 +980,7 @@ pub async fn build_controlled(
     while !out_done || !err_done {
         tokio::select! {
             _ = control_tick.tick() => {
-                let pause = match paused().and_then(|pause| { super::storage::guard_bytes(&options.output_dir, 0, "packaging")?; Ok(pause) }) {
+                let pause = match paused().and_then(|pause| { guard_build_space(&options.output_dir, temp)?; Ok(pause) }) {
                     Ok(pause) => pause,
                     Err(error) => { let _ = child.kill().await; let _ = child.wait().await; return Err(error); }
                 };
@@ -727,7 +991,10 @@ pub async fn build_controlled(
                 }
             },
             line = out_lines.next_line(), if !out_done => {
-                let line: Option<String> = line.map_err(redact)?;
+                let line = match line {
+                    Ok(line) => line,
+                    Err(error) => { let _ = child.kill().await; let _ = child.wait().await; return Err(redact(error)); }
+                };
                 match line {
                     Some(line) => {
                         if let Some(path) = parse_output_path(&line) {
@@ -745,7 +1012,11 @@ pub async fn build_controlled(
                 }
             }
             line = err_lines.next_line(), if !err_done => {
-                match line.map_err(redact)? {
+                let line = match line {
+                    Ok(line) => line,
+                    Err(error) => { let _ = child.kill().await; let _ = child.wait().await; return Err(redact(error)); }
+                };
+                match line {
                     Some(line) => { push_tail(&mut log_tail, line.clone()); on_line(line); }
                     None => err_done = true,
                 }
@@ -841,6 +1112,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn package_folder_names_are_safe_and_carry_the_title_id() {
+        assert_eq!(package_folder_name("The Lord of the Rings: Gollum™", Some("PPSA06367")), "The Lord of the Rings Gollum™ [PPSA06367]");
+        assert_eq!(package_folder_name("  A/B\\\\C?..  ", Some("PPSA00001")), "A B C [PPSA00001]");
+        assert_eq!(package_folder_name("PPSA00001", Some("PPSA00001")), "PPSA00001");
+        assert_eq!(package_folder_name("\u{7}\u{7}", None), "Package");
+    }
+
+    #[test]
+    fn relocation_moves_the_package_and_never_overwrites_one() {
+        let root = crate::test_output_root().join(uuid::Uuid::new_v4().to_string());
+        let workspace = root.join("packaged").join("job").join("output");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let folder = root.join("FPKG").join("Game [PPSA00001]");
+        for (n, body) in [b"first".as_slice(), b"second".as_slice()].into_iter().enumerate() {
+            let built = workspace.join("UP0000-PPSA00001_00-GAME000000000000-A0100-V0100.pkg");
+            std::fs::write(&built, body).unwrap();
+            let moved = relocate_package(&built, &folder).unwrap();
+            assert!(!built.exists());
+            assert_eq!(std::fs::read(&moved).unwrap(), body);
+            let expected = if n == 0 { "UP0000-PPSA00001_00-GAME000000000000-A0100-V0100.pkg" } else { "UP0000-PPSA00001_00-GAME000000000000-A0100-V0100 (2).pkg" };
+            assert_eq!(moved.file_name().unwrap(), expected);
+        }
+        assert_eq!(std::fs::read(folder.join("UP0000-PPSA00001_00-GAME000000000000-A0100-V0100.pkg")).unwrap(), b"first");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn kraken_worker_budget_reserves_a_core_and_memory() {
+        assert_eq!(worker_budget(24, 64 << 30), 23);
+        assert_eq!(worker_budget(64, 64 << 30), 32);
+        assert_eq!(worker_budget(12, 64 << 30), 11);
+        assert_eq!(worker_budget(24, 4 << 30), 4);
+        assert_eq!(worker_budget(24, 1 << 30), 1);
+        assert_eq!(worker_budget(1, 64 << 30), 1);
+    }
+
+    #[test]
+    fn staged_inventory_matches_preflight_after_index_repairs_and_excludes_backups() {
+        let root = crate::test_output_root().join(uuid::Uuid::new_v4().to_string());
+        let source = root.join("source"); let staging = root.join("staging");
+        std::fs::create_dir_all(source.join("sce_sys")).unwrap();
+        std::fs::create_dir_all(source.join("_DUPLEX_")).unwrap();
+        std::fs::write(source.join("sce_sys/param.json"), r#"{"titleId":"PPSA99999","contentId":"IV0000-PPSA99999_00-SSPIPACKTEST0000","contentVersion":"01.000.000"}"#).unwrap();
+        std::fs::write(source.join("eboot.bin"), b"broken").unwrap();
+        std::fs::write(source.join("eboot.bin.orig"), plaintext_self()).unwrap();
+        std::fs::write(source.join("_DUPLEX_/duplex.nfo"), b"release text\r\n").unwrap();
+        std::fs::write(source.join("ampr_emu.index"), b"old index").unwrap();
+        std::fs::write(source.join("sce_sys/playgo-chunk.dat"), b"stale").unwrap();
+        let doctor = crate::fpkg_doctor::inspect(&source, &|| Ok(())).unwrap();
+        assert!(doctor.blockers().is_empty()); assert_eq!(doctor.repairs.len(), 1);
+        assert_eq!(workspace_size(&source).unwrap(), (doctor.source_bytes, doctor.private_bytes));
+        let inventory = stage_source_with_repairs(&source, &staging, &doctor.repairs, &|| Ok(())).unwrap();
+        crate::ampr_index::prepare_staged(&staging, &|| Ok(())).unwrap();
+        let fast = preflight_staged(&staging, 100, &inventory).unwrap(); let full = preflight(&staging, 100).unwrap();
+        assert!(fast.ok() && full.ok()); assert_eq!((fast.file_count, fast.total_bytes), (full.file_count, full.total_bytes));
+        assert!(fast.warnings.iter().any(|s| s.contains("scene/release")));
+        assert!(!staging.join("eboot.bin.orig").exists()); assert!(!staging.join("sce_sys/playgo-chunk.dat").exists());
+        assert_eq!(std::fs::read(source.join("eboot.bin")).unwrap(), b"broken");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn staging_preserves_patched_files_and_backport_libraries() {
         let root = crate::test_output_root().join(uuid::Uuid::new_v4().to_string());
         let source = root.join("download/extracted/game");
@@ -886,7 +1219,7 @@ mod tests {
         stage_source(&fixture.join("source"), &staging).unwrap();
         let mut options = PackageOptions::new(staging, output.join("packages"));
         options.title_id = Some("PPSA99999".into());
-        options.preset = PackagePreset::Fast;
+        options.preset = PackagePreset::Fastest;
         options.threads = Some(4);
         let result = build(&engine, &options, |_| {}, |_, _| {}).await.unwrap();
         assert!(result.output.is_file());
@@ -908,13 +1241,151 @@ mod tests {
 
     #[test]
     fn presets_map_to_levels() {
-        assert_eq!(PackagePreset::from_label("fast").level(), 2);
-        assert_eq!(PackagePreset::from_label("").level(), 4);
-        assert_eq!(PackagePreset::from_label("smallest").level(), 7);
+        assert_eq!(PackagePreset::from_label("fast").level(), FASTEST_COMPRESSION_LEVEL);
+        assert_eq!(PackagePreset::from_label("fastest"), PackagePreset::Fastest);
+        assert_eq!(PackagePreset::from_label("standard"), PackagePreset::Balanced);
+        assert_eq!(PackagePreset::from_label("balanced"), PackagePreset::Balanced);
+        assert_eq!(PackagePreset::from_label("").level(), BALANCED_COMPRESSION_LEVEL);
+        assert_eq!(PackagePreset::from_label("smallest").level(), SMALLEST_COMPRESSION_LEVEL);
         let mut options = PackageOptions::new("source", "output");
-        assert_eq!(options.effective_compression_level().unwrap(), 4);
-        for level in 1..=9 { options.compression_level = Some(level); assert_eq!(options.effective_compression_level().unwrap(), level); }
-        for level in [0, 10, 255] { options.compression_level = Some(level); assert!(options.effective_compression_level().is_err()); }
+        assert_eq!(options.effective_compression_level().unwrap(), BALANCED_COMPRESSION_LEVEL);
+        assert_eq!(options.effective_pfs_version(), 2);
+        options.preset = PackagePreset::Smallest;
+        for level in (-4..=-1).chain(1..=9) { options.compression_level = Some(level); assert_eq!(options.effective_compression_level().unwrap(), level); }
+        for level in [0, 10, -5, i8::MIN, i8::MAX] { options.compression_level = Some(level); assert!(options.effective_compression_level().is_err()); }
+    }
+
+    #[test]
+    fn settings_migrate_old_presets_and_keep_explicit_levels() {
+        for (saved, canonical) in [("fast", "fastest"), ("standard", "balanced"), ("smallest", "smallest"), ("fastest", "fastest"), ("balanced", "balanced")] {
+            let mut value = serde_json::to_value(crate::Settings::default()).unwrap();
+            value["fpkgPreset"] = saved.into();
+            value["fpkgCompressionLevel"] = 3.into();
+            let settings: crate::Settings = serde_json::from_value(value).unwrap();
+            assert_eq!(settings.fpkg_preset, canonical);
+            assert_eq!(settings.fpkg_compression_level, Some(3));
+            assert_eq!(serde_json::to_value(settings).unwrap()["fpkgPreset"], canonical);
+        }
+        let mut value = serde_json::to_value(crate::Settings::default()).unwrap();
+        for field in ["fpkgPreset", "fpkgCompressionLevel", "fpkgPfsVersion"] { value.as_object_mut().unwrap().remove(field); }
+        let settings: crate::Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.fpkg_preset, "balanced");
+        assert_eq!(settings.fpkg_compression_level, None);
+        assert_eq!(settings.fpkg_pfs_version, 2);
+    }
+
+    #[test]
+    fn settings_save_level_validation_accepts_hyperfast_and_rejects_gaps() {
+        let mut value = serde_json::to_value(crate::Settings::default()).unwrap();
+        for level in [-4, -1, 1, 3, 9, 0, 10, -5] {
+            value["fpkgCompressionLevel"] = level.into();
+            let input: crate::SaveSettings = serde_json::from_value(value.clone()).unwrap();
+            let settings: crate::Settings = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(input.fpkg_compression_level, Some(level as i8));
+            assert_eq!(settings.fpkg_compression_level, input.fpkg_compression_level);
+            assert_eq!(validate_compression_level(input.fpkg_compression_level).is_ok(), matches!(level, -4..=-1 | 1..=9));
+        }
+        assert!(validate_compression_level(None).is_ok());
+    }
+
+    #[test]
+    fn packaging_info_keeps_signed_levels_and_defaults_old_temp_path() {
+        let info = crate::PackagingInfo { compression_level: -4, temp_path: "C:/Temp/sspi-fpkg-job".into(), ..Default::default() };
+        let mut value = serde_json::to_value(info).unwrap();
+        assert_eq!(value["compressionLevel"], -4);
+        assert_eq!(value["tempPath"], "C:/Temp/sspi-fpkg-job");
+        value.as_object_mut().unwrap().remove("tempPath");
+        value["compressionLevel"] = 3.into();
+        let restored: crate::PackagingInfo = serde_json::from_value(value).unwrap();
+        assert!(restored.temp_path.is_empty());
+        assert_eq!(restored.compression_level, 3);
+    }
+
+    fn temp_environment(fixed: bool, free_bytes: u64) -> TempEnvironment {
+        TempEnvironment { system_temp: PathBuf::from("C:/Windows/Temp"), volumes: vec![TempVolume { letter: 'C', fixed, free_bytes }] }
+    }
+
+    #[test]
+    fn temp_uses_another_fixed_volume_with_enough_space() {
+        let input = 40 << 30;
+        let env = temp_environment(true, input + TEMP_RESERVE_BYTES);
+        let choice = choose_temp_dir(Path::new("D:/packages"), input, &env);
+        assert_eq!(choice.dir, env.system_temp);
+        assert!(choice.reason.contains("another fixed volume"));
+    }
+
+    #[test]
+    fn temp_falls_back_when_space_is_short_or_size_overflows() {
+        let output = Path::new("D:/packages");
+        let input = 40 << 30;
+        for (bytes, free) in [(input, input + TEMP_RESERVE_BYTES - 1), (u64::MAX, u64::MAX)] {
+            let choice = choose_temp_dir(output, bytes, &temp_environment(true, free));
+            assert_eq!(choice.dir, output.join("work"));
+            assert!(choice.reason.contains("lacks room"));
+        }
+    }
+
+    #[test]
+    fn temp_falls_back_on_the_same_volume() {
+        for output in [Path::new("c:/packages"), Path::new(r"\\?\C:\packages")] {
+            let choice = choose_temp_dir(output, 1, &temp_environment(true, u64::MAX));
+            assert_eq!(choice.dir, output.join("work"));
+            assert!(choice.reason.contains("shares the output volume"));
+        }
+    }
+
+    #[test]
+    fn temp_skips_removable_network_and_unknown_volumes() {
+        let output = Path::new("D:/packages");
+        let mut env = temp_environment(false, u64::MAX);
+        assert_eq!(choose_temp_dir(output, 1, &env).dir, output.join("work"));
+        env.system_temp = PathBuf::from(r"\\server\share\Temp");
+        assert_eq!(choose_temp_dir(output, 1, &env).dir, output.join("work"));
+        env.system_temp = PathBuf::from("Z:/Temp");
+        assert_eq!(choose_temp_dir(output, 1, &env).dir, output.join("work"));
+        env.system_temp = PathBuf::from("Temp");
+        assert_eq!(choose_temp_dir(output, 1, &env).dir, output.join("work"));
+    }
+
+    #[test]
+    fn build_arguments_pass_temp_and_signed_level() {
+        let mut options = PackageOptions::new("D:/dump", "D:/output");
+        options.preset = PackagePreset::Smallest;
+        options.compression_level = Some(-4);
+        let temp = Path::new("C:/Temp with spaces/sspi-fpkg-job");
+        let command = build_command(Path::new("fpkg-cli.exe"), &options, temp).unwrap();
+        let args: Vec<_> = command.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        for (flag, expected) in [("--temp", temp.to_str().unwrap()), ("--level", "-4"), ("--pfs", "v2"), ("--priority", "normal")] {
+            let index = args.iter().position(|arg| arg == flag).unwrap();
+            assert_eq!(args[index + 1], expected);
+        }
+    }
+
+    #[test]
+    fn temp_workspace_cleans_up_on_success_and_error_without_touching_siblings() {
+        let root = crate::test_output_root().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        let sibling = root.join("keep");
+        std::fs::write(&sibling, b"keep").unwrap();
+        for fail in [false, true] {
+            let dir = root.join(format!("sspi-fpkg-{}", uuid::Uuid::new_v4()));
+            let result: Result<(), String> = (|| {
+                let temp = TempWorkspace::create(&dir)?;
+                std::fs::create_dir(temp.dir.join("nested")).unwrap();
+                std::fs::write(temp.dir.join("nested/inner.img"), b"inner image").unwrap();
+                if fail { return Err("engine failed".into()); }
+                temp.cleanup()
+            })();
+            assert_eq!(result.is_err(), fail);
+            assert!(!dir.exists());
+            assert_eq!(std::fs::read(&sibling).unwrap(), b"keep");
+        }
+        assert!(TempWorkspace::create(&sibling).is_err());
+        let existing = root.join(format!("sspi-fpkg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&existing).unwrap();
+        assert!(TempWorkspace::create(&existing).is_err());
+        assert!(existing.is_dir());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -985,7 +1456,7 @@ mod tests {
     fn preflight_accepts_plaintext_fself_without_backup_and_keeps_bytes() {
         let dir = crate::test_output_root().join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir_all(dir.join("sce_sys")).unwrap();
-        std::fs::write(dir.join("sce_sys").join("param.json"), "{}").unwrap();
+        std::fs::write(dir.join("sce_sys").join("param.json"), r#"{"titleId":"PPSA99999","contentId":"IV0000-PPSA99999_00-SSPIPACKTEST0000","contentVersion":"01.000.000"}"#).unwrap();
         let executable = plaintext_self();
         std::fs::write(dir.join("eboot.bin"), &executable).unwrap();
         let report = preflight(&dir, 100).unwrap();
@@ -998,7 +1469,8 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("eboot.bin")).unwrap(), executable);
         std::fs::write(dir.join("playgo-chunk.dat"), b"x").unwrap();
         let report = preflight(&dir, 100).unwrap();
-        assert!(report.blockers.iter().any(|b| b.contains("playgo")));
+        assert!(report.ok());
+        assert!(report.warnings.iter().any(|b| b.contains("playgo")));
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::remove_dir_all(staging).unwrap();
     }
@@ -1107,7 +1579,7 @@ mod tests {
         assert!(preflight(&staging, 100).unwrap().ok());
         assert!(!staging.join("decrypted").exists());
         let mut options = PackageOptions::new(&staging, root.join("host-only-packages"));
-        options.preset = PackagePreset::Fast;
+        options.preset = PackagePreset::Fastest;
         let outcome = build(&locate_engine(None).unwrap(), &options, |line| println!("{line}"), |_, _| {}).await.unwrap();
         assert_eq!(package_identity(&outcome.output).unwrap(), param["contentId"].as_str().unwrap());
         assert_eq!(std::fs::read(staging.join("eboot.bin")).unwrap(), original);

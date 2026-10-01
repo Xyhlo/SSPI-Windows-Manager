@@ -56,6 +56,7 @@ export function stageLabel(job: DeliveryJob) {
       "monitoring-ended": "Check PS4",
     }[job.stage] || ({queued: "Queued", unlocking: "Preparing link", downloading: "Downloading", extracting: "Extracting", packaging: "Packaging FPKG", submitting: "Submitting to console", mounting: "Mounting", failed: "Needs attention", cancelled: "Cancelled"}[job.stage] || job.stage))
   }
+  if (job.stage === "packaging" && job.packaging?.format === "exfat") return "Building image"
   return ({queued: "Queued", unlocking: "Preparing link", downloading: "Downloading", extracting: "Extracting", packaging: "Packaging FPKG", uploading: "Uploading", submitting: "Submitting to console", installing: "Installing", mounting: "Mounting", complete: "Complete", handoff: "Waiting for console", delivered: "Delivered", failed: "Needs attention", cancelled: "Cancelled", "monitoring-ended": "Check console"}[job.stage] || job.stage)
 }
 
@@ -119,6 +120,14 @@ export function transferStats(job: DeliveryJob, upload?: UploadState | null) {
   if (job.stage === "extracting" && detail.phase === "finalization") label = detail.label
   if (job.target === "ps4" && job.stage === "installing") label = transferred ? "Transfer complete · installing on PS4" : "Installing on PS4"
   if (job.target === "ps4" && job.stage === "monitoring-ended") label = transferred ? "Transfer complete · installation unconfirmed" : "Installation confirmation unavailable"
+  if (job.stage === "packaging") {
+    // Engine I/O measured from its own process counters: reads while compressing, writes while
+    // building the outer PFS. CPU-only stages (artwork, digests) are a true zero, not missing data.
+    const engine = job.packaging?.engine
+    const rate = engine?.stage === "compress" ? engine.io.readBps : engine?.stage === "outer" ? engine.io.writeBps : engine ? 0 : null
+    const live = !job.paused && activeTransfer(job) && rate != null && Number.isFinite(rate)
+    return { label, speedBps: live ? Math.max(0, rate) : null, etaSeconds: live && engine?.etaSeconds != null && engine.etaSeconds > 0 ? engine.etaSeconds : null }
+  }
   const byteWork = !job.paused && activeTransfer(job) && !transferred &&
     (job.stage === "downloading" || job.stage === "uploading" || (job.stage === "extracting" && detail.phase === "extraction"))
   const rate = tracked ? tracked.speedBps : job.speedBps
@@ -223,7 +232,7 @@ export function retainJobPaths(prev: JobPaths | undefined, next: JobPaths): JobP
 
 export type WorkPhase = "inspection" | "extraction" | "finalization" | "packaging" | "cleanup" | "staging" | "upload" | "unknown"
 
-type JobSnapshot = Pick<DeliveryJob, "stage" | "progress" | "bytesDone" | "bytesTotal" | "message" | "packageLabel"> & { stageHistory?: string[] }
+type JobSnapshot = Pick<DeliveryJob, "stage" | "progress" | "bytesDone" | "bytesTotal" | "message" | "packageLabel"> & { stageHistory?: string[]; packaging?: { format?: string } | null }
 
 /** Recovers the failing phase from a tagged backend error ("extraction/inspection: …", "cleanup: …"); "unknown" for untagged errors rather than guessing. */
 export function errorWorkPhase(message: string): WorkPhase {
@@ -322,7 +331,7 @@ export function phaseDetail(job: JobSnapshot): PhaseDetail {
     return { phase: "inspection", label: "Inspecting archive", indeterminate: true }
   }
   if (job.stage === "packaging") {
-    return { phase: "packaging", label: "Packaging FPKG", indeterminate: !(job.progress > 0) }
+    return { phase: "packaging", label: job.packaging?.format === "exfat" ? "Building image" : "Packaging FPKG", indeterminate: !(job.progress > 0) }
   }
   if (job.stage === "uploading") {
     if (/retrying/i.test(job.message || "")) return { phase: "upload", label: "Retrying upload", indeterminate: !(job.bytesTotal || 0) }

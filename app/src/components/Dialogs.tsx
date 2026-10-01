@@ -40,13 +40,15 @@ export function ReceiverDialog({ open, message, host, port, busy, onClose, onDow
 }
 
 /** Packages found on this PC and game folders to package or install. */
-export function ImportDialog({ open, onClose, target, local, picked, setPicked, onInstallLocal, localBusy, localBlock, manual, setManual, onInstallManual, manualBusy, manualBlock, onClear }: {
+export function ImportDialog({ open, onClose, target, local, picked, setPicked, onInstallLocal, localBusy, localBlock, manual, setManual, onInstallManual, manualBusy, manualBlock, manualNote, manualInstallLabel = "Install selected", onClear }: {
   open: boolean; onClose: () => void; target: ConsoleKind
   local: LocalPackage[]; picked: string[]; setPicked: (paths: string[]) => void; onInstallLocal: () => void; localBusy: boolean; localBlock?: string
-  manual: ManualRow[]; setManual: (update: (rows: ManualRow[]) => ManualRow[]) => void; onInstallManual: (packageOnly: boolean) => void; manualBusy: boolean; manualBlock?: string
+  manual: ManualRow[]; setManual: (update: (rows: ManualRow[]) => ManualRow[]) => void; onInstallManual: (packageOnly: boolean, pack?: boolean) => void; manualBusy: boolean; manualBlock?: string
+  manualNote?: string; manualInstallLabel?: string
   onClear: () => void
 }) {
   const packableOnly = manual.some(item => item.content !== "dump" || item.kind === "backport")
+  const allDumps = manual.length > 0 && !packableOnly
   return (
     <Shell open={open} onClose={onClose} wide title="Add from this PC" description={`Choose what to send to your ${target.toUpperCase()}. Imported originals are never changed or removed.`}>
       <div className="dialog-body">
@@ -89,10 +91,13 @@ export function ImportDialog({ open, onClose, target, local, picked, setPicked, 
                 </div>
               ))}
             </div>
-            {manualBlock && <p className="local-note">{manualBlock}</p>}
+            {manualBlock ? <p className="local-note">{manualBlock}</p> : manualNote && <p className="rail-note" style={{ marginTop: 8 }}>{manualNote}</p>}
             <div className="dialog-actions" style={{ justifyContent: "flex-start", marginTop: 10 }}>
-              <button type="button" className="btn primary sm" disabled={packableOnly || manualBusy} title={packableOnly ? "Only complete game folders (not backports or archives) can be packaged on their own." : undefined} onClick={() => onInstallManual(true)}>{manualBusy ? <span className="spinner" /> : <Icon name="box" />}Package {plural(manual.length, "folder")}</button>
-              <button type="button" className="btn sm" disabled={!!manualBlock || manualBusy} onClick={() => onInstallManual(false)}>{manualBusy ? <span className="spinner" /> : <Icon name="download" />}Install selected</button>
+              <button type="button" className="btn primary sm" disabled={packableOnly || manualBusy} title={packableOnly ? "Only complete game folders (not backports or archives) can be packaged on their own." : "Build every folder on this PC. Nothing is sent."} onClick={() => onInstallManual(true)}>{manualBusy ? <span className="spinner" /> : <Icon name="box" />}Package all</button>
+              {allDumps ? <>
+                <button type="button" className="btn sm" disabled={!!manualBlock || manualBusy} title="Build each folder, then send it to the PS5" onClick={() => onInstallManual(false, true)}>{manualBusy ? <span className="spinner" /> : <Icon name="download" />}Package and send all</button>
+                <button type="button" className="btn sm" disabled={!!manualBlock || manualBusy} title="Upload each folder as it is, without packaging" onClick={() => onInstallManual(false, false)}>{manualBusy ? <span className="spinner" /> : <Icon name="download" />}Send all as folders</button>
+              </> : <button type="button" className="btn sm" disabled={!!manualBlock || manualBusy} onClick={() => onInstallManual(false)}>{manualBusy ? <span className="spinner" /> : <Icon name="download" />}{manualInstallLabel}</button>}
             </div>
           </>
         )}

@@ -460,6 +460,16 @@ static void theme_active(char *out, size_t cap) {
     size_t n=0; while (n<64 && n+1<cap && raw[n] && ((raw[n]>='A'&&raw[n]<='Z')||(raw[n]>='0'&&raw[n]<='9')||raw[n]=='-'||raw[n]=='_')) { out[n]=raw[n]; n++; }
     out[n]=0;
 }
+/* Settings > Themes stores the full content ID as the selection; older receivers wrote the
+   16-character label. Try the console's own form first, then the label. */
+static int theme_select(const char *cid) {
+    char id[64]; memset(id,0,sizeof(id)); snprintf(id,sizeof(id),"%s",cid);
+    int rc=api.theme_set(user_id,id); log_line("theme entitlement set user=%d cid=%s rc=0x%08x",user_id,id,(unsigned)rc);
+    if (!rc) return 0;
+    memset(id,0,sizeof(id)); memcpy(id,cid+20,16);
+    int label_rc=api.theme_set(user_id,id); log_line("theme entitlement set user=%d label=%s rc=0x%08x",user_id,id,(unsigned)label_rc);
+    return label_rc;
+}
 static void theme_command(Command *c) {
     c->code=RESP_ERROR;
     if (c->command==CMD_THEME_LIST) {
@@ -475,9 +485,7 @@ static void theme_command(Command *c) {
         rc=api.theme_uninstall(c->cid); log_line("theme uninstall cid=%s rc=0x%08x",c->cid,(unsigned)rc);
     } else {
         if (!api.theme_set||user_id<0) { snprintf(c->result,sizeof(c->result),"this firmware does not offer theme selection"); return; }
-        /* The entitlement is the 16-character label after the content ID's last dash. */
-        char label[64]; memset(label,0,sizeof(label)); memcpy(label,c->cid+20,16);
-        rc=api.theme_set(user_id,label); log_line("theme entitlement set user=%d label=%s rc=0x%08x",user_id,label,(unsigned)rc);
+        rc=theme_select(c->cid);
     }
     if (rc) snprintf(c->result,sizeof(c->result),"PS4 refused the theme request (0x%08x)",(unsigned)rc);
     else { c->code=RESP_OK; snprintf(c->result,sizeof(c->result),"OK"); }

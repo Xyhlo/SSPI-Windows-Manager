@@ -1,7 +1,7 @@
 #ifndef SSPI_PROTO_H
 #define SSPI_PROTO_H
 #include "platform.h"
-#define VERSION "1.0.5"
+#define VERSION "1.0.11"
 #define DEFAULT_PORT 9114
 #define MAX_FRAME (8u * 1024u * 1024u)
 #define MAX_PATH_BYTES 2048
@@ -21,6 +21,8 @@ enum {
     CMD_TITLE_ICON_GET=0x60, CMD_TITLE_ICON_SET=0x61, CMD_TITLE_ICON_RESTORE=0x62,
     CMD_SHELL_REFRESH=0x63, CMD_SYSTEM_INFO=0x64, CMD_INSTALL_THEME=0x65,
     CMD_THEME_LIST=0x66, CMD_THEME_APPLY=0x67, CMD_THEME_DELETE=0x68,
+    CMD_KERNEL_LOG=0x69, CMD_PROCESSES=0x6a, CMD_LOG_LIST=0x6b, CMD_LOG_READ=0x6c, CMD_PROCESS_CONTROL=0x6e,
+    CMD_TITLE_ICON_SET2=0x6f,
     RESP_OK=1, RESP_ERROR=2, RESP_DATA=3, RESP_READY=4
 };
 static inline uint32_t read_u32le(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24); }

@@ -35,6 +35,9 @@ export type Settings = {
   keepArchives: boolean
   keepExtractions: boolean
   keepPackages: boolean
+  /** Remove from list / Clear inactive never delete a finished package. */
+  keepPackagesOnRemove?: boolean
+  /** "fastest" | "balanced" | "smallest"; older builds saved fast / standard. */
   fpkgPreset: string
   fpkgCompressionLevel?: number | null
   fpkgDoctor: boolean
@@ -42,7 +45,15 @@ export type Settings = {
   fpkgEnginePath: string
   targetFw: string
   fpkgCleanupSource: boolean
+  /** Dump packaging output: an installable FPKG or a ShadowMount Plus exFAT image. */
+  packageFormat?: PackageFormat
+  /** Lizard (AMPR/LZ4) asset packing inside exFAT images. Experimental. */
+  lizardPacking?: boolean
+  /** What adding game folders does: ask, or start one batch action right away. */
+  folderAction?: FolderAction
 }
+export type FolderAction = "ask" | "package" | "package-send" | "send"
+export type PackageFormat = "fpkg" | "exfat"
 
 export type Game = {
   variants?: Game[]
@@ -126,6 +137,34 @@ export type PackagingInfo = {
   activity?: string; phaseProgress?: number | null;
   compressionInputBytes?: number | null; compressionOutputBytes?: number | null;
   speedBps?: number | null; lastActivitySeconds?: number | null;
+  /** Engine telemetry (stages-io-v1); the last snapshot is the build summary. */
+  engine?: PackEngine | null
+  /** Where the builder's temporary inner image went (the app picks the drive). */
+  tempPath?: string
+  workspaceSeconds?: number | null
+  totalSeconds?: number | null
+  /** "exfat" for ShadowMount images; empty or "fpkg" for packages. */
+  format?: string
+  /** Lizard (AMPR/LZ4) packing summary for images built with it. */
+  lizard?: LizardSummary | null
+}
+export type LizardSummary = {
+  runtime: string; filesTotal: number; filesPacked: number; filesAutoLoose: number
+  packedBytes: number; storedBytes: number; chunks: number; sharedChunks: number; packs: number; crcPath: string
+}
+
+export type PackStageState = "pending" | "active" | "done"
+export type PackStage = { id: string; label: string; state: PackStageState; seconds: number; progress?: number | null; detail?: string | null }
+/** Measured by the packaging engine: builder milestones and this process's own I/O counters. */
+export type PackEngine = {
+  stage: string; stageIndex: number; stageCount: number; stageProgress?: number | null
+  stages: PackStage[]
+  io: { readBytes: number; writeBytes: number; readBps?: number | null; writeBps?: number | null }
+  inputBytes?: number | null; compressedBytes?: number | null
+  files?: { done: number; total: number } | null
+  currentFile?: string | null; currentFileProgress?: number | null
+  etaSeconds?: number | null
+  level: number; workers: number; pfs: string; blockKiB: number; elapsedSeconds: number
 }
 
 export type DoctorReport = {
@@ -277,14 +316,17 @@ export const blankSettings: Settings = {
   transferMode: "balanced",
   uploadLanes: 4,
   packageDumps: false,
-  downloadPackageOnly: false, keepArchives: false, keepExtractions: false, keepPackages: true,
-  fpkgPreset: "fast",
+  downloadPackageOnly: false, keepArchives: false, keepExtractions: false, keepPackages: true, keepPackagesOnRemove: true,
+  fpkgPreset: "balanced",
   fpkgCompressionLevel: null,
   fpkgDoctor: false,
   fpkgPfsVersion: 2,
   fpkgEnginePath: "",
   targetFw: "",
   fpkgCleanupSource: false,
+  packageFormat: "fpkg",
+  lizardPacking: false,
+  folderAction: "ask",
 }
 
 export const isActiveJob = (stage: string) =>

@@ -63,7 +63,7 @@ fn overlay_request(request: &DeliveryRequest) -> DeliveryRequest {
     let input = request.backport.as_ref().expect("validated combined request");
     DeliveryRequest { package: input.package.clone(), title_id: request.title_id.clone(),
         title_name: request.title_name.clone(), icon: request.icon.clone(), archive_parts: input.parts.clone(), backport: None, provider: request.provider.clone(),
-        target: request.target.clone(), transport: request.transport.clone() }
+        target: request.target.clone(), transport: request.transport.clone(), package_dumps: request.package_dumps }
 }
 
 fn save(app: &AppHandle, job: &str, state: &CombinedState) -> Result<(), String> {
@@ -210,7 +210,7 @@ fn extract_tree(source: &Path, dest: &Path, kind: ArtifactKind, password: Option
     // keeping distinct roots so an ambiguous backport cannot be silently selected.
     for nested in nested_rar_volumes(dest) {
         control()?;
-        let nested = if read_magic_sync(&nested).is_some_and(|m| m.starts_with(b"Rar!")) { unrar::Archive::new(&nested).as_first_part().filename().to_path_buf() } else { nested };
+        let nested = if read_magic_sync(&nested).is_some_and(|m| m.starts_with(b"Rar!")) { Some(rar_first_volume(&nested)).filter(|first| first.is_file()).unwrap_or(nested) } else { nested };
         if !seen_archives.insert(nested.clone()) { continue; }
         let kind = artifact_kind(&read_magic_sync(&nested).ok_or("Unreadable nested archive")?, &nested.to_string_lossy(), "");
         let output = dest.join(format!("unpacked_{}", Uuid::new_v4()));

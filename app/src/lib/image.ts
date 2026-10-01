@@ -93,28 +93,28 @@ export function pngBase64(canvas: HTMLCanvasElement, matte?: string) {
   return source.toDataURL("image/png").replace(/^data:image\/png;base64,/, "")
 }
 
+/** Marks art made here as finished, so the boxed-cover crop leaves it alone. */
+export const PLAIN_ART_PREFIX = "data:image/jpeg;sspi-art=1;base64,"
+
 const portraits = new Map<string, Promise<string>>()
 /**
- * Case art from a square home-screen icon: the icon sits full width in a portrait front, over a
- * blurred, darkened copy of itself, so a case shows the whole icon instead of a cropped middle.
+ * Case art from a square home-screen icon. The icon fills the case window (the front below the
+ * PS4 / PS5 band, about 0.9 as wide as it is tall), trimmed evenly at the sides, so the whole
+ * window is artwork with no band above or below it.
  */
 export function portraitFromIcon(src: string): Promise<string> {
   let request = portraits.get(src)
   if (!request) {
     request = loadImage(src).then(image => {
-      const w = 540, h = Math.round(540 * 1379 / 1080)
+      const w = 540, h = 600
+      const iw = image.naturalWidth || w, ih = image.naturalHeight || h
+      const scale = Math.max(w / iw, h / ih)
       const canvas = document.createElement("canvas")
       canvas.width = w; canvas.height = h
       const ctx = canvas.getContext("2d")!
-      ctx.fillStyle = "#0b0b0c"
-      ctx.fillRect(0, 0, w, h)
-      ctx.filter = "blur(28px) saturate(1.15) brightness(.55)"
-      ctx.drawImage(image, -h * 0.1, -h * 0.05, h * 1.2, h * 1.1)
-      ctx.filter = "none"
-      const top = Math.round((h - w) * 0.42)
       ctx.imageSmoothingQuality = "high"
-      ctx.drawImage(image, 0, top, w, w)
-      return canvas.toDataURL("image/jpeg", 0.9)
+      ctx.drawImage(image, (w - iw * scale) / 2, (h - ih * scale) / 2, iw * scale, ih * scale)
+      return canvas.toDataURL("image/jpeg", 0.9).replace("data:image/jpeg;base64,", PLAIN_ART_PREFIX)
     })
     portraits.set(src, request)
     request.catch(() => portraits.delete(src))

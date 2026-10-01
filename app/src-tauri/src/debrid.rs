@@ -51,7 +51,7 @@ pub(super) fn enabled(settings: &Settings) -> Vec<&'static str> {
         .collect()
 }
 
-fn token(provider: &str, supplied: Option<String>) -> Result<String, String> {
+pub(super) fn token(provider: &str, supplied: Option<String>) -> Result<String, String> {
     if !PROVIDERS.contains(&provider) {
         return Err("Unknown link provider".into());
     }
@@ -68,8 +68,8 @@ fn token(provider: &str, supplied: Option<String>) -> Result<String, String> {
 }
 
 #[derive(Debug)]
-struct ApiError {
-    message: String,
+pub(super) struct ApiError {
+    pub(super) message: String,
     host_failure: bool,
 }
 impl ApiError {
@@ -113,7 +113,7 @@ fn response_error(provider: &str, value: &Value, status: u16) -> ApiError {
     }
 }
 
-async fn request(provider: &str, builder: reqwest::RequestBuilder) -> Result<Value, ApiError> {
+pub(super) async fn request(provider: &str, builder: reqwest::RequestBuilder) -> Result<Value, ApiError> {
     let mut response = builder
         .timeout(Duration::from_secs(30))
         .send()
@@ -124,6 +124,8 @@ async fn request(provider: &str, builder: reqwest::RequestBuilder) -> Result<Val
             ))
         })?;
     let status = response.status().as_u16();
+    // Real-Debrid answers an empty list with 204 No Content.
+    if status == 204 { return Ok(Value::Array(Vec::new())); }
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
@@ -403,7 +405,7 @@ fn host_state(inventory: &ProviderHosts, url: &str) -> HostState {
         .unwrap_or(HostState::Unknown)
 }
 
-fn http_url(value: &str) -> bool {
+pub(super) fn http_url(value: &str) -> bool {
     reqwest::Url::parse(value).is_ok_and(|url| {
         matches!(url.scheme(), "http" | "https")
             && url.host_str().is_some()
@@ -420,6 +422,10 @@ pub(super) async fn resolve(
 ) -> Result<(String, Option<String>, Option<u64>), String> {
     if !http_url(url) {
         return Err("Invalid provider link".into());
+    }
+    // A TorBox account file (debrid file browser) is requested directly, not unlocked as a hoster link.
+    if let Some(result) = super::cloud::torbox_file(http, url).await {
+        return result;
     }
     let allowed = enabled(settings);
     if allowed.is_empty() {

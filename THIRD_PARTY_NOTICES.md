@@ -155,8 +155,39 @@ or add verified provenance and notices.
   bundling with software; the font may not be sold on its own, and the license
   text must accompany redistributed copies.
 
+### lz4 / lz4-sys — Lizard asset-pack compression
+
+- Versions: lz4 1.28.1 and lz4-sys 1.11.1+lz4-1.10.0, pinned in `app/src-tauri/Cargo.lock`.
+- Source: https://github.com/10xGenomics/lz4-rs. License: MIT (crate metadata and `LICENSE`).
+- lz4-sys compiles the bundled LZ4 library 1.10.0, Copyright (c) 2011-2020 Yann Collet,
+  BSD 2-Clause (`liblz4/LICENSE`). Ship both notices with binary distributions.
+
+### crc32fast — Lizard block checksums
+
+- Version: 1.5.1, pinned in `app/src-tauri/Cargo.lock`.
+- Source: https://github.com/srijs/rust-crc32fast. License: MIT OR Apache-2.0 (crate metadata).
+
+### ampr_emu — Lizard pack format and pack-capable runtime
+
+- `app/src-tauri/src/ampr_pack.rs` is a port of the pack tool (`ampr_pack.py` 4.0 and
+  `ampr_pack_format.py`) from drakmor's ampr_emu 0.4.2.1 pack tools. The release copies the
+  locally supplied `libSceAmpr.sprx` 0.4.2.1 "test-pack" build (SHA-256
+  `69e6c4d5e4f5fb83c9e01815db5861c4c75734acbf4595cafa50d4c218116d1a`) from `SDK/ampr/`
+  into `resources/ampr/`.
+- Status: `BLOCKED`. The local pack tools carry only the LZ4 license; ampr_emu's own license
+  and redistribution terms are not recorded. Confirm them before publishing the port or
+  distributing the runtime, and ship the required notice.
+
+### exFAT up-case table
+
+- `app/src-tauri/src/exfat/upcase_table.rs` holds the recommended up-case table defined in
+  Microsoft's exFAT specification (section 7.2.5.1; 5,836 bytes, checksum `0xE619D30D`).
+  The values were transcribed from exfatprogs 1.2.0 `mkfs/upcase.c` and checked against the
+  specification's checksum. No exfatprogs code is used.
+
 ### LibOrbisPkg — PS4 theme packaging library
 
+- Used by Tools > Themes, restored on 2026-10-01.
 - Observed file: `LibOrbisPkg.Core.dll` (assembly version 0.2.0.0), supplied locally
   under `SDK/liborbispkg/` and shipped unmodified in `resources/themepack/`.
 - Source: https://github.com/maxton/LibOrbisPkg. License: GNU LGPL version 3,
@@ -167,6 +198,7 @@ or add verified provenance and notices.
 
 ### PS4 Ultimate Theme Creator — theme format reference
 
+- Used by Tools > Themes, restored on 2026-10-01.
 - Source: PS4 Ultimate Theme Creator, Copyright (c) 2026 Imxnxl. License: MIT.
 - SSPI's PS4 theme builder follows its console-verified theme layout, animated
   scene structure and limits, and embeds the 420-byte plane model its generator

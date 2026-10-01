@@ -19,6 +19,10 @@ pub struct DoctorReport {
     pub issues: Vec<DoctorIssue>,
     pub repairs: Vec<DoctorRepair>,
     pub scanned_modules: usize,
+    #[serde(skip)]
+    pub source_bytes: u64,
+    #[serde(skip)]
+    pub private_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -138,10 +142,12 @@ pub fn inspect(
                     relative.display()
                 ));
             }
+            report.source_bytes = report.source_bytes.saturating_add(metadata.len());
+            if crate::fpkg::private_staging_file(&relative) { report.private_bytes = report.private_bytes.saturating_add(metadata.len()); }
             if tree == Tree::Runtime || tree == Tree::Excluded {
                 continue;
             }
-            if name.ends_with(".esbak") {
+            if crate::fpkg::BACKUP_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) {
                 if tree == Tree::Game {
                     report.issue(
                         &relative,
@@ -209,7 +215,7 @@ pub fn inspect(
     Ok(report)
 }
 
-fn inspect_metadata(source: &Path, report: &mut DoctorReport) -> Result<(), String> {
+pub(crate) fn inspect_metadata(source: &Path, report: &mut DoctorReport) -> Result<(), String> {
     let relative = Path::new("sce_sys/param.json");
     let path = source.join(relative);
     let Some(metadata) = safe_metadata(&path)? else {
@@ -329,7 +335,7 @@ fn inspect_module(
         }
         match validate_executable(&backup) {
             Ok(()) => {
-                report.issue(relative, "warning", format!("{problem}. A structurally valid .esbak is available for a staging-only replacement; the original dump remains unchanged. Launch compatibility still requires console testing."))?;
+                report.issue(relative, "warning", format!("{problem}. A structurally valid backup {} is available for a staging-only replacement; the original dump remains unchanged. Launch compatibility still requires console testing.", backup.strip_prefix(source).unwrap_or(&backup).display()))?;
                 report.repairs.push(DoctorRepair {
                     relative: relative.to_path_buf(),
                     backup,
@@ -399,14 +405,13 @@ fn excluded_repair_target(relative: &Path) -> bool {
     })
 }
 
-fn backup_paths(source: &Path, relative: &Path) -> [PathBuf; 2] {
-    let mut filename = relative.file_name().unwrap_or_default().to_os_string();
-    filename.push(".esbak");
-    let backup_relative = relative.with_file_name(filename);
-    [
-        source.join("decrypted").join(&backup_relative),
-        source.join(backup_relative),
-    ]
+fn backup_paths(source: &Path, relative: &Path) -> Vec<PathBuf> {
+    crate::fpkg::BACKUP_SUFFIXES.iter().flat_map(|suffix| {
+        let mut filename = relative.file_name().unwrap_or_default().to_os_string();
+        filename.push(suffix);
+        let backup_relative = relative.with_file_name(filename);
+        [source.join("decrypted").join(&backup_relative), source.join(backup_relative)]
+    }).collect()
 }
 
 fn module_extension(path: &Path) -> bool {
@@ -419,7 +424,7 @@ fn module_extension(path: &Path) -> bool {
     )
 }
 
-fn is_module(path: &Path, relative: &Path) -> Result<bool, String> {
+pub(crate) fn is_module(path: &Path, relative: &Path) -> Result<bool, String> {
     if module_extension(relative) {
         return Ok(true);
     }

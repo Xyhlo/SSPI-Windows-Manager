@@ -1,26 +1,61 @@
 /* =====================================================================
-   Options — the SSPI PS4 "Options" overlay: sections switch with Q / E,
-   rows take focus, "Save and close" persists. Appearance applies live.
+   Options — the SSPI PS4 "Options" overlay. Its sections take the place
+   of the app's tabs in the header (Q / E switch them); each page is one
+   column of grouped settings. "Save and close" persists; Appearance
+   applies live.
    ===================================================================== */
 import { invoke } from "@tauri-apps/api/core"
 import { open as openDialog } from "@tauri-apps/plugin-dialog"
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from "react"
 import { DoctorReportView } from "./DoctorReportView"
-import { CheckDraw, Icon } from "./Icon"
+import { CheckDraw, ConsoleGlyph, Icon } from "./Icon"
 import { Field, Row, Seg, Switch } from "./Controls"
-import { Dock, type Hint } from "./Shell"
 import { toast } from "./toasts"
 import { ACCENTS, DEFAULT_APPEARANCE, PATTERNS, type Appearance } from "@/lib/appearance"
 import { discoverConsoles } from "@/lib/console-api"
 import { displayText } from "@/lib/display"
 import { errorText } from "@/lib/format"
+import { FPKG_LEVELS, FPKG_PRESETS, levelName, presetOf, type FpkgPreset } from "@/lib/fpkg-presets"
 import { glide } from "@/lib/motion"
 import { patternPreview } from "@/stage/art"
 import type { DiscoveredConsole } from "@/lib/console-types"
-import type { ConsoleKind, DoctorReport, PackageSource, Ps4Probe, Settings } from "@/types"
+import type { ConsoleKind, DoctorReport, FolderAction, PackageFormat, PackageSource, Ps4Probe, Settings } from "@/types"
 
 export type OptionsTab = "consoles" | "sources" | "debrid" | "downloads" | "packaging" | "appearance"
 const TABS: Array<[OptionsTab, string]> = [["consoles", "Consoles"], ["sources", "Sources"], ["debrid", "Debrid"], ["downloads", "Downloads"], ["packaging", "Packaging"], ["appearance", "Appearance"]]
+
+/** The section before or after `tab`; the matching shoulder key flashes as if it was pressed. */
+export function stepOptionsTab(tab: OptionsTab, direction: -1 | 1): OptionsTab {
+  const index = TABS.findIndex(([id]) => id === tab)
+  const key = document.getElementById(direction < 0 ? "optQ" : "optE")
+  if (key) { key.classList.add("pressed"); window.setTimeout(() => key.classList.remove("pressed"), 140) }
+  return TABS[(index + direction + TABS.length) % TABS.length][0]
+}
+
+/** The Options sections, drawn in the header in place of the app's tabs while Options is open. */
+export function OptionsTabs({ tab, onTab }: { tab: OptionsTab; onTab: (tab: OptionsTab) => void }) {
+  const ref = useRef<HTMLElement>(null)
+  const ink = useRef<HTMLSpanElement>(null)
+  const placed = useRef(false)
+  useLayoutEffect(() => {
+    glide(ink.current, ref.current?.querySelector<HTMLElement>(`.tab[data-tab="${tab}"]`) || null, ref.current, placed.current ? { inset: 14, liquid: true } : { inset: 14, instant: true })
+    placed.current = true
+  }, [tab])
+  useEffect(() => {
+    const onResize = () => glide(ink.current, ref.current?.querySelector<HTMLElement>(".tab[aria-selected=true]") || null, ref.current, { inset: 14, instant: true })
+    window.addEventListener("resize", onResize)
+    document.fonts?.ready.then(onResize).catch(() => undefined)
+    return () => window.removeEventListener("resize", onResize)
+  }, [])
+  return (
+    <nav className="tabs opt-nav" ref={ref} role="tablist" aria-label="Options sections">
+      <span className="shoulder l" id="optQ" role="button" tabIndex={-1} aria-label="Previous section (Q)" onClick={() => onTab(stepOptionsTab(tab, -1))}>Q</span>
+      {TABS.map(([id, label]) => <button key={id} type="button" className="tab" role="tab" data-tab={id} aria-selected={tab === id} onClick={() => onTab(id)}>{label}</button>)}
+      <span className="shoulder r" id="optE" role="button" tabIndex={-1} aria-label="Next section (E)" onClick={() => onTab(stepOptionsTab(tab, 1))}>E</span>
+      <span className="tab-ink" ref={ink} />
+    </nav>
+  )
+}
 
 type Props = {
   tab: OptionsTab
@@ -38,6 +73,8 @@ type Props = {
   payloadBusy: boolean
   onConsoleTested: (target: ConsoleKind, ok: boolean) => void
   build: string
+  /** Changes when the header's Options button asks to close (unsaved changes still ask first). */
+  closeRequest: number
 }
 
 const inTauri = () => "__TAURI_INTERNALS__" in window
@@ -52,7 +89,7 @@ function TestButton({ busy, ok, onClick, label, okLabel = "Connected", disabled,
 }
 
 export function OptionsOverlay(props: Props) {
-  const { tab, setTab, onClose, settings, setSettings, sources, setSources, appearance, setAppearance, demo, onLeaveDemo, downloadReceiver, payloadBusy, onConsoleTested, build } = props
+  const { tab, setTab, onClose, settings, setSettings, sources, setSources, appearance, setAppearance, demo, onLeaveDemo, downloadReceiver, payloadBusy, onConsoleTested, build, closeRequest } = props
   const [draft, setDraft] = useState<Settings>(settings)
   const [rdToken, setRdToken] = useState("")
   const [torboxToken, setTorboxToken] = useState("")
@@ -69,25 +106,16 @@ export function OptionsOverlay(props: Props) {
   const [sourceUrl, setSourceUrl] = useState("")
   const [removing, setRemoving] = useState("")
   const [sheet, setSheet] = useState(false)
-  const tabsRef = useRef<HTMLDivElement>(null)
-  const thumbRef = useRef<HTMLSpanElement>(null)
   const bodyRef = useRef<HTMLDivElement>(null)
 
   const dirty = !demo && (JSON.stringify(draft) !== JSON.stringify(settings) || !!rdToken || !!torboxToken || !!alldebridToken || !!ps4FtpPassword)
   const patch = (update: Partial<Settings>) => setDraft(current => ({ ...current, ...update }))
 
-  useLayoutEffect(() => { glide(thumbRef.current, tabsRef.current?.querySelector<HTMLElement>(`.opt-tab[data-tab="${tab}"]`) || null, tabsRef.current) }, [tab])
   useEffect(() => { if (bodyRef.current) bodyRef.current.scrollTop = 0 }, [tab])
   useEffect(() => { if (flash) { const t = window.setTimeout(() => setFlash(""), 1600); return () => window.clearTimeout(t) } }, [flash])
 
   const close = (force = false) => { if (dirty && !force) { setSheet(true); return } onClose() }
-  const stepTab = (direction: number) => {
-    const index = TABS.findIndex(([id]) => id === tab)
-    const next = TABS[(index + direction + TABS.length) % TABS.length][0]
-    const el = document.getElementById(direction < 0 ? "optQ" : "optE")
-    if (el) { el.classList.add("pressed"); window.setTimeout(() => el.classList.remove("pressed"), 140) }
-    setTab(next)
-  }
+  const stepTab = (direction: -1 | 1) => setTab(stepOptionsTab(tab, direction))
 
   const save = async (event?: FormEvent) => {
     event?.preventDefault()
@@ -126,6 +154,8 @@ export function OptionsOverlay(props: Props) {
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
   }, [])
+  const firstCloseRequest = useRef(closeRequest)
+  useEffect(() => { if (closeRequest !== firstCloseRequest.current) live.current.close() }, [closeRequest])
 
   /* ---------------------------------------------------------------- console checks */
   const run = async (key: string, work: () => Promise<void>, failTitle: string) => {
@@ -219,12 +249,13 @@ export function OptionsOverlay(props: Props) {
 
   /* ---------------------------------------------------------------- sections */
   const disabled = demo || !inTauri()
-  const level = draft.fpkgCompressionLevel ?? ({ fast: 2, standard: 4, smallest: 7 } as Record<string, number>)[draft.fpkgPreset] ?? 2
+  const preset = presetOf(draft.fpkgPreset)
+  const exactLevel = draft.fpkgCompressionLevel ?? null
+  const image = draft.packageFormat === "exfat"
   const sections: Record<OptionsTab, ReactNode> = {
     consoles: <>
-      <h2>Consoles</h2><p className="lede">SSPI installs on the console you manage. Browsing and package links never need a connection.</p>
-      <div className="orows one">
-        <Row wide label="Find consoles on this network" detail="Scan this PC's network for consoles and receiver services.">
+      <div className="orows">
+        <Row label="Find consoles on this network">
           <button type="button" className="btn sm" disabled={scanningNetwork || (!demo && !inTauri())} onClick={() => void findConsoles()}>
             {scanningNetwork ? <><span className="spinner" aria-hidden="true" />Scanning</> : <><Icon name="search" />Find consoles</>}
           </button>
@@ -232,70 +263,68 @@ export function OptionsOverlay(props: Props) {
       </div>
       {discoveryError && <p className="opt-msg" role="alert">{discoveryError}</p>}
       {discoveredConsoles?.length === 0 && <p className="opt-msg" role="status">No consoles answered. Check that the console is on and on the same network, then load the receiver.</p>}
-      {!!discoveredConsoles?.length && <div className="orows one" aria-label="Discovered consoles">
+      {!!discoveredConsoles?.length && <div className="orows" aria-label="Discovered consoles">
         {discoveredConsoles.map(console => <Row key={`${console.host}-${console.label}`} label={console.host} detail={console.label}>
           {(console.platform === "ps5" || console.platform === "unknown") && <button type="button" className="btn sm ghost" onClick={() => useDiscoveredConsole(console, "ps5")}>Use for PS5</button>}
           {(console.platform === "ps4" || console.platform === "unknown") && <button type="button" className="btn sm ghost" onClick={() => useDiscoveredConsole(console, "ps4")}>Use for PS4</button>}
         </Row>)}
       </div>}
-      <div className="opt-section">PS5 receiver</div>
+      <div className="opt-section"><ConsoleGlyph kind="ps5" />PS5</div>
       <div className="orows">
-        <Row label="Address" detail="IPv4 address or hostname of your PS5"><Field label="PS5 address" value={draft.ps5Host} onChange={value => patch({ ps5Host: value })} placeholder="IP address or hostname" icon="monitor" /></Row>
-        <Row label="Receiver port" detail="Must match the receiver on the PS5"><Field label="PS5 receiver port" type="number" width={110} value={draft.ps5Port} onChange={value => patch({ ps5Port: Number(value) })} /></Row>
-        <Row label="ELF loader port" detail="Payloads and the receiver are sent here. The etaHEN and elfldr loaders listen on 9021."><Field label="PS5 ELF loader port" type="number" width={110} value={draft.ps5LoaderPort ?? 9021} onChange={value => { const port = Number(value); if (Number.isFinite(port)) patch({ ps5LoaderPort: Math.min(65535, Math.max(1, Math.trunc(port))) }) }} /></Row>
-        <Row wide label="Receiver" detail={ps5Message || "The SSPI receiver shows artwork and progress on the PS5. Reload it after updating the app or changing the port."} tone={ps5Message ? "good" : undefined}>
+        <Row label="Address"><Field label="PS5 address" value={draft.ps5Host} onChange={value => patch({ ps5Host: value })} placeholder="IP address or hostname" icon="monitor" /></Row>
+        <Row label="Receiver port"><Field label="PS5 receiver port" type="number" width={110} value={draft.ps5Port} onChange={value => patch({ ps5Port: Number(value) })} /></Row>
+        <Row label="ELF loader port" detail="etaHEN and elfldr use 9021"><Field label="PS5 ELF loader port" type="number" width={110} value={draft.ps5LoaderPort ?? 9021} onChange={value => { const port = Number(value); if (Number.isFinite(port)) patch({ ps5LoaderPort: Math.min(65535, Math.max(1, Math.trunc(port))) }) }} /></Row>
+        <Row label="Receiver" detail={ps5Message || "Reload it after updating SSPI"} tone={ps5Message ? "good" : undefined}>
           <TestButton busy={busy === "ps5"} ok={flash === "ps5"} onClick={() => void testPs5()} label="Test receiver" disabled={disabled} />
           <button type="button" className="btn ghost sm" disabled={payloadBusy || disabled} onClick={() => void downloadReceiver()}>{payloadBusy ? <span className="spinner" /> : <Icon name="download" />}Download receiver ELF</button>
         </Row>
       </div>
-      <div className="opt-section">PS4</div>
+      <div className="opt-section"><ConsoleGlyph kind="ps4" />PS4</div>
       <div className="orows">
-        <Row label="Address" detail="IPv4 address or hostname of your PS4"><Field label="PS4 address" value={draft.ps4Host} onChange={value => patch({ ps4Host: value })} placeholder="IP address or hostname" icon="monitor" /></Row>
-        <Row label="Delivery method" detail={draft.ps4Transport === "receiver" ? "The SSPI receiver payload, loaded through GoldHEN" : "SSPI's pkg-rars inbox over FTP"}>
+        <Row label="Address"><Field label="PS4 address" value={draft.ps4Host} onChange={value => patch({ ps4Host: value })} placeholder="IP address or hostname" icon="monitor" /></Row>
+        <Row label="Delivery method">
           <Seg label="PS4 delivery method" value={draft.ps4Transport} options={[["receiver", "Receiver payload"], ["inbox", "SSPI inbox"]]} onChange={value => patch({ ps4Transport: value })} />
         </Row>
         {draft.ps4Transport === "receiver" ? <>
-          <Row label="Receiver port" detail="9114 unless you changed it on the PS4"><Field label="PS4 receiver port" type="number" width={110} value={draft.ps4ReceiverPort} onChange={value => patch({ ps4ReceiverPort: Number(value) })} /></Row>
-          <Row label="GoldHEN BinLoader port" detail="9090 by default"><Field label="BinLoader port" type="number" width={110} value={draft.ps4LoaderPort} onChange={value => patch({ ps4LoaderPort: Number(value) })} /></Row>
-          <Row label="PC download port" detail="The PS4 downloads base games and updates from this PC. Allow SSPI through Windows Firewall when asked."><Field label="PC download port" type="number" width={110} value={draft.ps4ServePort} onChange={value => patch({ ps4ServePort: Number(value) })} /></Row>
-          <Row wide label="Receiver" detail="Load it again after each PS4 restart. GoldHEN's “Payload received” message alone doesn't confirm that it started.">
+          <Row label="Receiver port"><Field label="PS4 receiver port" type="number" width={110} value={draft.ps4ReceiverPort} onChange={value => patch({ ps4ReceiverPort: Number(value) })} /></Row>
+          <Row label="GoldHEN BinLoader port"><Field label="BinLoader port" type="number" width={110} value={draft.ps4LoaderPort} onChange={value => patch({ ps4LoaderPort: Number(value) })} /></Row>
+          <Row label="PC download port" detail="Allow SSPI through Windows Firewall when asked"><Field label="PC download port" type="number" width={110} value={draft.ps4ServePort} onChange={value => patch({ ps4ServePort: Number(value) })} /></Row>
+          <Row label="Receiver" detail="Load it again after each PS4 restart">
             <button type="button" className="btn sm" disabled={!!busy || disabled} onClick={() => void loadPs4Receiver()}>{busy === "ps4-load" ? <span className="spinner" /> : <Icon name="upload" />}Load receiver on PS4</button>
             <TestButton busy={busy === "ps4-test"} ok={flash === "ps4-test"} onClick={() => void testPs4Receiver()} label="Test receiver" disabled={disabled} />
             <button type="button" className="btn ghost sm" disabled={!!busy || disabled} onClick={() => void exportPs4()}><Icon name="download" />Download PS4 payload</button>
           </Row>
-          <p className="opt-note">Needs GoldHEN 2.4b18.5 or newer with BinLoader enabled. If sending fails while BinLoader is on, turn it off and on again. SSPI on the PS4 isn't required for this method.</p>
         </> : <>
-          <Row label="FTP port" detail="GoldHEN's FTP server, 2121 by default"><Field label="FTP port" type="number" width={110} value={draft.ps4FtpPort} onChange={value => patch({ ps4FtpPort: Number(value) })} /></Row>
-          <Row label="FTP user" detail="Optional"><Field label="FTP user" value={draft.ps4FtpUser} onChange={value => patch({ ps4FtpUser: value })} placeholder="anonymous" width={180} /></Row>
-          <Row label="FTP password" detail={draft.ps4FtpPasswordConfigured ? "A password is saved. Leave blank to keep it." : "Optional. Leave blank for anonymous."}><Field label="FTP password" type="password" value={ps4FtpPassword} onChange={setPs4FtpPassword} width={180} icon="lock" /></Row>
-          <Row label="Archives for PS4" detail="Where RAR sets are unpacked">
+          <Row label="FTP port"><Field label="FTP port" type="number" width={110} value={draft.ps4FtpPort} onChange={value => patch({ ps4FtpPort: Number(value) })} /></Row>
+          <Row label="FTP user"><Field label="FTP user" value={draft.ps4FtpUser} onChange={value => patch({ ps4FtpUser: value })} placeholder="anonymous" width={180} /></Row>
+          <Row label="FTP password" detail={draft.ps4FtpPasswordConfigured ? "Saved. Leave blank to keep it." : undefined}><Field label="FTP password" type="password" value={ps4FtpPassword} onChange={setPs4FtpPassword} width={180} icon="lock" /></Row>
+          <Row label="Archives for PS4">
             <select className="select" value={draft.ps4ArchiveMode} onChange={event => patch({ ps4ArchiveMode: event.target.value as Settings["ps4ArchiveMode"] })}>
               <option value="pc">Extract on this PC (recommended)</option>
               <option value="ps4">Send RAR sets to the PS4</option>
             </select>
           </Row>
-          <Row label="Remove uploads after a confirmed install" detail="Deletes the copy in pkg-rars only after SSPI confirms the installation"><Switch label="Remove uploads after install" checked={draft.ps4RemoveAfterInstall} onChange={value => patch({ ps4RemoveAfterInstall: value })} /></Row>
-          <Row label="Connection" detail="SSPI's background worker installs uploads even when the SSPI app is closed">
+          <Row label="Remove uploads after a confirmed install"><Switch label="Remove uploads after install" checked={draft.ps4RemoveAfterInstall} onChange={value => patch({ ps4RemoveAfterInstall: value })} /></Row>
+          <Row label="Connection">
             <TestButton busy={busy === "ps4"} ok={flash === "ps4"} onClick={() => void testPs4Ftp()} label="Test PS4" disabled={disabled} />
           </Row>
-          <p className="opt-note">Enable GoldHEN's FTP server. PS5 games and game folders can't be sent to a PS4.</p>
         </>}
-        {ps4Message && <p className="opt-msg" role="status">{ps4Message}</p>}
       </div>
+      {ps4Message && <p className="opt-msg" role="status">{ps4Message}</p>}
+      <p className="opt-note">{draft.ps4Transport === "receiver" ? "Needs GoldHEN 2.4b18.5 or newer with BinLoader on." : "Needs GoldHEN's FTP server."}</p>
     </>,
     sources: <>
-      <h2>Sources</h2><p className="lede">Package sources list the titles and packages you can search. Install one from a URL or a .gssource file.</p>
       <div className="orows">
-        <Row label="Install from a URL" detail="A .gssource link">
+        <Row label="Install from a URL">
           <Field label="Source URL" value={sourceUrl} onChange={setSourceUrl} placeholder="https://…/source.gssource" icon="link" width={280} />
           <button type="button" className="btn sm" disabled={!sourceUrl.trim() || !!busy || disabled} onClick={() => void installSource()}>{busy === "source-install" ? <span className="spinner" /> : <Icon name="download" />}Install</button>
         </Row>
-        <Row label="Install from a file" detail="A .gssource or .zip on this PC">
+        <Row label="Install from a file">
           <button type="button" className="btn sm" disabled={!!busy || disabled} onClick={() => void browseSource()}>{busy === "source-browse" ? <span className="spinner" /> : <Icon name="folder" />}Browse</button>
         </Row>
       </div>
       <div className="opt-section">Installed sources</div>
-      <div className="orows one">
+      {!!sources.length && <div className="orows">
         {sources.map(source => (
           <div key={source.id} className="orow">
             <div className="source-row">
@@ -310,11 +339,10 @@ export function OptionsOverlay(props: Props) {
             </div>
           </div>
         ))}
-        {!sources.length && <p className="opt-note">No package sources are installed. Install one from a URL or a file to start searching.</p>}
-      </div>
+      </div>}
+      {!sources.length && <p className="opt-note">No sources installed yet.</p>}
     </>,
     debrid: <>
-      <h2>Debrid</h2><p className="lede">Download services resolve links from supported hosts. Turn on more than one to fall back when a host isn't supported.</p>
       {([
         { id: "real-debrid", name: "Real-Debrid", enabled: draft.realDebridEnabled, configured: draft.realDebridConfigured, token: rdToken, setToken: setRdToken, setEnabled: (value: boolean) => patch({ realDebridEnabled: value }) },
         { id: "torbox", name: "TorBox", enabled: draft.torboxEnabled, configured: draft.torboxConfigured, token: torboxToken, setToken: setTorboxToken, setEnabled: (value: boolean) => patch({ torboxEnabled: value }) },
@@ -323,114 +351,131 @@ export function OptionsOverlay(props: Props) {
         <div key={service.id}>
           <div className="opt-section"><span className={`dot ${service.enabled && service.configured ? "good" : ""}`} />{service.name}</div>
           <div className="orows">
-            <Row label={`Use ${service.name}`} detail={service.configured ? "An API key is saved" : "No API key saved"} tone={service.configured ? "good" : undefined}><Switch label={`Use ${service.name}`} checked={service.enabled} onChange={service.setEnabled} /></Row>
-            <Row label="API key" detail={service.configured ? "Leave blank to keep the saved key" : "Paste the key from your account page"}>
+            <Row label={`Use ${service.name}`}><Switch label={`Use ${service.name}`} checked={service.enabled} onChange={service.setEnabled} /></Row>
+            <Row label="API key" detail={service.configured ? "Saved. Leave blank to keep it." : undefined} tone={service.configured ? "good" : undefined}>
               <Field label={`${service.name} API key`} type="password" value={service.token} onChange={service.setToken} placeholder={service.configured ? "Saved" : "API key"} icon="key" width={220} />
               <TestButton busy={busy === service.id} ok={flash === service.id} onClick={() => void verify(service.id, service.token)} label="Verify" okLabel="Verified" icon="shield" disabled={disabled} />
             </Row>
           </div>
         </div>
       ))}
-      <p className="opt-note" style={{ marginTop: 14 }}>Keys stay in Windows Credential Manager. Save to apply changes and refresh host support.</p>
+      <p className="opt-note">Keys are stored in Windows Credential Manager.</p>
     </>,
     downloads: <>
-      <h2>Downloads</h2><p className="lede">Where files land on this PC, what is kept afterwards, and how fast packages go to the PS5.</p>
       <div className="orows">
-        <Row wide label="Download folder" detail="Archives, extracted games and packages are staged here. Choose a drive other than the Windows drive for large games.">
+        <Row label="Download folder">
           <Field label="Download folder" value={draft.downloadDir} onChange={value => patch({ downloadDir: value })} icon="folder" width={340} />
           <button type="button" className="btn sm" disabled={disabled} onClick={() => void browseFolder()}>Browse</button>
         </Row>
-        <Row label="Keep downloaded archives" detail="RAR, ZIP and multipart downloads after extraction"><Switch label="Keep downloaded archives" checked={draft.keepArchives} onChange={value => patch({ keepArchives: value })} /></Row>
-        <Row label="Keep extracted game files" detail="Base and backport folders after packaging"><Switch label="Keep extracted game files" checked={draft.keepExtractions} onChange={value => patch({ keepExtractions: value })} /></Row>
-        <Row label="Keep packaged PKGs" detail="After a confirmed install. Failed installs and package-only jobs always keep theirs."><Switch label="Keep packaged PKGs" checked={draft.keepPackages} onChange={value => patch({ keepPackages: value })} /></Row>
-        <p className="opt-note">These apply when a transfer starts or is retried. Keeping files uses more disk space. Imported originals are never removed.</p>
+        <Row label="Keep downloaded archives"><Switch label="Keep downloaded archives" checked={draft.keepArchives} onChange={value => patch({ keepArchives: value })} /></Row>
+        <Row label="Keep extracted game files"><Switch label="Keep extracted game files" checked={draft.keepExtractions} onChange={value => patch({ keepExtractions: value })} /></Row>
+        <Row label="Keep packaged PKGs" detail="After a confirmed install"><Switch label="Keep packaged PKGs" checked={draft.keepPackages} onChange={value => patch({ keepPackages: value })} /></Row>
       </div>
+      <p className="opt-note">Imported originals are never removed.</p>
       <div className="opt-section">Upload to PS5</div>
       <div className="orows">
-        <Row label="Max bandwidth" detail="Balanced uses 4 lanes; Max uses up to 12 on your local network"><Switch label="Max bandwidth" checked={(draft.transferMode || "balanced") === "max"} onChange={value => patch({ transferMode: value ? "max" : "balanced" })} /></Row>
+        <Row label="Max bandwidth" detail="Up to 12 upload lanes instead of 4"><Switch label="Max bandwidth" checked={(draft.transferMode || "balanced") === "max"} onChange={value => patch({ transferMode: value ? "max" : "balanced" })} /></Row>
         {(draft.transferMode || "balanced") === "max" && (
           <Row label="Upload lanes" detail="1 to 12"><Field label="Upload lanes" type="number" width={90} value={draft.uploadLanes || 4} onChange={value => patch({ uploadLanes: Math.min(12, Math.max(1, Number(value) || 4)) })} /></Row>
         )}
-        <p className="opt-note">Max bandwidth needs the current receiver ELF. If installs start failing, go back to Balanced. Downloads stay one stream per volume.</p>
       </div>
     </>,
     packaging: <>
-      <h2>Packaging</h2><p className="lede">Package extracted game dumps into a single FPKG before they go to the console.</p>
       <div className="orows">
-        <Row label="Package extracted dumps" detail="Download and extract dumps, then build a finalized PS5 package"><Switch label="Package extracted dumps" checked={draft.packageDumps} onChange={value => patch({ packageDumps: value })} /></Row>
-        <Row label="Download and package only" detail="Save packages on this PC without installing. No console needed; finished packages are kept."><Switch label="Download and package only" checked={draft.downloadPackageOnly} onChange={value => patch({ downloadPackageOnly: value, ...(value ? { packageDumps: true } : {}) })} /></Row>
-        {draft.packageDumps && <>
-          <Row label="Kraken compression" detail="Higher levels spend more CPU time for smaller packages. It doesn't change launch compatibility.">
-            <select className="select" value={level} onChange={event => patch({ fpkgCompressionLevel: Number(event.target.value) })}>
-              {[1, 2, 3, 4, 5, 6, 7, 8, 9].map(value => <option key={value} value={value}>Level {value}{({ 1: ", fastest", 2: ", fast", 4: ", balanced", 7: ", stronger", 9: ", most effort" } as Record<number, string>)[value] || ""}</option>)}
-            </select>
+        <Row label="Package extracted dumps"><Switch label="Package extracted dumps" checked={draft.packageDumps} onChange={value => patch({ packageDumps: value })} /></Row>
+        {draft.packageDumps && (
+          <Row label="Output" detail={image ? "Mounted by ShadowMount Plus; nothing is installed" : "An installable .pkg"}>
+            <Seg<PackageFormat> label="Output" value={image ? "exfat" : "fpkg"} options={[["fpkg", "FPKG package"], ["exfat", "ShadowMount image"]]} onChange={value => patch({ packageFormat: value })} />
           </Row>
-          <Row label="Dump doctor" detail="Checks modules and metadata, and repairs invalid or missing modules from validated backups in the workspace"><Switch label="Dump doctor" checked={!!draft.fpkgDoctor} onChange={value => patch({ fpkgDoctor: value })} /></Row>
-          <Row label="Target console firmware" detail="Optional. Used to pick backports and gate PFS v3."><Field label="Target firmware" value={draft.targetFw} onChange={value => patch({ targetFw: value })} placeholder="For example 4.03" width={150} /></Row>
-          <Row label="PFS v3" detail="Needs firmware 7.00 or newer. Unknown or older firmware uses PFS v2."><Switch label="PFS v3" checked={draft.fpkgPfsVersion === 3} onChange={value => patch({ fpkgPfsVersion: value ? 3 : 2 })} /></Row>
-          <Row wide label="Packaging engine" detail="Found automatically when left blank"><Field label="Packaging engine path" value={draft.fpkgEnginePath} onChange={value => patch({ fpkgEnginePath: value })} placeholder="fpkg-cli.exe" icon="cpu" width={320} /></Row>
-          <p className="opt-note">Packaging uses a private workspace with hard links for bulk files; originals and backport overlays are preserved. Backport libraries are included inside the package. Launching them needs compatible kstuff and PPR patches and a loader with installed-PKG backport support, such as ShadowMount Plus 1.7.</p>
-        </>}
-        <Row wide label="Inspect a dump" detail="Runs the dump doctor on a folder without packaging it">
+        )}
+        {draft.packageDumps && image && (
+          <Row label="Lizard asset packing" detail="Experimental. Only for backports that use ampr_emu">
+            <Switch label="Lizard asset packing" checked={!!draft.lizardPacking} onChange={value => patch({ lizardPacking: value })} />
+          </Row>
+        )}
+        <Row label="When game folders are added">
+          <select className="select" aria-label="When game folders are added" value={draft.folderAction || "ask"} onChange={event => patch({ folderAction: event.target.value as FolderAction })}>
+            <option value="ask">Ask</option>
+            <option value="package">Package all</option>
+            <option value="package-send">Package and send all</option>
+            <option value="send">Send all as folders</option>
+          </select>
+        </Row>
+        <Row label="Download and package only" detail="Keeps the output on this PC; nothing is sent"><Switch label="Download and package only" checked={draft.downloadPackageOnly} onChange={value => patch({ downloadPackageOnly: value, ...(value ? { packageDumps: true } : {}) })} /></Row>
+        <Row label="Keep finished packages when removing"><Switch label="Keep finished packages when removing" checked={draft.keepPackagesOnRemove !== false} onChange={value => patch({ keepPackagesOnRemove: value })} /></Row>
+        {draft.packageDumps && !image && (
+          <Row label="Compression" detail={exactLevel != null ? `Kraken ${exactLevel} is set in Advanced` : FPKG_PRESETS[preset].note}>
+            <Seg<FpkgPreset> label="Compression" value={preset} options={(Object.keys(FPKG_PRESETS) as FpkgPreset[]).map(id => [id, FPKG_PRESETS[id].label])} onChange={value => patch({ fpkgPreset: value, fpkgCompressionLevel: null })} />
+          </Row>
+        )}
+      </div>
+      {draft.packageDumps && (
+        <details className="opt-advanced">
+          <summary>Advanced packaging</summary>
+          <div className="orows">
+            {!image && <>
+              <Row label="Exact Kraken level" detail={exactLevel != null ? "Overrides the compression choice" : undefined}>
+                <select className="select" aria-label="Exact Kraken level" value={exactLevel ?? "preset"} onChange={event => patch({ fpkgCompressionLevel: event.target.value === "preset" ? null : Number(event.target.value) })}>
+                  <option value="preset">Use the compression choice</option>
+                  {FPKG_LEVELS.map(value => <option key={value} value={value}>{value} · {levelName(value)}</option>)}
+                </select>
+              </Row>
+              <Row label="PFS v3" detail="Firmware 7.00 or newer"><Switch label="PFS v3" checked={draft.fpkgPfsVersion === 3} onChange={value => patch({ fpkgPfsVersion: value ? 3 : 2 })} /></Row>
+            </>}
+            <Row label="Target console firmware" detail="Optional. Used to pick backports"><Field label="Target firmware" value={draft.targetFw} onChange={value => patch({ targetFw: value })} placeholder="For example 4.03" width={150} /></Row>
+            <Row label="Dump doctor" detail="Checks and repairs modules and metadata"><Switch label="Dump doctor" checked={!!draft.fpkgDoctor} onChange={value => patch({ fpkgDoctor: value })} /></Row>
+            {!image && <Row label="Packaging engine" detail="Found automatically if blank"><Field label="Packaging engine path" value={draft.fpkgEnginePath} onChange={value => patch({ fpkgEnginePath: value })} placeholder="fpkg-cli.exe" icon="cpu" width={320} /></Row>}
+          </div>
+        </details>
+      )}
+      {draft.packageDumps && !image && <p className="opt-note">Backports need kstuff, PPR patches and a loader with backport support, such as ShadowMount Plus 1.7.</p>}
+      {draft.packageDumps && image && <p className="opt-note">Needs ShadowMount Plus on the PS5.</p>}
+      <div className="opt-section">Check a dump</div>
+      <div className="orows">
+        <Row label="Inspect a dump" detail="Runs the dump doctor without packaging">
           <button type="button" className={`btn sm ${flash === "doctor" ? "ok" : ""}`} disabled={!!busy || disabled} onClick={() => void inspectDump()}>{busy === "doctor" ? <span className="spinner" /> : <Icon name="shield" />}Inspect a dump</button>
         </Row>
-        {doctor && <div className="opt-msg"><DoctorReportView report={doctor} /></div>}
       </div>
+      {doctor && <div className="opt-msg"><DoctorReportView report={doctor} /></div>}
     </>,
     appearance: <AppearanceSection appearance={appearance} setAppearance={setAppearance} reduceMotion={draft.reduceMotion} setReduceMotion={value => patch({ reduceMotion: value })} />,
   }
 
-  const hints: Hint[] = [
-    { key: "Enter", label: "Select" },
-    { key: "QE", glyph: "Q E", face: "neutral", label: "Sections", run: () => stepTab(1) },
-    { key: "Save", glyph: "Ctrl S", face: "neutral", label: "Save and close", run: () => void save() },
-    { key: "Escape", label: "Close", run: () => close() },
-  ]
   return (
-    <>
-      <div className="options" role="dialog" aria-modal="true" aria-label="Options">
-        <div className="opt-scrim" onClick={() => close()} />
-        <form className="opt-panel" onSubmit={save}>
-          <div className="opt-head">
-            <span className="shoulder l" id="optQ" role="button" tabIndex={-1} aria-label="Previous section (Q)" onClick={() => stepTab(-1)}>Q</span>
-            <div className="opt-tabs" role="tablist" ref={tabsRef}>
-              <span className="opt-thumb" ref={thumbRef} />
-              {TABS.map(([id, label]) => <button key={id} type="button" role="tab" className="opt-tab" data-tab={id} aria-selected={tab === id} onClick={() => setTab(id)}>{label}</button>)}
-            </div>
-            <span className="shoulder r" id="optE" role="button" tabIndex={-1} aria-label="Next section (E)" onClick={() => stepTab(1)}>E</span>
-          </div>
-          <div className="opt-body" ref={bodyRef}>
-            {demo && (
-              <div className="orows one" style={{ marginBottom: 14 }}>
-                <Row label="Offline preview is on" detail="Titles, packages and transfers are simulated. Leave the preview to use your consoles and sources." tone="warn">
-                  <button type="button" className="btn primary sm" onClick={onLeaveDemo}>Leave the preview</button>
-                </Row>
-              </div>
-            )}
-            <div key={tab} className="swap-fade">{sections[tab]}</div>
-          </div>
-          <div className="opt-foot">
-            <span className="dirty">{demo ? "Settings can't be saved in the offline preview." : dirty ? "You have unsaved changes." : "Appearance changes apply right away."}</span>
-            <div className="row">
-              <button type="button" className="btn ghost" onClick={() => close()}>Close</button>
-              <button type="submit" className="btn primary" disabled={busy === "save"}>{busy === "save" ? <span className="spinner" /> : <Icon name="check" />}Save and close</button>
-            </div>
-          </div>
-          {sheet && (
-            <div className="sheet" role="alertdialog" aria-label="Unsaved changes">
-              <h3>Save your changes?</h3>
-              <p>Your console, source or download settings changed. Appearance changes are already applied.</p>
-              <div className="dialog-actions">
-                <button type="button" className="btn primary" onClick={() => void save()}>Save and close</button>
-                <button type="button" className="btn" onClick={() => { setSheet(false); close(true) }}>Discard changes</button>
-                <button type="button" className="btn ghost" onClick={() => setSheet(false)}>Keep editing</button>
-              </div>
+    <div className="options" role="dialog" aria-modal="true" aria-label="Options">
+      <div className="opt-scrim" onClick={() => close()} />
+      <form className="opt-panel" onSubmit={save}>
+        <div className="opt-body" ref={bodyRef}>
+          {demo && (
+            <div className="orows demo-note">
+              <Row label="Offline preview is on" detail="Nothing is sent to a console" tone="warn">
+                <button type="button" className="btn primary sm" onClick={onLeaveDemo}>Leave the preview</button>
+              </Row>
             </div>
           )}
-        </form>
-      </div>
-      <div className="options-dock"><Dock context={<>Options<small>{TABS.find(([id]) => id === tab)?.[1]}</small></>} hints={hints} build={build} /></div>
-    </>
+          <div key={tab} className="swap-fade">{sections[tab]}</div>
+        </div>
+        <div className="opt-foot">
+          <span className="dirty">{demo ? "Settings can't be saved in the offline preview." : dirty ? "You have unsaved changes." : "Appearance changes apply right away."}</span>
+          <div className="row">
+            <span className="opt-build">{build}</span>
+            <button type="button" className="btn ghost" onClick={() => close()}>Close</button>
+            <button type="submit" className="btn primary" disabled={busy === "save"}>{busy === "save" ? <span className="spinner" /> : <Icon name="check" />}Save and close</button>
+          </div>
+        </div>
+        {sheet && (
+          <div className="sheet" role="alertdialog" aria-label="Unsaved changes">
+            <h3>Save your changes?</h3>
+            <p>Your console, source or download settings changed. Appearance changes are already applied.</p>
+            <div className="dialog-actions">
+              <button type="button" className="btn primary" onClick={() => void save()}>Save and close</button>
+              <button type="button" className="btn" onClick={() => { setSheet(false); close(true) }}>Discard changes</button>
+              <button type="button" className="btn ghost" onClick={() => setSheet(false)}>Keep editing</button>
+            </div>
+          </div>
+        )}
+      </form>
+    </div>
   )
 }
 
@@ -440,7 +485,6 @@ function AppearanceSection({ appearance, setAppearance, reduceMotion, setReduceM
     tilesRef.current?.querySelectorAll<HTMLCanvasElement>("canvas[data-pattern]").forEach(canvas => patternPreview(canvas.dataset.pattern || "solid", appearance.accent, canvas))
   }, [appearance.accent])
   return <>
-    <h2>Appearance</h2><p className="lede">Background patterns and accents from SSPI on PS4. Changes apply right away.</p>
     <div className="opt-section">Background pattern</div>
     <div className="patterns" role="radiogroup" aria-label="Background pattern" ref={tilesRef}>
       {PATTERNS.map(pattern => (
@@ -457,19 +501,20 @@ function AppearanceSection({ appearance, setAppearance, reduceMotion, setReduceM
         </button>
       ))}
     </div>
-    <div className="orows" style={{ marginTop: 12 }}>
-      <Row label="Tint with game artwork" detail="The background picks up the colour of the selected game"><Switch label="Tint with game artwork" checked={appearance.gameTint} onChange={value => setAppearance(prev => ({ ...prev, gameTint: value }))} /></Row>
-      <Row label="Reduced motion" detail="Static focus and immediate transitions. Saved with your settings."><Switch label="Reduced motion" checked={reduceMotion} onChange={setReduceMotion} /></Row>
-      <Row label="Restore defaults" detail="Resets the background, accent, artwork tint and download cards">
+    <div className="opt-section">Artwork and motion</div>
+    <div className="orows">
+      <Row label="Tint with game artwork"><Switch label="Tint with game artwork" checked={appearance.gameTint} onChange={value => setAppearance(prev => ({ ...prev, gameTint: value }))} /></Row>
+      <Row label="Reduced motion"><Switch label="Reduced motion" checked={reduceMotion} onChange={setReduceMotion} /></Row>
+      <Row label="Restore defaults">
         <button type="button" className="btn sm" onClick={event => setAppearance(prev => ({ ...prev, accent: DEFAULT_APPEARANCE.accent, pattern: DEFAULT_APPEARANCE.pattern, gameTint: DEFAULT_APPEARANCE.gameTint, cardStyle: DEFAULT_APPEARANCE.cardStyle, cardSize: DEFAULT_APPEARANCE.cardSize }), { x: event.clientX, y: event.clientY })}><Icon name="refresh" />Restore</button>
       </Row>
     </div>
     <div className="opt-section">Download cards</div>
     <div className="orows">
-      <Row label="Card style" detail="Artwork blurs each game's art behind its card.">
+      <Row label="Card style">
         <Seg label="Download card style" value={appearance.cardStyle} options={[["art", "Artwork"], ["plain", "Plain"]]} onChange={cardStyle => setAppearance(prev => ({ ...prev, cardStyle }))} />
       </Row>
-      <Row label="Card size" detail="Compact fits more transfers on screen.">
+      <Row label="Card size">
         <Seg label="Download card size" value={appearance.cardSize} options={[["large", "Large"], ["compact", "Compact"]]} onChange={cardSize => setAppearance(prev => ({ ...prev, cardSize }))} />
       </Row>
     </div>

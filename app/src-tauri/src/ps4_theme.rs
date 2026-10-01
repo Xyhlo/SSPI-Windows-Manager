@@ -9,7 +9,7 @@
 //! hardware; see build/themepack-cli/NOTICE.txt.
 use super::*;
 use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat, RgbaImage};
-use std::{collections::BTreeMap, io::Cursor, process::Stdio};
+use std::{collections::BTreeMap, process::Stdio};
 
 const BACKGROUND: (u32, u32) = (1920, 1080);
 const PREVIEW: (u32, u32) = (740, 416);
@@ -90,12 +90,78 @@ fn sized(label: &str, image: DynamicImage, size: (u32, u32)) -> Result<DynamicIm
     if image.dimensions() != size { return Err(format!("{label} must be {}x{} (got {}x{})", size.0, size.1, image.width(), image.height())); }
     Ok(image)
 }
-fn png(image: &DynamicImage, alpha: bool) -> Result<Vec<u8>, String> {
-    // Backgrounds are written as 24-bit PNGs, icons keep their alpha channel.
-    let image = if alpha { DynamicImage::ImageRgba8(image.to_rgba8()) } else { DynamicImage::ImageRgb8(image.to_rgb8()) };
-    let mut out = Cursor::new(Vec::new());
-    image.write_to(&mut out, ImageFormat::Png).map_err(|e| format!("PNG encoding failed: {e}"))?;
-    Ok(out.into_inner())
+/// Largest file a tile, icon or thumbnail may be. A theme whose tile PNGs were 257–307 KB never
+/// became usable on a PS4, while ones up to 127 KB applied, so these stay within that.
+const ICON_BYTES: usize = 128 * 1024;
+/// Backgrounds of up to 1.7 MB applied on a console.
+const BACKGROUND_BYTES: usize = 1_700_000;
+/// IDAT chunk size libpng and ffmpeg write; the console's own theme files use small chunks too.
+const IDAT_CHUNK: usize = 8192;
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &b in bytes {
+        crc ^= u32::from(b);
+        for _ in 0..8 { crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 }; }
+    }
+    !crc
+}
+/// The same PNG with its image data re-split into `IDAT_CHUNK`-byte chunks.
+fn split_idat(png: &[u8]) -> Result<Vec<u8>, String> {
+    let bad = || "PNG encoding produced an unreadable file".to_string();
+    if png.len() < 8 { return Err(bad()); }
+    let (mut before, mut data, mut after, mut at) = (Vec::new(), Vec::new(), Vec::new(), 8usize);
+    while at + 12 <= png.len() {
+        let length = u32::from_be_bytes(png[at..at + 4].try_into().unwrap()) as usize;
+        let end = at.checked_add(12 + length).filter(|&e| e <= png.len()).ok_or_else(bad)?;
+        let kind = &png[at + 4..at + 8];
+        if kind == b"IDAT" { data.extend_from_slice(&png[at + 8..at + 8 + length]); }
+        else if data.is_empty() { before.extend_from_slice(&png[at..end]); }
+        else { after.extend_from_slice(&png[at..end]); }
+        at = end;
+    }
+    let mut out = Vec::with_capacity(png.len() + data.len() / IDAT_CHUNK * 12 + 12);
+    out.extend_from_slice(&png[..8]);
+    out.extend_from_slice(&before);
+    for part in data.chunks(IDAT_CHUNK) {
+        out.extend_from_slice(&(part.len() as u32).to_be_bytes());
+        let start = out.len();
+        out.extend_from_slice(b"IDAT");
+        out.extend_from_slice(part);
+        let crc = crc32(&out[start..]);
+        out.extend_from_slice(&crc.to_be_bytes());
+    }
+    out.extend_from_slice(&after);
+    Ok(out)
+}
+/// Every theme image is written as 8-bit RGBA, backgrounds included: that is what PS4 Ultimate
+/// Theme Creator's console-verified themes carry (its encoder forces rgba for every PNG).
+fn encode_png(image: &DynamicImage) -> Result<Vec<u8>, String> {
+    use image::codecs::png::{CompressionType, FilterType as PngFilter, PngEncoder};
+    use image::{ExtendedColorType, ImageEncoder};
+    let (w, h) = image.dimensions();
+    let mut out = Vec::new();
+    PngEncoder::new_with_quality(&mut out, CompressionType::Best, PngFilter::Adaptive)
+        .write_image(image.to_rgba8().as_raw(), w, h, ExtendedColorType::Rgba8)
+        .map_err(|e| format!("PNG encoding failed: {e}"))?;
+    split_idat(&out)
+}
+/// Rounds every channel to `levels` steps: soft glows and gradients compress far better and look the same at tile size.
+fn posterize(image: &DynamicImage, levels: u32) -> DynamicImage {
+    let step = 256 / levels;
+    let mut rgba = image.to_rgba8();
+    for value in rgba.iter_mut() { *value = ((u32::from(*value) + step / 2) / step * step).min(255) as u8; }
+    DynamicImage::ImageRgba8(rgba)
+}
+/// A theme PNG within `budget` bytes.
+fn png(label: &str, image: &DynamicImage, budget: usize) -> Result<Vec<u8>, String> {
+    let mut bytes = encode_png(image)?;
+    for levels in [64, 32, 16, 8] {
+        if bytes.len() <= budget { break; }
+        bytes = encode_png(&posterize(image, levels))?;
+    }
+    if bytes.len() > budget { return Err(format!("{label} is still {} KB after compression; the PS4 needs it under {} KB. Use a simpler image.", bytes.len() / 1024, budget / 1024)); }
+    Ok(bytes)
 }
 fn argb(label: &str, value: &str) -> Result<String, String> {
     let valid = value.len() == 9 && value.starts_with('#') && value[1..].chars().all(|c| c.is_ascii_hexdigit());
@@ -163,11 +229,11 @@ fn quantize(c: [f32; 3]) -> (u16, [f32; 3]) {
     let b = (c[2].clamp(0., 255.) * 31. / 255.).round() as u16;
     ((r << 11) | (g << 5) | b, [f32::from((r << 3) | (r >> 2)), f32::from((g << 2) | (g >> 4)), f32::from((b << 3) | (b >> 2))])
 }
-/// One opaque 4x4 block to BC1: endpoints on the block's principal colour
-/// axis (power iteration), indices chosen against the decoded palette.
-fn bc1_block(px: &[[f32; 3]; 16]) -> [u8; 8] {
+/// The ends of a pixel set along its principal colour axis (power iteration).
+fn principal_ends(px: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
+    let n = px.len().max(1) as f32;
     let mut mean = [0f32; 3];
-    for p in px { for c in 0..3 { mean[c] += p[c] / 16.; } }
+    for p in px { for c in 0..3 { mean[c] += p[c] / n; } }
     let mut cov = [[0f32; 3]; 3];
     let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
     for p in px {
@@ -185,8 +251,14 @@ fn bc1_block(px: &[[f32; 3]; 16]) -> [u8; 8] {
         let t = (p[0] - mean[0]) * axis[0] + (p[1] - mean[1]) * axis[1] + (p[2] - mean[2]) * axis[2];
         tmin = tmin.min(t); tmax = tmax.max(t);
     }
-    let (pa, ca) = quantize([0, 1, 2].map(|c| mean[c] + axis[c] * tmax));
-    let (pb, cb) = quantize([0, 1, 2].map(|c| mean[c] + axis[c] * tmin));
+    ([0, 1, 2].map(|c| mean[c] + axis[c] * tmax), [0, 1, 2].map(|c| mean[c] + axis[c] * tmin))
+}
+/// One opaque 4x4 block to BC1: endpoints on the block's principal colour
+/// axis, indices chosen against the decoded palette.
+fn bc1_block(px: &[[f32; 3]; 16]) -> [u8; 8] {
+    let (high, low) = principal_ends(px);
+    let (pa, ca) = quantize(high);
+    let (pb, cb) = quantize(low);
     // Opaque blocks want colour0 > colour1 (four-colour mode).
     let ((p0, c0), (p1, c1)) = if pa >= pb { ((pa, ca), (pb, cb)) } else { ((pb, cb), (pa, ca)) };
     let four = p0 > p1;
@@ -243,6 +315,69 @@ pub(super) fn dds_dxt1(image: &RgbaImage) -> Vec<u8> {
     out
 }
 
+/// A 4x4 block with transparent pixels, in BC1's three-colour mode (colour0 <= colour1):
+/// opaque pixels pick from colour0, colour1 and their midpoint, the rest take index 3,
+/// which decodes as transparent black.
+fn bc1_alpha_block(px: &[[f32; 3]; 16], clear: u16) -> [u8; 8] {
+    let opaque: Vec<[f32; 3]> = (0..16).filter(|i| clear & (1 << i) == 0).map(|i| px[i]).collect();
+    let (mut p0, mut p1, mut c0, mut c1) = (0u16, 0u16, [0f32; 3], [0f32; 3]);
+    if !opaque.is_empty() {
+        let (high, low) = principal_ends(&opaque);
+        let ((pa, ca), (pb, cb)) = (quantize(high), quantize(low));
+        ((p0, c0), (p1, c1)) = if pa <= pb { ((pa, ca), (pb, cb)) } else { ((pb, cb), (pa, ca)) };
+    }
+    let palette = [c0, c1, [0, 1, 2].map(|c| (c0[c] + c1[c]) / 2.)];
+    let mut bits = 0u32;
+    for (i, p) in px.iter().enumerate() {
+        let index = if clear & (1 << i) != 0 { 3 } else {
+            let mut best = (f32::MAX, 0u32);
+            for (k, q) in palette.iter().enumerate() {
+                let d = (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2);
+                if d < best.0 { best = (d, k as u32); }
+            }
+            best.1
+        };
+        bits |= index << (2 * i);
+    }
+    let mut out = [0u8; 8];
+    out[..2].copy_from_slice(&p0.to_le_bytes());
+    out[2..4].copy_from_slice(&p1.to_le_bytes());
+    out[4..].copy_from_slice(&bits.to_le_bytes());
+    out
+}
+/// A title icon as the `icon0.dds` the PS4 home screen draws: the same header the console's
+/// own icons carry (DXT1, one mip level), with a mask's transparent pixels as BC1's one-bit
+/// alpha. The image must be square with a side divisible by 4.
+pub(super) fn icon_dds(image: &RgbaImage) -> Vec<u8> {
+    let (w, h) = image.dimensions();
+    let payload = (w / 4 * (h / 4) * 8) as usize;
+    let mut out = Vec::with_capacity(128 + payload);
+    out.extend_from_slice(b"DDS ");
+    // CAPS | HEIGHT | WIDTH | PIXELFORMAT | MIPMAPCOUNT | LINEARSIZE, one level.
+    for value in [124u32, 0xa1007, h, w, payload as u32, 0, 1] { out.extend_from_slice(&value.to_le_bytes()); }
+    out.extend_from_slice(&[0; 44]);
+    for value in [32u32, 0x4] { out.extend_from_slice(&value.to_le_bytes()); }
+    out.extend_from_slice(b"DXT1");
+    out.extend_from_slice(&[0; 20]);
+    // COMPLEX | TEXTURE | MIPMAP, as the console's files have it.
+    for value in [0x40_1008u32, 0, 0, 0, 0] { out.extend_from_slice(&value.to_le_bytes()); }
+    for by in 0..h / 4 {
+        for bx in 0..w / 4 {
+            let (mut block, mut clear) = ([[0f32; 3]; 16], 0u16);
+            for y in 0..4 {
+                for x in 0..4 {
+                    let p = image.get_pixel(bx * 4 + x, by * 4 + y);
+                    let i = (y * 4 + x) as usize;
+                    if p[3] < 128 { clear |= 1 << i; }
+                    block[i] = [f32::from(p[0]), f32::from(p[1]), f32::from(p[2])];
+                }
+            }
+            out.extend_from_slice(&if clear == 0 { bc1_block(&block) } else { bc1_alpha_block(&block, clear) });
+        }
+    }
+    out
+}
+
 fn random_label() -> String {
     let seed = Sha256::digest(format!("{}-{:?}", Uuid::new_v4(), SystemTime::now()));
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -278,23 +413,23 @@ fn stage_theme(stage: &Path, request: &ThemeBuildRequest) -> Result<Staged, Stri
         Some(data) => sized("Theme icon", decode_png("Theme icon", data)?, ICON0)?,
         None => home.crop_imm((BACKGROUND.0 - BACKGROUND.1) / 2, 0, BACKGROUND.1, BACKGROUND.1).resize_exact(ICON0.0, ICON0.1, FilterType::Lanczos3),
     };
-    write("texture/background/homescreen.png", &png(&home, false)?)?;
-    write("texture/background/functionscreen.png", &png(&function, false)?)?;
-    write("texture/preview.png", &png(&preview, false)?)?;
-    write("sce_sys/icon0.png", &png(&icon0, false)?)?;
-    write("sce_sys/pic1.png", &png(&home, false)?)?;
+    write("texture/background/homescreen.png", &png("Home background", &home, BACKGROUND_BYTES)?)?;
+    write("texture/background/functionscreen.png", &png("Function screen background", &function, BACKGROUND_BYTES)?)?;
+    write("texture/preview.png", &png("Theme preview", &preview, ICON_BYTES)?)?;
+    write("sce_sys/icon0.png", &png("Theme icon", &icon0, ICON_BYTES)?)?;
+    write("sce_sys/pic1.png", &png("Home background", &home, BACKGROUND_BYTES)?)?;
     let mut files = 5;
     for (name, data) in &request.content_icons {
         if !CONTENT_ICONS.contains(&name.as_str()) { return Err(format!("Unknown system icon {name}")); }
         let label = format!("{name} icon");
-        write(&format!("texture/content_icon/{name}.png"), &png(&sized(&label, decode_png(&label, data)?, CONTENT_ICON)?, true)?)?;
+        write(&format!("texture/content_icon/{name}.png"), &png(&label, &sized(&label, decode_png(&label, data)?, CONTENT_ICON)?, ICON_BYTES)?)?;
         files += 1;
     }
     for (name, icon) in &request.function_icons {
         if !FUNCTION_ICONS.contains(&name.as_str()) { return Err(format!("Unknown function icon {name}")); }
         let label = format!("{name} function icon");
-        write(&format!("texture/function_icon/{name}.png"), &png(&sized(&label, decode_png(&label, &icon.icon)?, FUNCTION_ICON)?, true)?)?;
-        write(&format!("texture/function_icon/{name}_glow.png"), &png(&sized(&label, decode_png(&label, &icon.glow)?, FUNCTION_GLOW)?, true)?)?;
+        write(&format!("texture/function_icon/{name}.png"), &png(&label, &sized(&label, decode_png(&label, &icon.icon)?, FUNCTION_ICON)?, ICON_BYTES)?)?;
+        write(&format!("texture/function_icon/{name}_glow.png"), &png(&label, &sized(&label, decode_png(&label, &icon.glow)?, FUNCTION_GLOW)?, ICON_BYTES)?)?;
         files += 2;
     }
     write("theme.xml", theme_xml(&request.label, &request.colors)?.as_bytes())?;
@@ -370,6 +505,7 @@ pub(super) async fn build_ps4_theme(app: AppHandle, request: ThemeBuildRequest) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn decode_block(block: &[u8]) -> [[u8; 3]; 16] {
         let p0 = u16::from_le_bytes([block[0], block[1]]);
@@ -380,6 +516,71 @@ mod tests {
         let pal = if p0 > p1 { [c0, c1, [0, 1, 2].map(|c| (2. * c0[c] + c1[c]) / 3.), [0, 1, 2].map(|c| (c0[c] + 2. * c1[c]) / 3.)] }
             else { [c0, c1, [0, 1, 2].map(|c| (c0[c] + c1[c]) / 2.), [0.; 3]] };
         std::array::from_fn(|i| pal[((bits >> (2 * i)) & 3) as usize].map(|v| v.round() as u8))
+    }
+
+    /// Pixel i of a BC1 block is transparent when the block is in three-colour mode and uses index 3.
+    fn transparent(block: &[u8], i: usize) -> bool {
+        let (p0, p1) = (u16::from_le_bytes([block[0], block[1]]), u16::from_le_bytes([block[2], block[3]]));
+        p0 <= p1 && (u32::from_le_bytes(block[4..8].try_into().unwrap()) >> (2 * i)) & 3 == 3
+    }
+
+    #[test]
+    fn theme_pngs_use_small_idat_chunks_and_fit_the_budget() {
+        // Glow-like gradients with the low-bit noise canvas blurs leave behind: hard for PNG until posterized.
+        let mut seed = 7u32;
+        let noisy = RgbaImage::from_fn(512, 512, |x, y| {
+            let mut n = || { seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223); (seed >> 30) as u8 };
+            let (dx, dy) = (x as f32 - 256., y as f32 - 256.);
+            let glow = (255. * (-(dx * dx + dy * dy) / 30000.).exp()) as u8;
+            image::Rgba([glow.saturating_add(n()), ((x / 2) as u8).saturating_add(n()), ((y / 2) as u8).saturating_add(n()), 200u8.saturating_add(n())])
+        });
+        let image = DynamicImage::ImageRgba8(noisy);
+        let raw = encode_png(&image).unwrap();
+        assert!(raw.len() > ICON_BYTES, "the fixture should start over budget ({})", raw.len());
+        let bytes = png("Test tile", &image, ICON_BYTES).unwrap();
+        assert!(bytes.len() <= ICON_BYTES, "{}", bytes.len());
+        let (mut at, mut idat) = (8usize, 0);
+        while at + 12 <= bytes.len() {
+            let length = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let body = &bytes[at + 4..at + 8 + length];
+            assert_eq!(crc32(body), u32::from_be_bytes(bytes[at + 8 + length..at + 12 + length].try_into().unwrap()));
+            if &bytes[at + 4..at + 8] == b"IDAT" { idat += 1; assert!(length <= IDAT_CHUNK); }
+            at += 12 + length;
+        }
+        assert!(idat > 1);
+        let decoded = image::load_from_memory_with_format(&bytes, ImageFormat::Png).unwrap();
+        assert_eq!(decoded.dimensions(), (512, 512));
+        assert!(png("Test tile", &image, 1024).unwrap_err().contains("under 1 KB"));
+    }
+
+    #[test]
+    fn icon_dds_matches_the_console_header_and_keeps_the_mask() {
+        // The first 32 header bytes of a retail icon0.dds (512x512 DXT1, one level).
+        let stock = "444453207c00000007100a000002000000020000000002000000000001000000";
+        let mut image = RgbaImage::from_pixel(512, 512, image::Rgba([230, 40, 120, 255]));
+        for (x, y, p) in image.enumerate_pixels_mut() {
+            if (x as f32 - 255.5).hypot(y as f32 - 255.5) > 250. { *p = image::Rgba([0, 0, 0, 0]); }
+        }
+        let dds = icon_dds(&image);
+        assert_eq!(dds.len(), 131_200);
+        assert_eq!(dds[..32].iter().map(|b| format!("{b:02x}")).collect::<String>(), stock);
+        assert_eq!(&dds[76..88], &[32, 0, 0, 0, 4, 0, 0, 0, b'D', b'X', b'T', b'1']);
+        assert_eq!(&dds[108..112], &0x40_1008u32.to_le_bytes());
+        let block = |bx: usize, by: usize| &dds[128 + (by * 128 + bx) * 8..][..8];
+        // A corner block is fully clear, the centre is opaque and keeps its colour, and an edge
+        // block mixes both pixel by pixel.
+        assert!((0..16).all(|i| transparent(block(0, 0), i)));
+        assert!((0..16).all(|i| !transparent(block(64, 64), i)));
+        for got in decode_block(block(64, 64)) { assert!((i32::from(got[0]) - 230).abs() <= 8 && (i32::from(got[1]) - 40).abs() <= 8 && (i32::from(got[2]) - 120).abs() <= 8); }
+        for by in 0..128usize { for bx in 0..128usize { for i in 0..16 {
+            let (x, y) = (bx * 4 + i % 4, by * 4 + i / 4);
+            assert_eq!(transparent(block(bx, by), i), image.get_pixel(x as u32, y as u32)[3] < 128, "pixel {x},{y}");
+        } } }
+        // Clear blocks decode their opaque pixels from the opaque colours only.
+        let edge = (0..128).find(|&bx| { let b = block(bx, 64); (0..16).any(|i| transparent(b, i)) && (0..16).any(|i| !transparent(b, i)) }).unwrap();
+        for (i, got) in decode_block(block(edge, 64)).iter().enumerate() {
+            if !transparent(block(edge, 64), i) { assert!((i32::from(got[0]) - 230).abs() <= 8 && (i32::from(got[2]) - 120).abs() <= 8); }
+        }
     }
 
     #[test]

@@ -141,10 +141,8 @@
 !/app/src-tauri/src/discovery.rs
 !/app/src-tauri/src/payloads.rs
 !/app/src/components/Controls.tsx
-!/app/src/components/ConsoleMock.tsx
 !/app/src/components/CoverEditor.tsx
 !/app/src/components/LibraryPage.tsx
-!/app/src/components/ThemeStudio.tsx
 !/app/src/components/ToolsPage.tsx
 !/app/src/components/tools/PayloadsPanel.tsx
 !/app/src/components/tools/SystemPanel.tsx
@@ -153,7 +151,6 @@
 !/app/src/lib/console-helpers.ts
 !/app/src/lib/console-types.ts
 !/app/src/lib/image.ts
-!/app/src/lib/theme.ts
 !/app/src-tauri/src/console_tools.rs
 !/payload/console_files.c
 !/payload/console_files.h
@@ -163,6 +160,43 @@
 !/payload-ps4/console_tools.c
 !/payload-ps4/console_tools.h
 
-# SSPI Windows 2.22 PS4 theme packages
-!/app/src/lib/theme-package.ts
+# SSPI Windows PS4 themes (system theme packages and game icon shapes)
 !/app/src-tauri/src/ps4_theme.rs
+!/app/src/lib/ps4-theme.ts
+!/app/src/components/tools/ThemesPanel.tsx
+!/app/src/components/tools/IconMaskPanel.tsx
+!/app/src/components/tools/themes/ShapeGlyph.tsx
+!/app/src/lib/icon-mask.ts
+!/app/src/components/tools/themes/Ps4Preview.tsx
+!/app/src/components/tools/themes/IconsTab.tsx
+!/app/src/lib/ps4-icons.ts
+!/app/src/lib/theme-store.ts
+!/app/src/lib/zip.ts
+
+
+# SSPI Windows 2.22: links, debrid files, ShadowMount images, diagnostics and the README demo
+!/docs/demo-packaging-and-diagnostics.gif
+!/app/src-tauri/src/cloud.rs
+!/app/src-tauri/src/links.rs
+!/app/src-tauri/src/shadow_image.rs
+!/app/src-tauri/src/exfat/mod.rs
+!/app/src-tauri/src/exfat/upcase_table.rs
+!/app/src-tauri/src/exfat/verify.rs
+!/app/src-tauri/src/console_diagnostics.rs
+!/app/src/components/LinkDialogs.tsx
+!/app/src/components/tools/system/ExportMenu.tsx
+!/app/src/components/tools/system/KernelLogView.tsx
+!/app/src/components/tools/system/LogsView.tsx
+!/app/src/components/tools/system/ProcessesView.tsx
+!/app/src/lib/diagnostics.ts
+!/app/src/lib/fpkg-presets.ts
+!/app/src/lib/packaging.ts
+!/payload/diagnostics.c
+!/payload/diagnostics.h
+!/payload/process_control.c
+!/payload/process_control.h
+!/payload/system_ps5.c
+!/payload-ps4/diagnostics.c
+!/payload-ps4/process_control.c
+!/payload-ps4/system_ps4.c
+!/payload-ps4/system_ps4.h

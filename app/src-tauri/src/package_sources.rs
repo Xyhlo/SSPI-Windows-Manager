@@ -343,6 +343,13 @@ fn same_site_origin(left: &Url, right: &Url) -> bool {
             })
 }
 
+/// SSPI community catalogs: `embedded-catalog-v1`, and `embedded-catalog-refresh-v1`, the same
+/// data plus an online "recent posts" refresh. The refresh is not run here: it would contact
+/// catalog websites, so the catalog stays as shipped in the file.
+fn embedded_catalog(engine: &str) -> bool {
+    matches!(engine, "embedded-catalog-v1" | "embedded-catalog-refresh-v1")
+}
+
 fn validate_descriptor(descriptor: &Descriptor) -> Result<(), String> {
     if !descriptor.schema.is_empty() && descriptor.schema != "gamesearch.source/v1" {
         return Err("Package Source schema is not gamesearch.source/v1".into());
@@ -355,7 +362,7 @@ fn validate_descriptor(descriptor: &Descriptor) -> Result<(), String> {
     }
     if !matches!(
         descriptor.engine.engine_type.as_str(),
-        "recipe-v1" | "recipe-v2" | "remote-api-v1" | "embedded-catalog-v1"
+        "recipe-v1" | "recipe-v2" | "remote-api-v1" | "embedded-catalog-v1" | "embedded-catalog-refresh-v1"
     ) {
         return Err("Package Source engine is unsupported".into());
     }
@@ -378,7 +385,7 @@ fn validate_descriptor(descriptor: &Descriptor) -> Result<(), String> {
             }
         ));
     }
-    if descriptor.engine.engine_type == "embedded-catalog-v1" {
+    if embedded_catalog(&descriptor.engine.engine_type) {
         // Static catalogs are data-only: no search-time network origins.
         // Package downloads go through the normal hoster/resolver pipeline.
         let entry = descriptor.engine.entry.trim();
@@ -651,7 +658,7 @@ fn install_archive(
         fs::remove_dir_all(&staging).map_err(|error| error.to_string())?;
         return Err("Package Source destination already exists".into());
     }
-    if descriptor.engine.engine_type == "embedded-catalog-v1" {
+    if embedded_catalog(&descriptor.engine.engine_type) {
         // Data-only catalogs: every shard must match its declaration before
         // the source becomes visible to search.
         let declared: Vec<(String, u64, String)> = descriptor
@@ -2960,13 +2967,40 @@ mod supplied_catalog_tests {
         assert!(firmware > 0 && multipart > 0);
         println!("Supplied source: {} searchable PS5 titles, {rows} resolved rows, {firmware} firmware fields, {multipart} multipart rows; every declared shard hash passed", titles.len());
     }
+
+    /// The SSPI community PS4 catalog (`embedded-catalog-refresh-v1`) installs and resolves as a
+    /// static catalog; its online refresh section is ignored.
+    #[test]
+    #[ignore = "requires SSPI_PS4_CATALOG_FIXTURE extracted from the supplied PS4 source"]
+    fn validates_and_resolves_the_supplied_ps4_source() {
+        let root = PathBuf::from(std::env::var_os("SSPI_PS4_CATALOG_FIXTURE").expect("source fixture directory"));
+        let descriptor: Descriptor = serde_json::from_slice(&fs::read(root.join("source.json")).unwrap()).unwrap();
+        assert_eq!(descriptor.engine.engine_type, "embedded-catalog-refresh-v1");
+        validate_descriptor(&descriptor).unwrap();
+        let declared: Vec<_> = descriptor.files.iter().map(|f| (f.path.clone(), f.size, f.sha256.clone())).collect();
+        let counts = static_catalog::validate_installed(&root, &declared).unwrap();
+        let catalog = static_catalog::cached(&root).unwrap();
+        let titles = catalog.search("", "", 60000);
+        assert_eq!(titles.len() as u64, counts.ready_titles);
+        // PS4 titles plus PS2 classics packaged for PS4 (SLUS, SLES, SCUS, ...).
+        assert!(titles.iter().all(|t| t.title_id.starts_with("CUSA") || t.title_id.starts_with('S')));
+        let (mut rows, mut multipart, mut passwords) = (0, 0, 0);
+        for title in &titles {
+            let packages = static_resolve(&root, &descriptor, &title.title_id, "").unwrap();
+            assert!(!packages.is_empty(), "{} has no resolved packages", title.title_id);
+            multipart += packages.iter().filter(|p| p.archive_part_number.is_some()).count();
+            passwords += packages.iter().filter(|p| p.archive_password.as_deref().is_some_and(|v| !v.is_empty())).count();
+            rows += packages.len();
+        }
+        println!("Supplied PS4 source: {} searchable titles, {rows} resolved rows, {multipart} multipart rows, {passwords} with archive passwords", titles.len());
+    }
 }
 
 /// Local indexes populate both platforms without waiting for a remote source.
 pub fn home_titles(app: &AppHandle) -> Result<Vec<SourceTitle>, String> {
     let registry = load_registry(app)?;
     let mut results = Vec::new();
-    for entry in registry.sources.iter().filter(|s| s.enabled && s.engine_type == "embedded-catalog-v1") {
+    for entry in registry.sources.iter().filter(|s| s.enabled && embedded_catalog(&s.engine_type)) {
         let (descriptor, _) = load_source(app, entry)?;
         let directory = source_dir(app, &entry.id, &entry.version)?;
         let catalog = static_catalog::cached(&directory)?;
@@ -3013,7 +3047,7 @@ pub async fn search(
     // Sources resolve concurrently: latency is slowest-source, not sum-of-sources.
     let results = futures_util::future::join_all(jobs.into_iter().map(|job| async move {
         let result = tokio::time::timeout(Duration::from_secs(60), async {
-            if job.descriptor.engine.engine_type == "embedded-catalog-v1" {
+            if embedded_catalog(&job.descriptor.engine.engine_type) {
                 static_search(&job.directory, &job.descriptor, query, limit)
             } else if matches!(
                 job.descriptor.engine.engine_type.as_str(),
@@ -3087,7 +3121,7 @@ pub async fn resolve(
     // Sources resolve concurrently: latency is slowest-source, not sum-of-sources.
     let results = futures_util::future::join_all(jobs.into_iter().map(|job| async move {
         let result = tokio::time::timeout(Duration::from_secs(60), async {
-            if job.descriptor.engine.engine_type == "embedded-catalog-v1" {
+            if embedded_catalog(&job.descriptor.engine.engine_type) {
                 static_resolve(&job.directory, &job.descriptor, title_id, region)
             } else if matches!(
                 job.descriptor.engine.engine_type.as_str(),
@@ -3681,10 +3715,7 @@ mod tests {
 pub fn migrate_bundled(app: &AppHandle) -> Result<(), String> {
     let marker = source_root(app)?.join("windows-bundle-3.2.0.applied");
     if marker.exists() { return Ok(()); }
-    let registry = load_registry(app)?;
-    if !registry.sources.iter().any(|s| s.id == "org.sspi.gamesource" && version_cmp(&s.version, "3.2.0") != std::cmp::Ordering::Less) {
-        install_archive(app, include_bytes!("../../../../Build-Output/Windows Manager/sources/gamesource-windows.gssource").to_vec(), "bundled:gamesource-windows-3.2.0")?;
-    }
+    // Sources are installed by the user (Options > Sources): nothing is added automatically.
     let mut registry = load_registry(app)?;
     let retired = ["org.gamesearch.dlpsgame-ps5", "org.gamesearch.dlpsgame", "org.amptis.dlpsgame", "org.gamesearch.superpsx", "org.amptis.superpsx"];
     for source in &mut registry.sources { if retired.contains(&source.id.as_str()) { source.enabled = false; } }

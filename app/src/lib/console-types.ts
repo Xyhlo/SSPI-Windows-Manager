@@ -32,10 +32,20 @@ export type DiscoveredConsole = {
   platform: ConsoleKind | "unknown"
   receiver?: { port: number; version?: string | null; platform?: ConsoleKind | null } | null
   ftp?: { port: number; banner: string } | null
-  label: string // e.g. "PS5 receiver 1.0.6", "PS4, GoldHEN FTP"
+  label: string // e.g. "PS5 receiver 1.0.7", "PS4, GoldHEN FTP"
 }
 
 /* ---------------------------------------------------------------- library */
+
+export type LibrarySource = "appdb" | "app" | "appmeta" | "shadowmount"
+export type LibraryDiagnostics = {
+  appdb: "ok" | `unavailable:${string}`
+  counts: Record<LibrarySource, number>
+  skipped: Array<{ id: string; reason: string }>
+  skippedTruncated?: boolean
+  budgetExceeded?: boolean
+  elapsedMs?: number | null
+}
 
 export type LibraryTitle = {
   titleId: string // CUSA00000 or PPSA00000
@@ -48,6 +58,7 @@ export type LibraryTitle = {
   requiredFirmware?: string | null // "9.00", from SYSTEM_VER or requiredSystemSoftwareVersion
   contentId?: string | null
   platform?: ConsoleKind | null // a PS5 can hold PS4 titles
+  sources?: LibrarySource[] // absent on older receivers
   cover?: string | null // box art; only the offline preview supplies it
 }
 
@@ -59,6 +70,7 @@ export type ConsoleLibrarySnapshot = {
   truncated: boolean
   errors: string[]
   metadataWarnings: string[]
+  diagnostics?: LibraryDiagnostics | null // absent on older receivers
 }
 
 /* ---------------------------------------------------------------- icons and home screen */
@@ -97,9 +109,52 @@ export type ConsoleSystemInfo = {
   memory?: { totalBytes: number; freeBytes: number } | null
   network?: { ip?: string | null; mac?: string | null } | null
   runningTitleId?: string | null
+  /** Every mounted filesystem (receivers with `diagnostics-v1`). */
+  mounts?: ConsoleMount[] | null
   capabilities: string[]
+  /** processCount, cpuFrequencyMhz, loadAverage, networkInterface, firmwareRaw; all strings. */
   extras: Record<string, string>
 }
+export type ConsoleMount = { from: string; on: string; type: string; readOnly: boolean; totalBytes: number; freeBytes: number }
+
+/* ---------------------------------------------------------------- diagnostics (receiver `diagnostics-v1`) */
+
+/**
+ * `console_kernel_log({ target, host, port })`. `msgbuf` is a non-destructive snapshot of the kernel
+ * message buffer. `klog` is what the receiver drained from /dev/klog; `busy` means another klog
+ * server (GoldHEN, etaHEN, klogsrv) holds the device, so use its live stream instead.
+ */
+export type KernelLog = { source: "msgbuf" | "klog"; busy: boolean; dropped: boolean; bytes: number; text: string; capturedAt: number }
+
+/** `console_processes({ target, host, port })`. The PS4 cannot read auth IDs, so they are null there. */
+export type ConsoleProcess = {
+  pid: number; ppid: number; name: string
+  state: "unknown" | "starting" | "running" | "sleeping" | "stopped" | "zombie" | "waiting" | "locked"
+  uid: number; titleId?: string | null; appType?: number | null; authId?: string | null
+  rssBytes: number; vmBytes: number; threads: number; startedAt?: number | null; cpuMs: number
+  /** What the receiver lets the app stop here (`process-control-v1`): apps and elfldr payloads. */
+  control?: "app" | "payload" | null
+}
+export type ProcessList = { processes: ConsoleProcess[]; truncated: boolean; capturedAt: number }
+/** `console_process_control(...)`: `stop` closes an app (or SIGTERM), `end` forces it. */
+export type ProcessAction = "stop" | "end"
+export type ProcessControl = { pid: number; name: string; kind: "app" | "payload"; method: "close-app" | "sigterm" | "sigkill"; exited: boolean; waitedMs: number }
+
+/** `console_log_files({ target, host, port })`: logs, settings and crash reports under /data and /user/data. */
+export type LogFile = { path: string; size: number; modified: number; kind: "log" | "config" | "crash" }
+export type LogFileList = { files: LogFile[]; truncated: boolean; incomplete: boolean; capturedAt: number }
+/** `console_read_log({ target, host, port, path, maxBytes })`: the last `maxBytes` of a log or settings file. */
+export type LogTail = { path: string; size: number; offset: number; bytes: number; modified: number; text: string }
+
+/** `probe_debug_services({ target, host })`: which well-known homebrew services answer a TCP connect. Loader ports are never probed. */
+export type DebugServiceKind = "klog" | "ftp" | "debugger" | "installer"
+export type DebugService = { port: number; name: string; kind: DebugServiceKind; open: boolean; latencyMs?: number | null }
+
+/**
+ * `start_klog_stream({ target, host, port })` → stream id; the app then emits `klog-stream` events.
+ * Only known kernel log ports are accepted. `stop_klog_stream({ id })` ends it.
+ */
+export type KlogStreamEvent = { id: number; text?: string | null; closed: boolean; error?: string | null }
 
 /* ---------------------------------------------------------------- payloads (binloader manager) */
 
@@ -117,7 +172,11 @@ export type PayloadEntry = {
   lastSentAt?: number | null
   lastResult?: string | null
   notes?: string | null
+  /** Parsed from the stored bytes; absent for raw BIN payloads. */
+  elf?: PayloadElf | null
 }
+
+export type PayloadElf = { class: string; endian: string; kind: string; machine: string; entry: string; segments: number; loadable: number; loadableBytes: number }
 
 /**
  * `list_payloads()` → PayloadEntry[]
@@ -127,10 +186,14 @@ export type PayloadEntry = {
  * `send_payload({ id, target, host, port })` → PayloadSendResult; `port` is the loader port
  *   (PS4 GoldHEN BinLoader 9090, PS5 ELF loader 9021). Built-in receivers are verified after sending.
  */
-export type PayloadSendResult = { message: string; bytes: number; port: number; verified: boolean }
+export type PayloadSendStep = { label: string; detail: string; ms: number; ok: boolean }
+/** Every send is traced: each step's duration, the socket write time and throughput, and the payload hash. */
+export type PayloadSendResult = {
+  message: string; bytes: number; port: number; verified: boolean
+  steps?: PayloadSendStep[]; totalMs?: number; sendMs?: number | null; bytesPerSecond?: number | null; host?: string; sha256?: string
+}
 
-/** `save_theme_file({ path, contents })` and `load_theme_file({ path })` → contents. `.sspitheme` only, at most 8 MiB. */
-export type ThemeFileContents = string
+/* ---------------------------------------------------------------- PS4 system themes */
 
 /**
  * `build_ps4_theme({ request })` → ThemeBuildResult. The studio draws every image; the app checks

@@ -1,15 +1,15 @@
 import { invoke } from "@tauri-apps/api/core"
 import { listen } from "@tauri-apps/api/event"
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { ProviderContext } from "@/components/ProviderContext"
-import { Dock, Header, TABS, TitleBar, pressKey, pulseDownloadsTab, type ConsoleState, type Hint, type Tab } from "@/components/Shell"
+import { Header, TABS, pressKey, pulseDownloadsTab, type ConsoleState, type Tab } from "@/components/Shell"
 import { LibraryPage } from "@/components/LibraryPage"
 import { SearchPage } from "@/components/SearchPage"
 import { DetailsPage } from "@/components/DetailsPage"
 import { DownloadsPage } from "@/components/DownloadsPage"
 import { ToolsPage, type ToolsTab } from "@/components/ToolsPage"
-import { OptionsOverlay, type OptionsTab } from "@/components/OptionsOverlay"
+import { OptionsOverlay, OptionsTabs, type OptionsTab } from "@/components/OptionsOverlay"
 import { ReceiverDialog } from "@/components/Dialogs"
 import { toast } from "@/components/toasts"
 import { demoGames, demoJobs, demoMetadata, demoPackages } from "@/data/demo"
@@ -95,7 +95,6 @@ export type Page = Tab | "details"
 export type UpdateInfo = { state: "checking" | "done" | "error"; packages?: PackageCandidate[]; checkedAt: number }
 export type LibrarySync = { endpoint: string; state: "syncing" | "ready" | "partial" | "offline" | "unsupported"; syncedAt?: number; messages: string[] }
 export type LibraryView = { target: ConsoleKind; entries: LibraryEntry[]; authoritative: boolean; sync?: LibrarySync; syncedAt?: number }
-type DockState = { context: ReactNode; hints: Hint[] }
 
 const APP_VERSION = typeof __APP_VERSION__ === "string" ? __APP_VERSION__ : ""
 const displayVersion = (value: string) => value.replace(/\.0$/, "")
@@ -140,9 +139,8 @@ export default function App() {
   const [page, setPage] = useState<Page>("library")
   const [origin, setOrigin] = useState<Tab>("library")
   const [options, setOptions] = useState<OptionsTab | null>(null)
+  const [closeOptions, setCloseOptions] = useState(0)
   const [toolsTab, setToolsTab] = useState<ToolsTab>("payloads")
-  const [dock, setDockState] = useState<DockState>({ context: "Library", hints: [] })
-  const setDock = useCallback((next: DockState) => setDockState(next), [])
 
   /* ---------------------------------------------------------------- search and library */
   const [query, setQuery] = useState("")
@@ -243,10 +241,7 @@ export default function App() {
     setRevealed(true)
     window.setTimeout(() => document.getElementById("bootCaption")?.remove(), 600)
     if (!motionOK()) return
-    const parts: Array<[string, number, number]> = [[".titlebar", 0, -8], [".header", 60, -14], [".dock", 120, 14]]
-    for (const [selector, delay, y] of parts) {
-      document.querySelector(selector)?.animate([{ opacity: 0, transform: `translateY(${y}px)` }, { opacity: 1, transform: "none" }], { duration: SPRINGS.soft.ms, delay, easing: SPRINGS.soft.easing, fill: "backwards" })
-    }
+    document.querySelector(".header")?.animate([{ opacity: 0, transform: "translateY(-14px)" }, { opacity: 1, transform: "none" }], { duration: SPRINGS.soft.ms, easing: SPRINGS.soft.easing, fill: "backwards" })
     document.querySelector(".viewport")?.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 500, delay: 140, easing: "ease-out", fill: "backwards" })
   }
 
@@ -590,10 +585,8 @@ export default function App() {
     else setMetadataState("error")
   }, [demo])
 
-  const go = useCallback((next: Tab) => {
-    if (page === "details" && selected) getStage()?.cases.retain(selected.titleId.toUpperCase())
-    setPage(next)
-  }, [page, selected])
+  // Tabs swap pages outright; only Back carries the game's case to where it came from.
+  const go = useCallback((next: Tab) => setPage(next), [])
 
   const rememberRecent = useCallback((game: Game, persist: boolean) => {
     setRecent(old => {
@@ -796,12 +789,12 @@ export default function App() {
   return (
     <ProviderContext settings={settings}>
       <div className="app">
-        <TitleBar />
         <Header
           tab={tab} activeJobs={activeJobs} settings={settings} consoleState={consoleState} probes={probes} demo={demo} brandRef={brandRef} menuDisabled={Boolean(options || receiverPrompt)}
+          optionsTabs={options ? <OptionsTabs tab={options} onTab={setOptions} /> : undefined}
           loadingReceiver={loadingReceiver} onLoadReceiver={target => void loadReceiver(target)}
           onTab={next => go(next)} onStep={step} onConsole={target => void changeConsole(target)}
-          onOptions={() => setOptions("consoles")} onManageConsoles={() => setOptions("consoles")}
+          onOptions={() => options ? setCloseOptions(n => n + 1) : setOptions("consoles")} onManageConsoles={() => setOptions("consoles")}
         />
         <main className="viewport" id="viewport">
           {page === "library" && (
@@ -814,7 +807,7 @@ export default function App() {
               onConsole={target => void changeConsole(target)} onRefresh={target => void syncConsoleLibrary(target)}
               onOpenGame={(entry, el) => openGame(gameFromEntry(entry), { el, kind: "thumb" })}
               onIconChanged={onIconChanged} onLoadReceiver={target => void loadReceiver(target)} loadingReceiver={loadingReceiver}
-              onOptions={setOptions} onSearch={() => go("search")} onDemo={enterDemo} onDock={setDock} tintOn={appearance.gameTint}
+              onOptions={setOptions} onSearch={() => go("search")} onDemo={enterDemo} tintOn={appearance.gameTint}
             />
           )}
           {page === "search" && (
@@ -824,7 +817,7 @@ export default function App() {
               results={results} region={region} setRegion={setRegion} resultsScroll={resultsScroll}
               library={library} recent={recent} onClearRecent={() => { setRecent([]); try { window.localStorage.removeItem(RECENT_KEY) } catch { /* ignore */ } }}
               onOpen={openGame} sources={sources} demo={demo} activeConsole={settings.activeConsole}
-              onOptions={setOptions} onDemo={enterDemo} onDock={setDock}
+              onOptions={setOptions} onDemo={enterDemo}
             />
           )}
           {page === "details" && selected && (
@@ -837,7 +830,7 @@ export default function App() {
               backLabel={backLabel}
               onBack={goBack} onRetry={() => void selectGame(selected)} onVariant={game => void selectGame(game)}
               onInstall={(candidates, available, from, provider) => deliver(selected, candidates, available, { from, provider })}
-              onOptions={setOptions} onDock={setDock} tintOn={appearance.gameTint}
+              onOptions={setOptions} tintOn={appearance.gameTint}
             />
           )}
           {page === "downloads" && (
@@ -846,7 +839,7 @@ export default function App() {
               jobs={shownJobs} demo={demo} settings={settings} systemDrive={systemDrive}
               filter={dlFilter} setFilter={setDlFilter} open={dlOpen} setOpen={setDlOpen} drawer={dlDrawer} setDrawer={setDlDrawer}
               statsForNerds={appearance.statsForNerds} setStatsForNerds={value => setAppearance(prev => ({ ...prev, statsForNerds: value }))}
-              ensureConsole={ensureConsole} onOptions={setOptions} onDock={setDock} onSearch={() => go("search")}
+              ensureConsole={ensureConsole} onOptions={setOptions} onSearch={() => go("search")}
               onOpenGame={group => openGame({ titleId: group.titleId || group.key, name: group.title, region: "", icon: group.icon })}
               tintOn={appearance.gameTint} cardStyle={appearance.cardStyle} cardSize={appearance.cardSize}
             />
@@ -855,21 +848,18 @@ export default function App() {
             <ToolsPage
               key="tools"
               tab={toolsTab} setTab={setToolsTab} target={settings.activeConsole} settings={settings} demo={demo}
-              probes={probes} libraries={libraries} onConsole={target => void changeConsole(target)}
+              probes={probes} onConsole={target => void changeConsole(target)}
               onLoadReceiver={target => void loadReceiver(target)} onReceiverLoaded={() => void probeAll()}
-              onIconChanged={onIconChanged} onRefreshLibrary={target => void syncConsoleLibrary(target)}
-              onOptions={setOptions} onDock={setDock}
             />
           )}
         </main>
-        <Dock context={dock.context} hints={dock.hints} build={build} />
       </div>
       {options && (
         <OptionsOverlay
           tab={options} setTab={setOptions} onClose={() => setOptions(null)}
           settings={settings} setSettings={setSettings} sources={sources} setSources={setSources}
           appearance={appearance} setAppearance={setAppearance} demo={demo} onLeaveDemo={leaveDemo}
-          downloadReceiver={downloadReceiver} payloadBusy={payloadBusy} onConsoleTested={markConsole} build={build}
+          downloadReceiver={downloadReceiver} payloadBusy={payloadBusy} onConsoleTested={markConsole} build={build} closeRequest={closeOptions}
         />
       )}
       <ReceiverDialog

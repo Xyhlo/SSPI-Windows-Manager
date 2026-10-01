@@ -5,7 +5,7 @@
   "stack": "Tauri 2 / React / Rust",
   "identifier": "com.simpleps5installer.gamesearch",
   "executable": "game-search.exe",
-  "receiverVersion": "1.0.6",
+  "receiverVersion": "1.0.12",
   "receiverPort": 9114,
   "sourceOrigin": "Simple-PS5-Installer; latest debug source snapshot",
   "outputRoot": "../Build-Output/Windows Manager"

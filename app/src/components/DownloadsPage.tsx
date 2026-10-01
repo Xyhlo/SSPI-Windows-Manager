@@ -11,9 +11,9 @@ import { CaseAnchor } from "./CaseAnchor"
 import { Collapse } from "./Collapse"
 import { DoctorReportView } from "./DoctorReportView"
 import { ImportDialog, type ManualRow } from "./Dialogs"
+import { CloudFilesDialog, PasteLinksDialog } from "./LinkDialogs"
 import { Icon } from "./Icon"
 import { useJobActions } from "./JobActions"
-import type { Hint } from "./Shell"
 import type { OptionsTab } from "./OptionsOverlay"
 import { SpeedChart } from "./SpeedChart"
 import { toast } from "./toasts"
@@ -25,12 +25,13 @@ import {
 } from "@/lib/downloads"
 import { displayText } from "@/lib/display"
 import { errorText, fmtBytes, fmtEta, fmtSpeed, plural } from "@/lib/format"
+import { activeStage, engineRate, fmtClock, fmtDuration, packEngine, packHeadline, packSummary, plainPath, stageProgress } from "@/lib/packaging"
 import { setPageKeys } from "@/lib/keys"
 import { clamp, glide } from "@/lib/motion"
 import { speedNow, speedSamples } from "@/lib/speed"
 import { coverTint } from "@/stage/art"
 import { getStage } from "@/stage/stage"
-import type { ConsoleKind, DeliveryJob, LocalPackage, ManualCandidate, ManualItem, Settings } from "@/types"
+import type { ConsoleKind, DeliveryJob, LocalPackage, ManualCandidate, ManualItem, PackEngine, Settings } from "@/types"
 
 type DrawerTab = "packages" | "files" | "errors"
 type Props = {
@@ -48,7 +49,6 @@ type Props = {
   setStatsForNerds: (value: boolean) => void
   ensureConsole: (target: ConsoleKind) => Promise<boolean>
   onOptions: (tab: OptionsTab) => void
-  onDock: (dock: { context: ReactNode; hints: Hint[] }) => void
   onSearch: () => void
   onOpenGame: (group: DownloadGroup) => void
   tintOn: boolean
@@ -82,7 +82,8 @@ function useUploadTrackers() {
 }
 
 function barPercent(job: DeliveryJob, upload?: UploadState | null) {
-  if (job.stage === "packaging") return Math.round((job.packaging?.phaseProgress ?? 0) * 100)
+  // One number while packaging: the active stage's measured progress (the segmented bar shows the rest).
+  if (job.stage === "packaging") return Math.round((stageProgress(job.packaging) ?? 0) * 100)
   if (job.stage === "extracting") {
     const detail = phaseDetail(job)
     if (detail.doneBytes != null && detail.totalBytes) return Math.round(Math.min(0.99, detail.doneBytes / detail.totalBytes) * 100)
@@ -93,7 +94,7 @@ function barPercent(job: DeliveryJob, upload?: UploadState | null) {
 function barIndeterminate(job: DeliveryJob) {
   const active = activeTransfer(job)
   if (job.stage === "queued" || /^waiting for another extraction/i.test(job.message || "")) return false
-  if (job.stage === "packaging") return !job.paused && active && job.packaging?.phaseProgress == null
+  if (job.stage === "packaging") return !job.paused && active && stageProgress(job.packaging) == null
   if (phaseDetail(job).indeterminate) return !job.paused && active
   return !job.paused && active && !job.bytesTotal && job.progress === 0
 }
@@ -130,16 +131,16 @@ function jobLine(job: DeliveryJob, group: DownloadGroup, downloadDir: string): {
   const target = jobTarget(job).toUpperCase()
   if (job.paused) return { text: "Paused. Retained files stay where they are.", cls: "muted" }
   if (["failed", "cancelled", "monitoring-ended"].includes(job.stage)) return { text: `${failureText(job)} ${errorContext(job)?.retryHint || ""}`.trim(), cls: "attn" }
-  if (job.stage === "complete") return { text: job.packageOnly ? `The package is saved in ${job.packaging?.outputPath || downloadDir}.` : `${group.title} is installed on your ${target}.`, cls: "done" }
+  if (job.stage === "complete") return { text: job.packageOnly ? job.packaging?.outputBytes ? `${packSummary(job.packaging)}.` : `The package is saved in ${plainPath(job.packaging?.outputPath || downloadDir)}.` : job.packaging?.format === "exfat" ? `The ${group.title} image is on your ${target}. ShadowMount Plus mounts it on its next scan.` : `${group.title} is installed on your ${target}.`, cls: "done" }
   if (job.stage === "delivered") return { text: `Delivered to SSPI on the ${target}. The PC can't confirm this install.`, cls: "done" }
   if (consoleOwned(job)) return { text: jobTarget(job) === "ps4" ? "Installation is managed on the PS4. Follow it in the PS4's download queue." : "Installation is managed by the PS5. Follow it on the console.", cls: "" }
   if (job.stage === "queued") return { text: job.message ? displayText(job.message) : "Queued. Starts when a download slot is free.", cls: "muted" }
-  if (job.stage === "packaging") return { text: job.packaging?.activity || phaseDetail(job).label, cls: "" }
+  if (job.stage === "packaging") return { text: job.packaging ? packHeadline(job.packaging) : phaseDetail(job).label, cls: "" }
   return { text: displayText(job.message || phaseDetail(job).label), cls: /^waiting/i.test(job.message || "") ? "muted" : "" }
 }
 
 export function DownloadsPage(props: Props) {
-  const { jobs, demo, settings, systemDrive, filter, setFilter, open, setOpen, drawer, setDrawer, statsForNerds, setStatsForNerds, ensureConsole, onOptions, onDock, onSearch, tintOn, cardStyle, cardSize } = props
+  const { jobs, demo, settings, systemDrive, filter, setFilter, open, setOpen, drawer, setDrawer, statsForNerds, setStatsForNerds, ensureConsole, onOptions, onSearch, tintOn, cardStyle, cardSize } = props
   const groups = useMemo(() => groupDownloads(jobs), [jobs])
   const trackUpload = useUploadTrackers()
   const [current, setCurrent] = useState<Record<string, string>>({})
@@ -154,6 +155,8 @@ export function DownloadsPage(props: Props) {
   const [localBusy, setLocalBusy] = useState(false)
   const localBusyRef = useRef(false)
   const [importOpen, setImportOpen] = useState(false)
+  const [linksOpen, setLinksOpen] = useState(false)
+  const [cloudOpen, setCloudOpen] = useState(false)
   const ftabsRef = useRef<HTMLDivElement>(null)
   const inkRef = useRef<HTMLSpanElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
@@ -209,15 +212,30 @@ export function DownloadsPage(props: Props) {
   }
 
   /* ---------------------------------------------------------------- tools */
+  const mergeManual = (found: ManualRow[]) => setManual(old => {
+    const seen = new Set(old.map(item => item.path.toLowerCase()))
+    const next = [...old]
+    for (const item of found) {
+      const key = item.path.toLowerCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      next.push(item)
+    }
+    return next
+  })
   const choose = async (directory: boolean) => {
     try {
-      const value = await openDialog({ multiple: true, directory, title: directory ? "Choose package folders" : "Choose PKG, ZIP or RAR files" })
+      const value = await openDialog({ multiple: true, directory, title: directory ? "Choose package or game folders" : "Choose PKG, ZIP or RAR files" })
       const paths = (Array.isArray(value) ? value : value ? [value] : []).filter((path): path is string => typeof path === "string")
       if (!paths.length) return
       const results = await Promise.all(paths.map(async path => {
         try { return { path, items: await invoke<LocalPackage[]>("scan_local_packages", { path }) } }
         catch (error) { return { path, error } }
       }))
+      // A game dump holds no PKG files, so folder scans also look for dumps.
+      // Folders without one are expected here, so their scan errors are ignored.
+      const dumps: ManualRow[] = directory ? (await Promise.all(paths.map(path => invoke<ManualCandidate[]>("scan_manual_folder", { path }).catch(() => []))))
+        .flat().filter(item => item.content === "dump").map(item => ({ ...item, kind: item.detectedKind })) : []
       const found = results.flatMap(result => result.items ?? [])
       for (const result of results) if ("error" in result) {
         toast({ tone: "error", title: directory ? "A folder couldn't be read" : "A file couldn't be scanned", text: `${result.path}: ${errorText(result.error)}` })
@@ -229,9 +247,13 @@ export function DownloadsPage(props: Props) {
           for (const item of found) if (!merged.has(item.path.toLowerCase())) merged.set(item.path.toLowerCase(), item)
           return [...merged.values()].map((item, index) => ({ ...item, number: index + 1 }))
         })
-        setImportOpen(true)
-      } else if (!results.some(result => "error" in result)) {
-        toast({ tone: "info", title: "No packages found", text: `Nothing SSPI can install was found in ${paths.length === 1 ? paths[0] : `${paths.length} selected paths`}.` })
+        setPicked(old => [...new Set([...old, ...found.map(item => item.path)])])
+      }
+      if (dumps.length) mergeManual(dumps)
+      if (dumps.length && !found.length && await runFolderAction(dumps)) return
+      if (found.length || dumps.length) setImportOpen(true)
+      else if (!results.some(result => "error" in result)) {
+        toast({ tone: "info", title: "Nothing found", text: `No PKG files or game folders were found in ${paths.length === 1 ? paths[0] : `${paths.length} selected paths`}.` })
       }
     } catch (error) { toast({ tone: "error", title: "The scan didn't finish", text: errorText(error) }) }
   }
@@ -250,25 +272,31 @@ export function DownloadsPage(props: Props) {
           for (const item of scanned) found.push({ ...item, kind: item.detectedKind })
         } catch (error) { toast({ tone: "error", title: "A folder couldn't be read", text: errorText(error) }) }
       }
-      setManual(old => {
-        const seen = new Set(old.map(item => item.path.toLowerCase()))
-        const next = [...old]
-        for (const item of found) {
-          const key = item.path.toLowerCase()
-          if (seen.has(key)) continue
-          seen.add(key)
-          next.push(item)
-        }
-        return next
-      })
+      mergeManual(found)
+      manualBusyRef.current = false
+      if (found.length && await runFolderAction(found)) return
       if (found.length) setImportOpen(true)
     } catch (error) { toast({ tone: "error", title: "The folders couldn't be added", text: errorText(error) }) }
     finally { manualBusyRef.current = false; setManualBusy(false) }
   }
+  /** Options → Packaging → "When game folders are added" runs one batch action without asking. */
+  const runFolderAction = async (rows: ManualRow[]) => {
+    const action = settings.folderAction || "ask"
+    if (action === "ask" || !rows.every(row => row.content === "dump" && row.kind !== "backport" && row.titleId?.trim())) return false
+    await installManual(action === "package", action === "package-send" ? true : action === "send" ? false : undefined, rows)
+    return true
+  }
   const target = settings.activeConsole
   const localBlock = picked.map(path => local.find(item => item.path === path)).filter((item): item is LocalPackage => !!item)
     .map(item => sendBlockReason(target, { titleId: item.titleId, backport: item.packageKind === "backport" })).find(Boolean)
-  const manualBlock = manual.map(item => sendBlockReason(target, { titleId: item.titleId, content: item.content === "dump" ? "dump" : item.content === "archive" ? "archive" : "pkg", backport: item.kind === "backport" })).find(Boolean)
+  // Game folders, PPSA titles and backports only install on a PS5, so they go there whichever console is active.
+  const manualTarget = (row: ManualRow): ConsoleKind => row.content === "dump" || /^PPSA/i.test(row.titleId?.trim() || "") || row.kind === "backport" ? "ps5" : target
+  const manualBlock = manual.map(item => sendBlockReason(manualTarget(item), { titleId: item.titleId, content: item.content === "dump" ? "dump" : item.content === "archive" ? "archive" : "pkg", backport: item.kind === "backport" })).find(Boolean)
+  const manualTargets = [...new Set(manual.map(manualTarget))]
+  const manualNote = target !== "ps5" && manualTargets.includes("ps5") ? "Game folders and PS5 titles go to your PS5." : undefined
+  const manualInstallLabel = manual.length && manual.every(item => item.content === "dump" && item.kind !== "backport")
+    ? settings.packageDumps ? settings.packageFormat === "exfat" ? "Build image and send" : "Package and install" : "Send to PS5"
+    : "Install selected"
   const installLocal = async () => {
     if (localBusyRef.current) return
     localBusyRef.current = true
@@ -304,13 +332,14 @@ export function DownloadsPage(props: Props) {
     if (!failed.length && !manual.length) setImportOpen(false)
     } finally { localBusyRef.current = false; setLocalBusy(false) }
   }
-  const installManual = async (packageOnly: boolean) => {
+  const installManual = async (packageOnly: boolean, pack?: boolean, rows: ManualRow[] = manual) => {
     if (manualBusyRef.current) return
     manualBusyRef.current = true
     setManualBusy(true)
+    const manual = rows
     try {
     if (!packageOnly && manualBlock) { toast({ tone: "warning", title: "This can't go to a PS4", text: manualBlock }); return }
-    if (!packageOnly && !await ensureConsole(target)) return
+    if (!packageOnly) for (const kind of manualTargets) if (!await ensureConsole(kind)) return
     const missing = manual.find(item => !item.titleId?.trim() && item.content === "dump")
     if (missing) { toast({ tone: "warning", title: "A title ID is needed", text: `${missing.name} needs a CUSA or PPSA title ID.` }); return }
     const kindOrder: Record<string, number> = { base: 0, update: 1, dlc: 2, backport: 3 }
@@ -323,15 +352,15 @@ export function DownloadsPage(props: Props) {
     for (const { row } of ordered) {
       const item: ManualItem = { path: row.path, kind: row.kind, titleId: row.titleId?.trim() ? row.titleId.trim().toUpperCase() : undefined }
       try {
-        await invoke<string>("start_manual_install", { items: [item], packageOnly, ...(!packageOnly ? { target } : {}) })
+        await invoke<string>("start_manual_install", { items: [item], packageOnly, ...(!packageOnly ? { target: manualTarget(row) } : {}), ...(pack != null ? { package: pack } : {}) })
         succeeded.add(row.path)
       } catch (error) {
         failed.push(row)
         toast({ tone: "error", title: `${row.name} didn't start`, text: errorText(error) })
       }
     }
-    if (succeeded.size) toast({ tone: "success", title: packageOnly ? `Packaging ${plural(succeeded.size, "folder")}` : `${plural(succeeded.size, "item")} queued`, text: packageOnly ? "Title, version and artwork are read from each dump. Packages stay on this PC." : `Installing on your ${target.toUpperCase()}.` })
-    setManual(() => failed)
+    if (succeeded.size) toast({ tone: "success", title: packageOnly ? `Packaging ${plural(succeeded.size, "folder")}` : `${plural(succeeded.size, "item")} queued`, text: packageOnly ? "Title, version and artwork are read from each dump. Packages stay on this PC." : pack === false ? "Each folder is uploaded as it is." : `Sending to your ${[...new Set(manual.map(manualTarget))].map(kind => kind.toUpperCase()).join(" and ")}.` })
+    setManual(old => old.filter(row => !succeeded.has(row.path)))
     if (!failed.length && !local.length) setImportOpen(false)
     } finally { manualBusyRef.current = false; setManualBusy(false) }
   }
@@ -372,18 +401,6 @@ export function DownloadsPage(props: Props) {
     if (k === "f" || k === "F") { event.preventDefault(); setDrawer("files") }
   }), [])
 
-  useEffect(() => {
-    const hints: Hint[] = [{ key: "Enter", label: openGroup ? "Close" : "Open", disabled: !shown.length, run: () => { const key = openKey || shown[0]?.key; if (key) toggle(key) } }]
-    if (primary && !demo) {
-      if (actions.controls.pause) hints.push({ key: "P", glyph: "P", face: "square", label: primary.paused ? "Resume" : "Pause", run: () => void actions.run("pause") })
-      if (actions.controls.retry) hints.push({ key: "R", glyph: "R", face: "square", label: "Retry", run: () => void actions.run("retry") })
-      if (actions.controls.cancel || actions.controls.remove) hints.push({ key: "Delete", label: actions.controls.cancel ? "Cancel" : "Remove", run: () => (actions.controls.cancel ? cancel() : actions.setRemoving(true)) })
-    }
-    if (openGroup) hints.push({ key: "F", glyph: "F", face: "triangle", label: "Files", run: () => setDrawer("files") })
-    hints.push({ key: "N", glyph: "N", face: "neutral", label: "Stats for nerds", run: () => setStatsForNerds(!statsForNerds) })
-    onDock({ context: openGroup ? <>Downloads<small>{openGroup.title}</small></> : "Downloads", hints })
-  }, [openGroup?.key, primary?.jobId, primary?.stage, primary?.paused, statsForNerds, shown.length, demo, cancelArmed])
-
   /* ---------------------------------------------------------------- render */
   return (
     <div className="page downloads-page enter">
@@ -401,6 +418,8 @@ export function DownloadsPage(props: Props) {
             <button type="button" className="btn sm" title="Import a PKG, ZIP or RAR" onClick={() => void choose(false)}><Icon name="box" /><span className="lbl">Import file</span></button>
             <button type="button" className="btn sm" title="Scan a folder for packages" onClick={() => void choose(true)}><Icon name="library" /><span className="lbl">Scan folder</span></button>
             <button type="button" className="btn sm" title="Package game folders" disabled={manualBusy} onClick={() => void addFolders()}>{manualBusy ? <span className="spinner" /> : <Icon name="folder" />}<span className="lbl">Add game folders</span></button>
+            <button type="button" className="btn sm" title="Paste hoster or direct download links" onClick={() => setLinksOpen(true)}><Icon name="link" /><span className="lbl">Paste links</span></button>
+            <button type="button" className="btn sm" title="Browse files stored in your debrid accounts" onClick={() => setCloudOpen(true)}><Icon name="globe" /><span className="lbl">Debrid files</span></button>
             {(local.length > 0 || manual.length > 0) && !importOpen && <button type="button" className="btn sm" onClick={() => setImportOpen(true)}><Icon name="files" />{plural(local.length + manual.length, "item")} ready</button>}
             {inactive.length > 0 && <button type="button" className="btn ghost sm" onClick={() => setClearing(value => !value)}><Icon name="trash" />Clear finished ({inactive.length})</button>}
           </div>
@@ -441,10 +460,13 @@ export function DownloadsPage(props: Props) {
           </div>
         )}
       </div>
+      <PasteLinksDialog open={linksOpen} onClose={() => setLinksOpen(false)} />
+      <CloudFilesDialog open={cloudOpen} onClose={() => setCloudOpen(false)} settings={settings} />
       <ImportDialog
         open={importOpen} onClose={() => setImportOpen(false)} target={target}
         local={local} picked={picked} setPicked={setPicked} onInstallLocal={() => void installLocal()} localBusy={localBusy} localBlock={localBlock}
-        manual={manual} setManual={setManual} onInstallManual={packageOnly => void installManual(packageOnly)} manualBusy={manualBusy} manualBlock={manualBlock}
+        manual={manual} setManual={setManual} onInstallManual={(packageOnly, pack) => void installManual(packageOnly, pack)} manualBusy={manualBusy} manualBlock={manualBlock}
+        manualNote={manualNote} manualInstallLabel={manualInstallLabel}
         onClear={() => { setLocal([]); setPicked([]); setManual([]); setImportOpen(false) }}
       />
     </div>
@@ -472,11 +494,12 @@ function Card({ group, index, open, onToggle, job, setCurrent, drawer, setDrawer
   const target = jobTarget(job)
   const moving = activeTransfer(job) && !job.paused
   // One status line: measured bytes, speed and time left while bytes move; otherwise what's happening.
-  const summary = moving && stats.speedBps != null
-    ? [stats.label.replace(" / ", " of "), fmtSpeed(stats.speedBps), stats.etaSeconds ? `${fmtEta(stats.etaSeconds)} left` : ""].filter(Boolean).join(", ")
+  const summary = moving && stats.speedBps != null && job.stage !== "packaging"
+    ? [stats.label.replace(" / ", " of "), fmtSpeed(stats.speedBps), stats.etaSeconds ? fmtEta(stats.etaSeconds) : ""].filter(Boolean).join(", ")
     : line.text
   const showBar = !finished && !["failed", "cancelled", "monitoring-ended"].includes(job.stage)
   const showPct = showBar && !barIndeterminate(job) && job.stage !== "queued"
+  const engine = packEngine(job.packaging)
 
   useLayoutEffect(() => {
     const stage = getStage(), el = cardRef.current
@@ -503,10 +526,12 @@ function Card({ group, index, open, onToggle, job, setCurrent, drawer, setDrawer
           <span className={`dline ${moving ? "" : line.cls}`}>{summary}</span>
         </span>
         <span className="dside">
-          {showPct && <span className="dpct">{pct}<small>%</small></span>}
+          {showPct && <span className="dpct">{pct}<small>%</small>{engine && job.stage === "packaging" && <em className="dstage">stage {engine.stageIndex}/{engine.stageCount}</em>}</span>}
           <Icon name="chevD" className="dchev" />
         </span>
-        {showBar && <span className={`dbar progress ${progressClass(job)}`} aria-hidden="true"><span className="fill" style={{ width: `${pct}%` }} /></span>}
+        {showBar && (engine && job.stage === "packaging"
+          ? <StageBar engine={engine} paused={!!job.paused} />
+          : <span className={`dbar progress ${progressClass(job)}`} aria-hidden="true"><span className="fill" style={{ width: `${pct}%` }} /></span>)}
       </button>
       <Collapse open={open} className="ddrawer">
         <Drawer group={group} job={job} setCurrent={setCurrent} drawer={drawer} setDrawer={setDrawer} statsForNerds={statsForNerds} setStatsForNerds={setStatsForNerds} trackUpload={trackUpload} settings={settings} demo={demo} actions={actions || headActions} cancelArmed={!!actions && cancelArmed} onCancel={actions ? onCancel : () => void headActions.run("cancel")} onRetryJob={onRetryJob} />
@@ -530,6 +555,8 @@ function Drawer({ group, job, setCurrent, drawer, setDrawer, statsForNerds, setS
   const counts = { packages: group.jobs.length, files: fileCount, errors: errors.length }
   const detail = phaseDetail(job)
   const pct = barPercent(job, trackUpload(job))
+  const engine = job.stage === "packaging" ? packEngine(job.packaging) : null
+  const showBuild = !!job.packaging && (job.stage === "packaging" || !!packEngine(job.packaging) || job.packaging.outputBytes > 0)
 
   useLayoutEffect(() => {
     glide(inkRef.current, tabsRef.current?.querySelector<HTMLElement>(`.dtab[data-drawer="${drawer}"]`) || null, tabsRef.current, { liquid: true })
@@ -547,11 +574,12 @@ function Drawer({ group, job, setCurrent, drawer, setDrawer, statsForNerds, setS
                 {state === "done" ? <Icon name="check" /> : state === "failed" ? <Icon name="x" /> : state === "skipped" ? "–" : n + 1}
               </span>
               <span>{name}</span>
-              <small>{state === "skipped" ? job.localPkg && index === 0 ? "Local file" : "Not needed" : state === "done" ? "Done" : state === "current" ? (job.paused ? "Paused" : detail.indeterminate ? detail.label : "In progress") : state === "failed" ? "Stopped" : ""}</small>
+              <small>{state === "skipped" ? job.localPkg && index === 0 ? "Local file" : "Not needed" : state === "done" ? "Done" : state === "current" ? (job.paused ? "Paused" : name === "Package" && engine ? `Stage ${engine.stageIndex} of ${engine.stageCount}` : detail.indeterminate ? detail.label : "In progress") : state === "failed" ? "Stopped" : ""}</small>
             </li>
           )
         })}
       </ol>
+      {showBuild && <PackagingPanel job={job} demo={demo} />}
       <div className="dtabs" role="tablist" ref={tabsRef}>
         {(["packages", "files", "errors"] as const).map(id => (
           <button key={id} type="button" role="tab" className="dtab" data-drawer={id} aria-selected={drawer === id} onClick={() => setDrawer(id)}>{id[0].toUpperCase() + id.slice(1)}<b>{counts[id]}</b></button>
@@ -614,6 +642,110 @@ function Drawer({ group, job, setCurrent, drawer, setDrawer, statsForNerds, setS
   )
 }
 
+/** One segment per engine stage, each filled only by that stage's measured progress. */
+function StageBar({ engine, paused }: { engine: PackEngine; paused: boolean }) {
+  return (
+    <span className={`dbar segbar ${paused ? "paused" : ""}`} aria-hidden="true">
+      {engine.stages.map(stage => {
+        const fill = stage.state === "done" ? 1 : stage.state === "active" ? stage.progress ?? null : 0
+        return <i key={stage.id} data-state={stage.state} data-indet={stage.state === "active" && fill == null ? "" : undefined}><b style={{ width: `${(fill ?? 0) * 100}%` }} /></i>
+      })}
+    </span>
+  )
+}
+
+const STAGE_NAMES: Record<string, string> = { prepare: "Prepare", compress: "Compress", outer: "Outer PFS", metadata: "Metadata", finalize: "Finalize", verify: "Verify", lizard: "Lizard", layout: "Layout", write: "Write" }
+const baseName = (path: string) => path.split(/[\\/]/).pop() || path
+
+/** The FPKG or image build, compact: one strip of engine stages, one line of measured numbers, the result. */
+function PackagingPanel({ job, demo, ensureConsole }: { job: DeliveryJob; demo: boolean; ensureConsole?: (target: ConsoleKind) => Promise<boolean> }) {
+  const info = job.packaging!
+  const engine = packEngine(info)
+  const packing = job.stage === "packaging" && activeTransfer(job)
+  const built = !!info.outputBytes
+  const [revealError, setRevealError] = useState("")
+  const level = engine?.level ?? info.compressionLevel ?? 0
+  const temp = info.tempPath ? plainPath(info.tempPath).slice(0, 2) : ""
+  const image = info.format === "exfat"
+  const lizard = info.lizard
+  const spec = (image
+    ? ["exFAT", `${engine?.blockKiB ?? 64} KiB clusters`, engine?.stages.some(stage => stage.id === "lizard") || lizard ? `Lizard LZ4, ${engine?.workers ?? info.threads} workers` : ""]
+    : [`Kraken ${level}`, `${engine?.workers ?? info.threads} workers`, engine?.pfs ? `PFS ${engine.pfs}` : `PFS v${info.pfsVersion}`, temp && /^[A-Za-z]:$/.test(temp) ? `temp ${temp.toUpperCase()}` : ""]).filter(Boolean).join(" · ")
+  const elapsed = (info.workspaceSeconds || 0) + (engine?.elapsedSeconds ?? info.elapsedSeconds)
+  const total = info.totalSeconds ?? (built ? info.elapsedSeconds : null)
+  const active = engine ? activeStage(engine) : undefined
+  const counted = ["compress", "lizard", "write"].includes(active?.id || "")
+  // An image compares with the dump as downloaded; its engine input is the (possibly Lizard-packed) payload.
+  const input = image ? info.inputBytes || engine?.inputBytes || 0 : engine?.inputBytes || info.inputBytes
+  const reveal = async () => {
+    setRevealError("")
+    try { await invoke("reveal_path", { path: info.outputPath }) } catch (error) { setRevealError(errorText(error)) }
+  }
+  const [sending, setSending] = useState(false)
+  // A finished "package only" build can still go to the PS5 from here.
+  const canSend = !demo && built && job.packageOnly && ["complete", "failed", "cancelled"].includes(job.stage)
+  const send = async () => {
+    setRevealError(""); setSending(true)
+    try {
+      if (ensureConsole && !await ensureConsole("ps5")) return
+      await invoke<string>("send_packaged", { jobId: job.jobId })
+      toast({ tone: "success", title: "Sending to your PS5", text: image ? "The image goes to /data/homebrew; ShadowMount Plus mounts it on its next scan." : "The package is uploaded and installed. Follow it on this card." })
+    } catch (error) { setRevealError(errorText(error)) }
+    finally { setSending(false) }
+  }
+  // One line of numbers: live rates while working, the result once built.
+  const line = packing && engine ? [
+    engine.io.readBps != null && active?.id !== "metadata" ? `read ${fmtSpeed(engine.io.readBps)}` : "",
+    engine.io.writeBps != null && active?.id !== "metadata" ? `write ${fmtSpeed(engine.io.writeBps)}` : "",
+    counted && engine.files ? `${engine.files.done} of ${engine.files.total} files` : active?.detail || "",
+    engine.etaSeconds != null && engine.etaSeconds >= 1 ? `${fmtDuration(engine.etaSeconds)} left in stage` : "",
+    counted && engine.currentFile ? `${baseName(engine.currentFile)}${engine.currentFileProgress != null ? ` ${Math.round(engine.currentFileProgress * 100)}%` : ""}` : "",
+  ] : [
+    built ? `${fmtBytes(input)} → ${fmtBytes(info.outputBytes)} (${(100 * info.outputBytes / Math.max(1, input)).toFixed(1)}%)` : fmtBytes(input),
+    lizard ? `Lizard packed ${lizard.filesPacked} of ${lizard.filesTotal} files, saved ${fmtBytes(Math.max(0, lizard.packedBytes - lizard.storedBytes))}` : "",
+    engine ? `read ${fmtBytes(engine.io.readBytes)}` : "",
+    engine ? `written ${fmtBytes(engine.io.writeBytes)}` : "",
+    info.workspaceSeconds != null ? `workspace ${fmtDuration(info.workspaceSeconds)}` : "",
+  ]
+  return (
+    <section className="pack" aria-label={image ? "ShadowMount image build" : "FPKG build"}>
+      <header className="pack-head">
+        <span className="pack-title"><strong>{image ? "ShadowMount image" : "FPKG build"}</strong><span className="pack-spec">{spec}</span></span>
+        <span className="pack-clock">
+          {total != null && !packing ? <><small>{image ? "Built in" : "Packaged in"}</small><b>{fmtDuration(total)}</b></> : <><small>{job.paused ? "Paused at" : "Elapsed"}</small><b>{fmtClock(elapsed)}</b></>}
+        </span>
+      </header>
+      {engine ? (
+        <ol className="pack-strip" style={{ gridTemplateColumns: `repeat(${engine.stages.length}, minmax(0, 1fr))` }}>
+          {engine.stages.map(stage => {
+            const fill = stage.state === "done" ? 1 : stage.state === "active" ? stage.progress ?? null : 0
+            const name = stage.id === "metadata" && /artwork/i.test(stage.label) ? "Artwork" : STAGE_NAMES[stage.id] || stage.label
+            return (
+              <li key={stage.id} data-state={stage.state} title={[stage.label, stage.detail].filter(Boolean).join(": ")}>
+                <span className="n">{stage.state === "done" && <Icon name="check" />}{name}</span>
+                <span className="t">{stage.state === "active" && fill != null ? `${Math.floor(fill * 100)}%` : stage.state === "pending" ? "–" : fmtDuration(stage.seconds)}</span>
+                <i className={stage.state === "active" && fill == null && !job.paused ? "indet" : ""}><b style={{ width: `${(fill ?? 0) * 100}%` }} /></i>
+              </li>
+            )
+          })}
+        </ol>
+      ) : (
+        <p className="rail-note" style={{ margin: "0 0 8px" }}>{image ? "Preparing the image workspace." : "Stage timings need packaging engine 1.1 or newer. This package was built by an earlier engine."}</p>
+      )}
+      <p className="pack-line">{line.filter(Boolean).join(" · ")}</p>
+      {built && info.outputPath && (
+        <div className="pack-out">
+          <Icon name="box" />
+          <code title={plainPath(info.outputPath)}>{plainPath(info.outputPath)}</code>
+          {canSend && <button type="button" className="btn sm" disabled={sending} onClick={() => void send()}>{sending ? <span className="spinner" /> : <Icon name="download" />}Send to PS5</button>}
+          {!demo && <button type="button" className="btn sm ghost" onClick={() => void reveal()}><Icon name="folder" />Show in folder</button>}
+        </div>
+      )}
+      {revealError && <p className="error" role="alert">{revealError}</p>}
+    </section>
+  )
+}
+
 function FilesPanel({ job, settings }: { job: DeliveryJob; settings: Settings }) {
   const components = job.components || []
   return (
@@ -635,14 +767,14 @@ function FilesPanel({ job, settings }: { job: DeliveryJob; settings: Settings })
         {job.packaging?.outputPath && (
           <div className="file">
             {job.stage === "complete" || job.packaging.outputBytes > 0 ? <Icon name="checkCircle" className="ok" /> : <Icon name="box" />}
-            <span>{job.packaging.outputPath.split(/[\\/]/).pop()}</span>
+            <span>{plainPath(job.packaging.outputPath).split(/[\\/]/).pop()}</span>
             <small>{job.packaging.outputBytes > 0 ? fmtBytes(job.packaging.outputBytes) : "Not built yet"}</small>
             <small>{job.stage === "packaging" ? "Building" : job.packaging.outputBytes > 0 ? "Packaged" : "Pending"}</small>
           </div>
         )}
         {!components.length && !job.packaging?.outputPath && <p className="noerr"><Icon name="info" />File details appear once the transfer has started.</p>}
       </div>
-      {settings.downloadDir && <p className="path-line"><Icon name="folder" /><code>{job.packaging?.outputPath || settings.downloadDir}</code></p>}
+      {settings.downloadDir && <p className="path-line"><Icon name="folder" /><code>{plainPath(job.packaging?.outputPath || settings.downloadDir)}</code></p>}
       <details className="tech">
         <summary>Technical details</summary>
         <div className="tech-body">
@@ -681,7 +813,7 @@ function NerdPanels({ job, settings }: { job: DeliveryJob; settings: Settings })
   if (recent.length > 2) {
     panels.push(
       <div key="speed" className="nerd-panel">
-        <div className="nerd-head"><strong>Speed</strong><span>{stageLabel(job)}, last 60 seconds</span></div>
+        <div className="nerd-head"><strong>{job.stage === "packaging" ? "Engine I/O" : "Speed"}</strong><span>{job.stage === "packaging" ? "Reads while compressing, writes while building the outer PFS" : `${stageLabel(job)}, last 60 seconds`}</span></div>
         <SpeedChart jobId={job.jobId} active={active} stageLabel={stage => stageLabel({ ...job, stage, paused: false })} />
         <div className="tp-foot">
           <span>Now <b>{fmtSpeed(values[values.length - 1] || 0)}</b></span>
@@ -703,21 +835,8 @@ function NerdPanels({ job, settings }: { job: DeliveryJob; settings: Settings })
   } else if (active) {
     panels.push(<div key="speed" className="nerd-panel"><div className="nerd-head"><strong>Speed</strong><span>Collecting samples</span></div><p className="rail-note" style={{ margin: 0 }}>The graph appears after a few seconds of transfer.</p></div>)
   }
-  if (job.stage === "packaging" && job.packaging) {
-    const p = job.packaging
-    panels.push(
-      <div key="pack" className="nerd-panel">
-        <div className="nerd-head"><strong>FPKG packaging</strong><span>PFS v{p.pfsVersion}{settings.fpkgDoctor ? ", dump doctor on" : ""}</span></div>
-        <div className="nerd-table">
-          <div><div className="k">Input</div><div className="v">{fmtBytes(p.inputBytes)}</div></div>
-          <div><div className="k">Package so far</div><div className="v">{fmtBytes(p.outputBytes)}</div></div>
-          <div><div className="k">Compression</div><div className="v">Kraken {p.compressionLevel || ({ fast: 2, standard: 4, smallest: 7 } as Record<string, number>)[p.preset] || 2}</div></div>
-          <div><div className="k">Workers</div><div className="v">{p.threads}</div></div>
-          <div><div className="k">Throughput</div><div className="v">{p.speedBps ? fmtSpeed(p.speedBps) : "Measuring"}</div></div>
-          <div><div className="k">Files</div><div className="v">{p.fileCount.toLocaleString()}</div></div>
-        </div>
-      </div>,
-    )
+  if (job.stage === "packaging") {
+    // Stages, bytes and rates live in the FPKG build panel above.
   } else if (job.stage === "uploading") {
     const target = jobTarget(job)
     const lanes = target === "ps5" ? ((settings.transferMode || "balanced") === "max" ? `Max, up to ${settings.uploadLanes || 4}` : "Balanced, 4") : "One stream"
