@@ -768,6 +768,21 @@ pub fn locate_engine(explicit: Option<&str>) -> Option<PathBuf> {
     which("fpkg-cli")
 }
 
+/// The .NET runtime shipped beside the application in `resources/dotnet`, when it is complete.
+fn bundled_dotnet_root(app_dir: &Path) -> Option<PathBuf> {
+    let root = app_dir.join("resources").join("dotnet");
+    (root.join("host").join("fxr").is_dir() && root.join("shared").join("Microsoft.NETCore.App").is_dir()).then_some(root)
+}
+
+/// The packaging engines are published framework-dependent. A full SSPI build ships the .NET
+/// runtime they need, so point them at it and no separate .NET install is required.
+pub(crate) fn use_bundled_dotnet(command: &mut Command) {
+    let exe = std::env::current_exe().ok();
+    if let Some(root) = exe.as_deref().and_then(Path::parent).and_then(bundled_dotnet_root) {
+        command.env("DOTNET_ROOT", &root).env("DOTNET_ROOT_X64", &root);
+    }
+}
+
 fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -800,6 +815,7 @@ pub async fn verify_runtime(
     paused: impl Fn() -> Result<bool, String> + Send,
 ) -> Result<(), String> {
     let mut cmd = Command::new(engine);
+    use_bundled_dotnet(&mut cmd);
     cmd.arg("verify").arg(package).kill_on_drop(true)
         .stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::piped());
     #[cfg(windows)]
@@ -906,6 +922,7 @@ fn build_command(engine: &Path, options: &PackageOptions, temp: &Path) -> Result
     let pfs = options.effective_pfs_version();
 
     let mut cmd = Command::new(engine);
+    use_bundled_dotnet(&mut cmd);
     cmd.arg("build")
         .arg("--source")
         .arg(&options.source)
@@ -1110,6 +1127,18 @@ fn parse_output_path(line: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_dotnet_runtime_is_used_only_when_complete() {
+        let app = std::env::temp_dir().join(format!("sspi-dotnet-root-{}", std::process::id()));
+        let root = app.join("resources").join("dotnet");
+        std::fs::create_dir_all(root.join("host").join("fxr").join("9.0.20")).unwrap();
+        assert_eq!(bundled_dotnet_root(&app), None, "a runtime without its shared framework is incomplete");
+        std::fs::create_dir_all(root.join("shared").join("Microsoft.NETCore.App").join("9.0.20")).unwrap();
+        assert_eq!(bundled_dotnet_root(&app), Some(root));
+        let _ = std::fs::remove_dir_all(&app);
+        assert_eq!(bundled_dotnet_root(&app), None);
+    }
 
     #[test]
     fn package_folder_names_are_safe_and_carry_the_title_id() {

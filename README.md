@@ -6,9 +6,9 @@ SSPI Windows Manager is the desktop side of SSPI. It finds packages, downloads a
 
 ![Packaging a PS5 dump, then reading the console's kernel log, processes and payload logs](docs/demo-packaging-and-diagnostics.gif)
 
-**Version 2.22.0 · Windows 10 and 11 (x64) · Tauri 2, React and Rust**
+**Version 2.22.1 · Windows 10 and 11 (x64) · Tauri 2, React and Rust**
 
-This is a private development repository. Test builds are published as a single `SSPI.exe` on the [Releases](../../releases) page.
+This is a private development repository. Test builds are published on the [Releases](../../releases) page as a Windows installer and a portable zip.
 
 ## What it does
 
@@ -47,11 +47,11 @@ This is a private development repository. Test builds are published as a single 
 - **PS5:** a console running homebrew with an ELF loader on port 9021, such as etaHEN or elfldr. Packaged installs and ShadowMount images also need compatible homebrew on the console.
 - **PS4:** GoldHEN 2.4b18.5 or newer, with BinLoader enabled.
 - The PC and the console on the same local network. Allow SSPI through Windows Firewall when asked.
-- Packaging dumps needs the .NET 9 runtime and the packaging engine that comes with a full build (see [Releases and updates](#releases-and-updates)).
+- Nothing else to install: the packaging engines and the .NET runtime they run on come with SSPI.
 
 ## Getting started
 
-1. Download `SSPI.exe` from the latest release and run it. It's portable, so nothing is installed.
+1. Download the installer (`-setup.exe`) from the latest release and run it. It installs for your Windows user, without an administrator prompt. If you'd rather not install, extract the portable zip and run `SSPI.exe` from that folder.
 2. Open **Options → Consoles**, then use **Find consoles** or enter your console's IP address.
 3. Load the receiver. Open **Tools → Payloads**, pick your console, and press **Send** next to the SSPI receiver. Load it again after a console restart and after updating SSPI.
 4. Install a package source in **Options → Sources**. If your links need it, add a debrid API key in **Options → Debrid**.
@@ -80,9 +80,12 @@ This is development software, tested by a small group. A host build that passes 
 
 ## Releases and updates
 
-Each release currently ships the plain `SSPI.exe`, which covers search, downloads, extraction, installs and the console tools. Packaging dumps (FPKG, exFAT images and Lizard asset packing) and building PS4 themes also need the `resources` folder that sits next to the EXE in a full build.
+Each release has two downloads, and both contain everything the app needs: the packaging engines, the Lizard runtime, the PS4 theme packager and the .NET runtime they run on.
 
-A Windows installer with automatic updates from this repository is planned. It will install the EXE and its resources together and keep both up to date.
+- **Installer:** installs SSPI for your Windows user and adds it to the Start menu. Settings and jobs are kept when you install a newer version over it.
+- **Portable zip:** the same files in a folder. Keep `SSPI.exe` next to its `resources` folder.
+
+Automatic updates from this repository are planned next.
 
 ## Building from source
 

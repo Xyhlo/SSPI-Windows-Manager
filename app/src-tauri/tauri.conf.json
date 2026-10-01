@@ -1,6 +1,6 @@
 {
   "productName": "SSPI",
-  "version": "2.22.0",
+  "version": "2.22.1",
   "identifier": "com.simpleps5installer.gamesearch",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -30,6 +30,9 @@
     "windows": {
       "wix": {
         "language": "en-US"
+      },
+      "nsis": {
+        "installMode": "currentUser"
       }
     },
     "icon": [

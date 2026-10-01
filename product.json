@@ -1,6 +1,6 @@
 {
   "productName": "SSPI for Windows",
-  "version": "2.22.0",
+  "version": "2.22.1",
   "releaseChannel": "development",
   "stack": "Tauri 2 / React / Rust",
   "identifier": "com.simpleps5installer.gamesearch",

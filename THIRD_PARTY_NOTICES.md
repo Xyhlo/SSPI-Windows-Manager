@@ -178,6 +178,15 @@ or add verified provenance and notices.
   and redistribution terms are not recorded. Confirm them before publishing the port or
   distributing the runtime, and ship the required notice.
 
+### .NET runtime — packaging engine runtime
+
+- Shipped unmodified in `resources/dotnet`: the Microsoft.NETCore.App shared framework and its
+  `hostfxr`, version 9.0.20, copied from the locally supplied .NET SDK (`SDK/dotnet`).
+- SSPI starts its framework-dependent packaging engines (`fpkg-cli`, `themepack-cli`) with
+  `DOTNET_ROOT` pointing at this folder, so no separate .NET install is needed.
+- Source: https://github.com/dotnet/runtime. License: MIT. Microsoft's `LICENSE.txt` and
+  `ThirdPartyNotices.txt` are copied beside the runtime.
+
 ### exFAT up-case table
 
 - `app/src-tauri/src/exfat/upcase_table.rs` holds the recommended up-case table defined in

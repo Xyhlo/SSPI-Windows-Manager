@@ -483,6 +483,7 @@ pub(super) async fn build_ps4_theme(app: AppHandle, request: ThemeBuildRequest) 
     };
     let output = root.join(format!("{content_id}.pkg"));
     let mut command = tokio::process::Command::new(&packager);
+    crate::fpkg::use_bundled_dotnet(&mut command);
     command.arg("build").arg(&stage).arg(&output).arg("--content-id").arg(&content_id).arg("--title").arg(&title)
         .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     #[cfg(windows)]
