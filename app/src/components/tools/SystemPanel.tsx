@@ -8,6 +8,7 @@ import { useEffect, useRef, useState } from "react"
 import { Seg } from "../Controls"
 import { Icon } from "../Icon"
 import { KernelLogView } from "./system/KernelLogView"
+import { CrashTimelineView } from "./system/CrashTimelineView"
 import { LogsView } from "./system/LogsView"
 import { ProcessesView } from "./system/ProcessesView"
 import { consoleSystemInfo } from "@/lib/console-api"
@@ -17,7 +18,7 @@ import { errorText, fmtBytes } from "@/lib/format"
 import type { ConsoleKind, Settings } from "@/types"
 
 type Props = { target: ConsoleKind; settings: Settings; demo: boolean; probe?: ConsoleProbe; onLoadReceiver: () => void }
-type View = "overview" | "klog" | "processes" | "logs"
+type View = "overview" | "timeline" | "klog" | "processes" | "logs"
 
 const CAPABILITY_NAMES: Record<string, string> = {
   "installed-library-v1": "Installed titles",
@@ -30,7 +31,7 @@ const CAPABILITY_NAMES: Record<string, string> = {
   "parallel-upload": "Parallel uploads",
   "stop": "Remote reload",
 }
-const VIEWS: Array<[View, string]> = [["overview", "Overview"], ["klog", "Kernel log"], ["processes", "Processes"], ["logs", "Logs & crashes"]]
+const VIEWS: Array<[View, string]> = [["overview", "Overview"], ["timeline", "Crash timeline"], ["klog", "Kernel log"], ["processes", "Processes"], ["logs", "Logs & crashes"]]
 
 export function SystemPanel({ target, settings, demo, probe, onLoadReceiver }: Props) {
   const name = target.toUpperCase()
@@ -41,15 +42,15 @@ export function SystemPanel({ target, settings, demo, probe, onLoadReceiver }: P
   const diagnostics = demo || hasCapability(probe, "diagnostics-v1")
   const { host, port } = receiverEndpoint(settings, target)
 
-  useEffect(() => { if (!diagnostics) setView("overview") }, [diagnostics])
+  useEffect(() => { if (!diagnostics && view !== "timeline") setView("overview") }, [diagnostics, view])
 
-  if (unreachable || unsupported) {
+  if ((unreachable || unsupported) && view !== "timeline") {
     return (
       <div className="empty-state">
         <Icon name={unsupported ? "upload" : "signal"} />
         <h3>{unsupported ? `Load receiver ${probe?.receiver.expectedVersion || ""} to see system information`.replace("  ", " ") : `Your ${name} isn't answering`}</h3>
         <p>{unsupported ? `The receiver running on your ${name} is older and doesn't report system information.` : !probe?.host ? `Add your ${name}'s address in Options, Consoles, then load the receiver.` : `Nothing answered at ${probe.host}:${probe.receiver.port}. Load the receiver on your ${name}, or check that it's on.`}</p>
-        {probe?.host && <div className="row"><button type="button" className="btn sm" onClick={onLoadReceiver}><Icon name="upload" />Load receiver</button></div>}
+        {probe?.host && <div className="row"><button type="button" className="btn sm" onClick={onLoadReceiver}><Icon name="upload" />Load receiver</button><button type="button" className="btn sm" onClick={() => setView("timeline")}><Icon name="rows" />Saved crash timeline</button></div>}
       </div>
     )
   }
@@ -57,12 +58,13 @@ export function SystemPanel({ target, settings, demo, probe, onLoadReceiver }: P
   return (
     <div className="sysx">
       <div className="sysx-bar">
-        {diagnostics
+        {diagnostics || view === "timeline"
           ? <Seg<View> label="System view" value={view} options={VIEWS} onChange={setView} />
           : <p className="sys-note">Load receiver {probe?.receiver.expectedVersion} to read the kernel log, processes, and other payloads' logs and crash reports.</p>}
       </div>
       <div className="sysx-body swap-fade" key={view}>
         {view === "overview" && <Overview target={target} host={host} port={port} demo={demo} probe={probe} />}
+        {view === "timeline" && <CrashTimelineView key={`${target}:${host}:${port}:${demo}`} target={target} host={host} port={port} demo={demo} available={!unreachable && !unsupported && diagnostics} />}
         {view === "klog" && <KernelLogView target={target} host={host} port={port} demo={demo} />}
         {view === "processes" && <ProcessesView target={target} host={host} port={port} demo={demo} />}
         {view === "logs" && <LogsView target={target} host={host} port={port} demo={demo} />}
