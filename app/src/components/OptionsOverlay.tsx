@@ -8,6 +8,7 @@ import { invoke } from "@tauri-apps/api/core"
 import { open as openDialog } from "@tauri-apps/plugin-dialog"
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from "react"
 import { DoctorReportView } from "./DoctorReportView"
+import { UpdatePanel } from "./Updater"
 import { CheckDraw, ConsoleGlyph, Icon } from "./Icon"
 import { Field, Row, Seg, Switch } from "./Controls"
 import { toast } from "./toasts"
@@ -21,8 +22,8 @@ import { patternPreview } from "@/stage/art"
 import type { DiscoveredConsole } from "@/lib/console-types"
 import type { ConsoleKind, DoctorReport, FolderAction, PackageFormat, PackageSource, Ps4Probe, Settings } from "@/types"
 
-export type OptionsTab = "consoles" | "sources" | "debrid" | "downloads" | "packaging" | "appearance"
-const TABS: Array<[OptionsTab, string]> = [["consoles", "Consoles"], ["sources", "Sources"], ["debrid", "Debrid"], ["downloads", "Downloads"], ["packaging", "Packaging"], ["appearance", "Appearance"]]
+export type OptionsTab = "consoles" | "sources" | "debrid" | "downloads" | "packaging" | "appearance" | "updates"
+const TABS: Array<[OptionsTab, string]> = [["consoles", "Consoles"], ["sources", "Sources"], ["debrid", "Debrid"], ["downloads", "Downloads"], ["packaging", "Packaging"], ["appearance", "Appearance"], ["updates", "Updates"]]
 
 /** The section before or after `tab`; the matching shoulder key flashes as if it was pressed. */
 export function stepOptionsTab(tab: OptionsTab, direction: -1 | 1): OptionsTab {
@@ -439,6 +440,7 @@ export function OptionsOverlay(props: Props) {
       {doctor && <div className="opt-msg"><DoctorReportView report={doctor} /></div>}
     </>,
     appearance: <AppearanceSection appearance={appearance} setAppearance={setAppearance} reduceMotion={draft.reduceMotion} setReduceMotion={value => patch({ reduceMotion: value })} />,
+    updates: <UpdatePanel disabled={demo} />,
   }
 
   return (

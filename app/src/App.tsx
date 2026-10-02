@@ -9,6 +9,7 @@ import { SearchPage } from "@/components/SearchPage"
 import { DetailsPage } from "@/components/DetailsPage"
 import { DownloadsPage } from "@/components/DownloadsPage"
 import { ToolsPage, type ToolsTab } from "@/components/ToolsPage"
+import { Updater } from "@/components/Updater"
 import { OptionsOverlay, OptionsTabs, type OptionsTab } from "@/components/OptionsOverlay"
 import { ReceiverDialog } from "@/components/Dialogs"
 import { toast } from "@/components/toasts"
@@ -788,6 +789,7 @@ export default function App() {
   const backLabel = origin === "downloads" ? "Downloads" : origin === "library" ? "Library" : origin === "tools" ? "Tools" : searchState === "idle" ? "Search" : "Search results"
   return (
     <ProviderContext settings={settings}>
+      <Updater />
       <div className="app">
         <Header
           tab={tab} activeJobs={activeJobs} settings={settings} consoleState={consoleState} probes={probes} demo={demo} brandRef={brandRef} menuDisabled={Boolean(options || receiverPrompt)}

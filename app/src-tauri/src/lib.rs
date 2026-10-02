@@ -22,6 +22,7 @@ mod payloads;
 mod payload_catalog;
 mod payload_autostart;
 mod web_launcher;
+mod updater;
 mod ps4_theme;
 mod ps4_protocol;
 mod ps4_inbox;
@@ -5118,6 +5119,7 @@ async fn queue_delivery(app: AppHandle, state: &AppState, mut request: DeliveryR
             return Err("This entry is being removed or was already removed".into());
         }
         let mut active = state.cancel.lock().unwrap();
+        if updater::installing() { return Err("SSPI is preparing to restart for an update. Start this transfer after it reopens.".into()); }
         if active.contains_key(&job) { return Err("This job is already running".into()); }
         if active.keys().any(|id| store.records.get(id).and_then(|record| record.request.as_ref()).is_some_and(|other| job_store::overlapping_delivery(&request, other))) {
             return Err("This game already has an active transfer. Open Downloads to manage it. Use one Install with backport transfer to combine the base and backport.".into());
@@ -5649,6 +5651,21 @@ async fn start_local_install(
 }
 
 pub fn run() {
+    if let Err(error) = updater::recover_if_needed() {
+        let message = format!("SSPI could not restore an interrupted update.\n\n{error}\n\nYour settings and downloads have not been removed.");
+        eprintln!("{message}");
+        #[cfg(windows)]
+        {
+            #[link(name = "user32")]
+            extern "system" {
+                fn MessageBoxW(window: *mut std::ffi::c_void, text: *const u16, caption: *const u16, flags: u32) -> i32;
+            }
+            let text: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+            let caption: Vec<u16> = "SSPI update recovery".encode_utf16().chain(std::iter::once(0)).collect();
+            unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), caption.as_ptr(), 0x10); }
+        }
+        std::process::exit(1);
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -5689,6 +5706,10 @@ pub fn run() {
             web_launcher::get_web_launcher,
             web_launcher::start_web_launcher,
             web_launcher::stop_web_launcher,
+            updater::get_update_status,
+            updater::check_for_updates,
+            updater::download_update,
+            updater::install_update,
             console_tools::list_console_library,
             console_tools::get_title_icon,
             console_tools::set_title_icon,

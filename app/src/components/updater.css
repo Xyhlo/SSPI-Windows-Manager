@@ -1,0 +1,15 @@
+.sspi-update-panel { padding-bottom: 12px; }
+.sspi-update-summary { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; padding: 18px 0 4px; }
+.sspi-update-summary span, .sspi-update-progress span { opacity: .7; font-size: 12px; }
+.sspi-update-message { line-height: 1.5; }
+.sspi-update-message[role="alert"] { color: #efb77b; }
+.sspi-update-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; }
+.sspi-update-progress { display: flex; align-items: center; gap: 12px; }
+.sspi-update-progress progress { flex: 1; }
+.sspi-update-notes { white-space: pre-wrap; font-size: 13px; line-height: 1.6; opacity: .8; }
+.sspi-update-banner { position: fixed; bottom: 42px; right: 24px; z-index: 45; max-width: min(640px, calc(100vw - 48px)); padding: 14px 16px; display: flex; align-items: center; gap: 12px; background: var(--panel, #202428); color: var(--text, #f4f5f6); border: 1px solid var(--line, #54575b); border-radius: 12px; box-shadow: 0 10px 40px #0006; font-size: 13px; }
+.sspi-update-banner > span { line-height: 1.4; }
+.sspi-update-banner .btn { flex-shrink: 0; }
+.sspi-update-banner progress { width: 110px; }
+.sspi-update-dismiss { border: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; font-size: 20px; padding: 0 4px; }
+.sspi-update-panel progress, .sspi-update-banner progress { height: 6px; accent-color: var(--accent, #b8f462); }
