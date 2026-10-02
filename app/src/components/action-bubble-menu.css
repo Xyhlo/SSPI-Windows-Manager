@@ -1,0 +1,33 @@
+.action-bubble-trigger {
+  display: inline-grid; flex: none; place-items: center; width: 36px; height: 36px; padding: 0;
+  border: 1px solid var(--line-2); border-radius: 50%; background: var(--surface-2); color: var(--ink);
+  transition: background 140ms, border-color 140ms;
+}
+.action-bubble-trigger:hover, .action-bubble-trigger[aria-expanded=true] { background: var(--surface-3); border-color: var(--line-3); }
+.action-bubble-trigger > .i { width: 19px; height: 19px; transition: transform 180ms var(--spring-snappy); }
+.action-bubble-trigger[aria-expanded=true] > .i { transform: rotate(45deg); }
+.action-bubble-trigger:focus-visible, .action-bubble:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.action-bubbles {
+  position: fixed; z-index: 120; display: flex; flex-direction: column; align-items: flex-end; gap: 8px;
+  width: max-content; max-width: calc(100vw - 24px); padding: 4px; overflow-y: auto; overscroll-behavior: contain;
+  background: none; border: 0; box-shadow: none; isolation: isolate;
+}
+.action-bubbles.align-start { align-items: flex-start; }
+.action-bubble {
+  display: flex; flex: none; align-items: center; gap: 11px; min-height: 44px; max-width: 100%; padding: 5px 18px 5px 6px;
+  border: 1px solid var(--line-2); border-radius: 25px; background: var(--surface-2); color: var(--ink);
+  box-shadow: 0 5px 14px #0004; text-align: left; font: 500 13px/1.35 var(--font);
+  transform-origin: top right; animation: actionBubbleIn 180ms var(--spring-snappy) both;
+  animation-delay: calc(var(--bubble-index) * 18ms);
+}
+.action-bubbles.opens-up .action-bubble { transform-origin: bottom right; }
+.action-bubble:hover, .action-bubble:focus-visible { background: var(--surface-3); border-color: var(--line-3); }
+.action-bubble:disabled { opacity: .45; cursor: default; }
+.action-bubble-icon { display: grid; place-items: center; flex: none; width: 32px; height: 32px; border-radius: 50%; background: rgba(var(--accent-rgb), .09); color: var(--accent); }
+.action-bubble-icon .i { width: 17px; height: 17px; }
+.action-bubble > .i { width: 14px; height: 14px; color: var(--good-ink); }
+@keyframes actionBubbleIn { from { opacity: 0; transform: translateY(-5px) scale(.97); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@media (prefers-reduced-motion: reduce) {
+  .action-bubble, .action-bubble-trigger, .action-bubble-trigger > .i { animation: none; transition: none; }
+}
+.reduce-motion .action-bubble, .reduce-motion .action-bubble-trigger, .reduce-motion .action-bubble-trigger > .i { animation: none; transition: none; }

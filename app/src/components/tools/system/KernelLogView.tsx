@@ -5,6 +5,7 @@
    ===================================================================== */
 import { useEffect, useMemo, useRef, useState } from "react"
 import { Icon } from "../../Icon"
+import { ActionBubbleMenu } from "../../ActionBubbleMenu"
 import { consoleKernelLog, onKlogStream, probeDebugServices, startKlogStream, stopKlogStream } from "@/lib/console-api"
 import type { DebugService, KernelLog } from "@/lib/console-types"
 import { analyzeKernelLog, exportName, textLogExport, type LogFinding } from "@/lib/diagnostics"
@@ -117,14 +118,15 @@ export function KernelLogView({ target, host, port, demo }: Props) {
         </div>
         <div className="kl-actions">
           <label className="field kl-filter"><Icon name="search" /><input value={filter} onChange={event => setFilter(event.target.value)} placeholder="Filter lines" aria-label="Filter kernel log lines" /></label>
-          <button type="button" className="btn sm" aria-pressed={issuesOnly} onClick={() => setIssuesOnly(value => !value)}><Icon name="alert" />{issuesOnly ? "Issues only" : "All lines"}</button>
-          <button type="button" className="btn sm" aria-pressed={follow} onClick={() => setFollow(value => !value)}><Icon name="chevD" />{follow ? "Following" : "Follow"}</button>
-          {live
-            ? <button type="button" className="btn sm ok" onClick={() => void stopLive()}><Icon name="pause" />Stop live</button>
-            : klogServers.map(service => <button key={service.port} type="button" className="btn sm" onClick={() => void goLive(service)}><Icon name="signal" />Live: {service.name}</button>)}
+          {live && <button type="button" className="btn sm ok" onClick={() => void stopLive()}><Icon name="pause" />Stop live</button>}
           <button type="button" className="btn sm icon" title="Take a new snapshot" aria-label="Take a new snapshot" disabled={loading || !!live} onClick={() => void loadSnapshot()}><Icon name="refresh" /></button>
           <ExportMenu name={exportName(target, "kernel-log", "txt").replace(/\.txt$/, "")} demo={demo} disabled={!text} build={format => textLogExport(text, format)} />
-          <button type="button" className="btn sm icon" title={copied ? "Copied" : "Copy the log"} aria-label="Copy the log" disabled={!text} onClick={() => void copy()}><Icon name={copied ? "check" : "copy"} /></button>
+          <ActionBubbleMenu label="Kernel log actions" actions={[
+            { id: "issues", label: "Show issues only", icon: "alert", checked: issuesOnly, onSelect: () => setIssuesOnly(value => !value) },
+            { id: "follow", label: "Follow new lines", icon: "chevD", checked: follow, onSelect: () => setFollow(value => !value) },
+            ...(!live ? klogServers.map(service => ({ id: `live-${service.port}`, label: `Live: ${service.name}`, icon: "signal" as const, onSelect: () => goLive(service) })) : []),
+            { id: "copy", label: copied ? "Copied" : "Copy the log", icon: copied ? "check" : "copy", disabled: !text, onSelect: copy },
+          ]} />
         </div>
       </div>
 

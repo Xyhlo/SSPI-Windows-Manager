@@ -8,6 +8,7 @@ import { invoke } from "@tauri-apps/api/core"
 import { open as openDialog } from "@tauri-apps/plugin-dialog"
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { CaseAnchor } from "./CaseAnchor"
+import { ActionBubbleMenu } from "./ActionBubbleMenu"
 import { Collapse } from "./Collapse"
 import { DoctorReportView } from "./DoctorReportView"
 import { ImportDialog, type ManualRow } from "./Dialogs"
@@ -415,11 +416,13 @@ export function DownloadsPage(props: Props) {
         </div>
         {!demo && (
           <div className="dl-tools">
-            <button type="button" className="btn sm" title="Import a PKG, ZIP or RAR" onClick={() => void choose(false)}><Icon name="box" /><span className="lbl">Import file</span></button>
-            <button type="button" className="btn sm" title="Scan a folder for packages" onClick={() => void choose(true)}><Icon name="library" /><span className="lbl">Scan folder</span></button>
-            <button type="button" className="btn sm" title="Package game folders" disabled={manualBusy} onClick={() => void addFolders()}>{manualBusy ? <span className="spinner" /> : <Icon name="folder" />}<span className="lbl">Add game folders</span></button>
-            <button type="button" className="btn sm" title="Paste hoster or direct download links" onClick={() => setLinksOpen(true)}><Icon name="link" /><span className="lbl">Paste links</span></button>
-            <button type="button" className="btn sm" title="Browse files stored in your debrid accounts" onClick={() => setCloudOpen(true)}><Icon name="globe" /><span className="lbl">Debrid files</span></button>
+            <ActionBubbleMenu label="Add to downloads" actions={[
+              { id: "file", label: "Import file", icon: "box", description: "Import a PKG, ZIP or RAR", onSelect: () => choose(false) },
+              { id: "scan", label: "Scan folder", icon: "library", description: "Scan a folder for packages", onSelect: () => choose(true) },
+              { id: "folders", label: "Add game folders", icon: "folder", description: "Package game folders", busy: manualBusy, onSelect: addFolders },
+              { id: "links", label: "Paste links", icon: "link", description: "Paste hoster or direct download links", onSelect: () => setLinksOpen(true) },
+              { id: "cloud", label: "Debrid files", icon: "globe", description: "Browse files stored in your debrid accounts", onSelect: () => setCloudOpen(true) },
+            ]} />
             {(local.length > 0 || manual.length > 0) && !importOpen && <button type="button" className="btn sm" onClick={() => setImportOpen(true)}><Icon name="files" />{plural(local.length + manual.length, "item")} ready</button>}
             {inactive.length > 0 && <button type="button" className="btn ghost sm" onClick={() => setClearing(value => !value)}><Icon name="trash" />Clear finished ({inactive.length})</button>}
           </div>
