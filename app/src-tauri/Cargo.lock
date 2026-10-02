@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "game-search"
-version = "2.22.1"
+version = "2.23.1"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
