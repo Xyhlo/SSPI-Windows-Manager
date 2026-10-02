@@ -26,13 +26,13 @@ const BUILTIN_PS4: &str = "builtin:ps4-receiver";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct PayloadEntry {
-    id: String,
-    name: String,
+    pub(super) id: String,
+    pub(super) name: String,
     file_name: String,
     path: String,
     size: usize,
-    sha256: String,
-    target: String,
+    pub(super) sha256: String,
+    pub(super) target: String,
     builtin: bool,
     added_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -49,10 +49,10 @@ pub(super) struct PayloadEntry {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct PayloadSendResult {
-    message: String,
+    pub(super) message: String,
     bytes: usize,
     port: u32,
-    verified: bool,
+    pub(super) verified: bool,
     /// Measured steps of this send, in order.
     #[serde(default)]
     steps: Vec<SendStep>,
@@ -193,6 +193,7 @@ const DEFAULT_PS5_TIMING: Ps5Timing = Ps5Timing {
 
 #[tauri::command]
 pub(super) fn list_payloads(app: AppHandle) -> Result<Vec<PayloadEntry>, String> {
+    let _index = index_lock().lock().unwrap_or_else(|p| p.into_inner());
     list_payloads_at(&store_root(&app)?)
 }
 
@@ -202,6 +203,7 @@ pub(super) fn add_payloads(
     paths: Vec<String>,
     target: String,
 ) -> Result<Vec<PayloadEntry>, String> {
+    let _index = index_lock().lock().unwrap_or_else(|p| p.into_inner());
     add_payloads_at(&store_root(&app)?, &paths, &target)
 }
 
@@ -213,11 +215,13 @@ pub(super) fn update_payload(
     target: Option<String>,
     notes: Option<String>,
 ) -> Result<Vec<PayloadEntry>, String> {
+    let _index = index_lock().lock().unwrap_or_else(|p| p.into_inner());
     update_payload_at(&store_root(&app)?, &id, name, target, notes)
 }
 
 #[tauri::command]
 pub(super) fn remove_payload(app: AppHandle, id: String) -> Result<Vec<PayloadEntry>, String> {
+    let _index = index_lock().lock().unwrap_or_else(|p| p.into_inner());
     remove_payload_at(&store_root(&app)?, &id)
 }
 
@@ -230,12 +234,13 @@ pub(super) async fn send_payload(
     host: String,
     port: u32,
 ) -> Result<PayloadSendResult, String> {
+    let _send = send_lock().try_lock().map_err(|_| "Another payload is being sent. Wait for it to finish.".to_string())?;
     let settings = state
         .settings
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    send_payload_at(
+    let result = send_payload_at(
         &store_root(&app)?,
         &id,
         &target,
@@ -244,7 +249,25 @@ pub(super) async fn send_payload(
         &settings,
         DEFAULT_PS5_TIMING,
     )
-    .await
+    .await;
+    crate::payload_autostart::record_manual(&target, &id, &result);
+    result
+}
+
+fn send_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn index_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+pub(super) async fn send_configured(app: &AppHandle, settings: &Settings, id: &str, target: &str) -> Result<PayloadSendResult, String> {
+    let _send = send_lock().try_lock().map_err(|_| "Another payload is being sent. Wait for it to finish.".to_string())?;
+    let (host, port) = if target == "ps4" { (&settings.ps4_host, settings.ps4_loader_port) } else { (&settings.ps5_host, settings.ps5_loader_port) };
+    send_payload_at(&store_root(app)?, id, target, host, port.into(), settings, DEFAULT_PS5_TIMING).await
 }
 
 fn store_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -432,7 +455,7 @@ async fn send_payload_at(
     settings: &Settings,
     ps5_timing: Ps5Timing,
 ) -> Result<PayloadSendResult, String> {
-    let mut index = read_index(root)?;
+    let index = { let _index = index_lock().lock().unwrap_or_else(|p| p.into_inner()); read_index(root)? };
     let builtin = is_builtin(id);
     let entry = if builtin {
         builtin_entry(id)
@@ -502,6 +525,9 @@ async fn send_payload_at(
         result
     });
 
+    // A send can take seconds. Preserve edits/imports made while the socket was active.
+    let _index = index_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let mut index = read_index(root)?;
     let now = unix_ms();
     let last_result = outcome
         .as_ref()

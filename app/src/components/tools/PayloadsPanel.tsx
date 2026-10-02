@@ -8,6 +8,7 @@ import { useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode 
 import { Collapse } from "../Collapse"
 import { Seg } from "../Controls"
 import { Icon } from "../Icon"
+import { ActionBubbleMenu } from "../ActionBubbleMenu"
 import { toast } from "../toasts"
 import { addPayloads, listPayloads, removePayload, sendPayload, updatePayload } from "@/lib/console-api"
 import { loaderEndpoint } from "@/lib/console-helpers"
@@ -16,6 +17,8 @@ import { errorText, fmtBytes, fmtSpeed } from "@/lib/format"
 import { isTyping, setPanelKeys } from "@/lib/keys"
 import { clamp } from "@/lib/motion"
 import type { ConsoleKind, Settings } from "@/types"
+import { getAutostart, setAutostart, getPayloadCatalog, downloadCatalogPayload, launcherAvailable, type AutostartStatus, type PayloadCatalog } from "@/lib/launcher-api"
+import "./WebLauncherPanel.css"
 
 type Props = { target: ConsoleKind; settings: Settings; demo: boolean; onReceiverLoaded: (target: ConsoleKind) => void }
 type SessionSend = { id: string; name: string; at: number; result: string; ok: boolean; totalMs?: number; bytesPerSecond?: number | null }
@@ -44,6 +47,10 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
   const [removing, setRemoving] = useState("")
   const [history, setHistory] = useState<SessionSend[]>([])
   const [traces, setTraces] = useState<Record<string, Traced>>({})
+  const [autostart, setAutostartState] = useState<AutostartStatus[]>([])
+  const [autoBusy, setAutoBusy] = useState(false)
+  const [autoError, setAutoError] = useState("")
+  const autoGeneration = useRef(0)
   const fileRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
 
@@ -54,10 +61,31 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
     return () => { live = false }
   }, [demo])
 
+  useEffect(() => {
+    let live = true, fetching = false
+    if (!launcherAvailable(demo)) return
+    const poll = async () => {
+      if (fetching) return
+      fetching = true; const generation = autoGeneration.current
+      try { const next = await getAutostart(demo); if (live && generation === autoGeneration.current) setAutostartState(next) }
+      catch (reason) { if (live) setAutoError(errorText(reason)) }
+      finally { fetching = false }
+    }
+    void poll(); const timer = window.setInterval(() => void poll(), 2000)
+    return () => { live = false; clearInterval(timer) }
+  }, [demo])
+
   const shown = useMemo(() => payloads
     .filter(payload => payload.target === "any" || payload.target === target)
     .sort((a, b) => Number(b.builtin) - Number(a.builtin) || a.name.localeCompare(b.name)), [payloads, target])
   const current = shown.find(payload => payload.id === selected) || shown[0]
+  const auto = autostart.find(item => item.target === target)
+  const changeAutostart = async (id: string) => {
+    autoGeneration.current += 1; setAutoBusy(true); setAutoError("")
+    try { setAutostartState(await setAutostart(target, id || null, demo)) }
+    catch (reason) { setAutoError(errorText(reason)) }
+    finally { autoGeneration.current += 1; setAutoBusy(false) }
+  }
 
   const addPaths = async (paths: string[]) => {
     if (!paths.length) return
@@ -141,6 +169,16 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
         <input ref={fileRef} type="file" accept=".elf,.bin" multiple hidden onChange={(event: ChangeEvent<HTMLInputElement>) => { const files = Array.from(event.currentTarget.files || []); event.currentTarget.value = ""; void addPaths(files.map(file => `preview/${file.name}`)) }} />
       </div>
       {error && <p className="pl-error" role="alert">{error}</p>}
+      <div className="pl-autostart">
+        <label className="pl-autostart-label" htmlFor="payload-autostart">Autostart</label>
+        <select id="payload-autostart" value={auto?.payloadId || ""} disabled={loading || autoBusy || !!busy || !launcherAvailable(demo)} onChange={event => void changeAutostart(event.target.value)}>
+          <option value="">Off</option>
+          {shown.map(entry => <option key={entry.id} value={entry.id}>{entry.name}</option>)}
+          {auto?.payloadId && !shown.some(entry => entry.id === auto.payloadId) && <option value={auto.payloadId}>Payload unavailable</option>}
+        </select>
+        <span className="pl-autostart-status" role="status">{autoBusy ? "Saving…" : autoError || auto?.message || "Sends once when SSPI starts."}</span>
+        <details className="pl-autostart-details"><summary>Details</summary><p>Off by default, with one payload per console. Choosing a payload arms it now and on each SSPI launch. Connection failures retry twice, then stop. A completed or partial send is never repeated automatically. The console’s loader must already be running and reachable over your network.</p>{auto?.lastAttemptAt && <p>Last attempt {when(auto.lastAttemptAt)} · {auto.attempts} of 3{auto.nextAttemptAt ? ` · next ${time(auto.nextAttemptAt)}` : ""}. {auto.phase === "sent" ? "Bytes were sent; execution was not verified." : auto.phase === "verified" ? "The SSPI receiver answered after loading." : ""}</p>}</details>
+      </div>
       <div ref={listRef} className="pl-list scroll" role="listbox" aria-label={`Payloads for your ${name}`}>
         {loading && Array.from({ length: 3 }, (_, n) => <div key={n} className="skeleton" style={{ height: 68, flex: "none" }} />)}
         {!loading && shown.map((entry, n) => {
@@ -158,15 +196,17 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
                 <span className="pl-main">
                   <strong>{entry.name}</strong>
                   <span>{entry.fileName}&ensp;{fmtBytes(entry.size)}{entry.builtin ? <>&ensp;Built in</> : entry.target === "any" ? <>&ensp;Any console</> : null}</span>
-                  <span className="pl-tech">{techLine(entry)}</span>
                 </span>
                 <span className={`pl-last ${failed ? "fail" : ""}`}>
-                  {entry.lastSentAt ? <><b>Sent {when(entry.lastSentAt)}</b><small>{entry.lastResult}</small></> : <b>Not sent yet</b>}
+                  {entry.lastSentAt ? <><b>{failed ? "Failed" : "Sent"} {when(entry.lastSentAt)}</b>{isCurrent && <small>{entry.lastResult}</small>}</> : <b>Not sent yet</b>}
                 </span>
                 {isCurrent && !entry.builtin && (
-                  <span className="pl-tools">
-                    <button type="button" className="btn sm ghost icon" aria-label={`Rename ${entry.name}`} title="Rename (R)" aria-expanded={editing === entry.id} onClick={event => { event.stopPropagation(); setRemoving(""); setEditing(editing === entry.id ? "" : entry.id) }}><Icon name="pencil" /></button>
-                    <button type="button" className="btn sm ghost icon" aria-label={`Remove ${entry.name}`} title="Remove (Delete)" aria-expanded={removing === entry.id} onClick={event => { event.stopPropagation(); setEditing(""); setRemoving(removing === entry.id ? "" : entry.id) }}><Icon name="trash" /></button>
+                  <span className="pl-tools" onClick={event => event.stopPropagation()}>
+                    <ActionBubbleMenu label={`Actions for ${entry.name}`} actions={[
+                      { id: "rename", label: "Rename", icon: "pencil", disabled: !!busy, onSelect: () => { setRemoving(""); setEditing(editing === entry.id ? "" : entry.id) } },
+                      { id: "autostart", label: auto?.payloadId === entry.id ? "Disable autostart" : "Autostart", icon: "play", disabled: autoBusy || !!busy, checked: auto?.payloadId === entry.id, onSelect: () => changeAutostart(auto?.payloadId === entry.id ? "" : entry.id) },
+                      { id: "remove", label: "Remove", icon: "trash", disabled: !!busy, onSelect: () => { setEditing(""); setRemoving(removing === entry.id ? "" : entry.id) } },
+                    ]} />
                   </span>
                 )}
                 <button type="button" className={`btn sm ${isCurrent ? "primary" : ""} pl-send`} disabled={!endpoint.host || !!busy} onClick={event => { event.stopPropagation(); setSelected(entry.id); void send(entry) }}>
@@ -177,7 +217,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
                 <PayloadEditor entry={entry} busy={busy === entry.id} onCancel={() => setEditing("")} onSave={draft => void save(entry, draft)} />
               </Collapse>
               <Collapse open={isCurrent && editing !== entry.id && removing !== entry.id} className="pl-drawer">
-                <PayloadSheet entry={entry} destination={endpoint.host ? `${endpoint.host}:${endpoint.port}` : ""} loader={loader} trace={traces[entry.id]} sending={busy === entry.id} />
+                <details className="pl-inspect"><summary>Payload details{traces[entry.id] ? " and last send" : ""}</summary><p className="pl-tech">{techLine(entry)}</p><PayloadSheet entry={entry} destination={endpoint.host ? `${endpoint.host}:${endpoint.port}` : ""} loader={loader} trace={traces[entry.id]} sending={busy === entry.id} /></details>
               </Collapse>
               <Collapse open={removing === entry.id} className="pl-drawer">
                 <div className="remove-confirm">
@@ -198,6 +238,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
           </div>
         )}
       </div>
+      {target === "ps5" && <CatalogBrowser demo={demo} onImported={setPayloads} />}
       {history.length > 0 && (
         <details className="tech pl-log">
           <summary>This session: {history.length === 1 ? "1 send" : `${history.length} sends`}, last {history[0].name} at {time(history[0].at)}</summary>
@@ -208,6 +249,41 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
       )}
     </div>
   )
+}
+
+function CatalogBrowser({ demo, onImported }: { demo: boolean; onImported: (entries: PayloadEntry[]) => void }) {
+  const [catalog, setCatalog] = useState<PayloadCatalog | null>(null)
+  const [search, setSearch] = useState("")
+  const [busy, setBusy] = useState("")
+  const [error, setError] = useState("")
+  const refresh = async (force: boolean) => {
+    if (busy) return
+    setBusy("refresh"); setError("")
+    try { setCatalog(await getPayloadCatalog(force, demo)) }
+    catch (reason) { setError(errorText(reason)) }
+    finally { setBusy("") }
+  }
+  const download = async (filename: string) => {
+    if (busy) return
+    if (demo) { toast({ tone: "info", title: "Offline preview", text: "No payload was downloaded." }); return }
+    setBusy(filename); setError("")
+    try { onImported(await downloadCatalogPayload(filename)); setCatalog(await getPayloadCatalog(false, demo)); toast({ tone: "success", title: "Payload added", text: "The selected repository version is in your library. Use Send when ready." }) }
+    catch (reason) { setError(errorText(reason)) }
+    finally { setBusy("") }
+  }
+  const entries = catalog?.entries.filter(item => `${item.name} ${item.category} ${item.description}`.toLowerCase().includes(search.trim().toLowerCase())) || []
+  return <details className="tech pl-catalog" onToggle={event => { if (event.currentTarget.open && !catalog && !busy) void refresh(false) }}>
+    <summary>Payload catalog · PS5</summary>
+    <div className="tech-body">
+      <div className="pl-catalog-top"><input className="field" placeholder="Find a payload" aria-label="Search payload catalog" value={search} onChange={e => setSearch(e.target.value)} /><button type="button" className="btn sm" disabled={!!busy || !launcherAvailable(demo)} onClick={() => void refresh(true)}>{busy === "refresh" ? "Loading…" : "Refresh"}</button></div>
+      <p>From <a href="https://github.com/itsPLK/ps5-payloads-mirror" target="_blank" rel="noreferrer">Payload Manager’s repository</a>. Refresh checks available versions. Downloads add a local copy; your existing payloads and autostart selection stay as chosen.</p>
+      {(error || catalog?.warning) && <p className="pl-error" role="alert">{error || catalog?.warning}</p>}
+      <div className="pl-catalog-list">
+        {entries.map(entry => <div className="pl-catalog-item" key={entry.filename}><div><strong>{entry.name} {entry.version}</strong><p>{entry.description}</p><small>{entry.checksum ? "SHA-256 checked on download" : "No published checksum"}{entry.source && <> · <a href={entry.source} target="_blank" rel="noreferrer">Source & compatibility</a></>}</small></div><button type="button" className="btn sm" disabled={!!busy || entry.installed} onClick={() => void download(entry.filename)}>{busy === entry.filename ? "Downloading…" : entry.installed ? "Added" : "Download"}</button></div>)}
+        {!entries.length && <p className="pl-catalog-empty">{busy === "refresh" ? "Loading repository…" : catalog ? "No payloads match this search." : "Open the catalog in the SSPI app to download payloads."}</p>}
+      </div>
+    </div>
+  </details>
 }
 
 /** Header facts for the selected payload and, after a send, what the send measured. */

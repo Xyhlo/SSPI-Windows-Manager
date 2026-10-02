@@ -19,6 +19,8 @@ mod package_details;
 mod static_catalog;
 mod discovery;
 mod payloads;
+mod payload_catalog;
+mod payload_autostart;
 mod web_launcher;
 mod ps4_theme;
 mod ps4_protocol;
@@ -5676,9 +5678,14 @@ pub fn run() {
                     .pool_idle_timeout(Duration::from_secs(30))
                     .build()?,
             });
+            payload_autostart::start(handle.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            payload_catalog::get_payload_catalog,
+            payload_catalog::download_catalog_payload,
+            payload_autostart::get_payload_autostart,
+            payload_autostart::set_payload_autostart,
             web_launcher::get_web_launcher,
             web_launcher::start_web_launcher,
             web_launcher::stop_web_launcher,
