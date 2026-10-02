@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SSPI Web Launcher</title>
+  <style>
+/* SSPI visual layer. Upstream WebKit Autoloader copyright and license retained in source distribution. */
+*{box-sizing:border-box;-webkit-box-sizing:border-box}html,body{margin:0;min-height:100%;background:#0b0b0c;color:#ededed}
+body{font:18px/1.55 "Geist","Segoe UI","Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased;background:radial-gradient(ellipse at 85% 0,rgba(255,255,255,.035),transparent 60%),#0b0b0c}
+.sspi-header{height:92px;display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;-webkit-justify-content:space-between;justify-content:space-between;padding:0 5%;border-bottom:1px solid rgba(255,255,255,.08);background:#111113}
+.sspi-brand{display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;font-size:18px;font-weight:400;color:#a0a0a6;letter-spacing:.01em}.sspi-logo{display:block;width:52px;height:52px;object-fit:contain;margin-right:18px}.sspi-header-note{font-size:13px;color:#7a7a81}
+main{width:90%;max-width:1120px;margin:48px auto;padding:0;position:relative;animation:sspi-enter .35s ease-out;-webkit-animation:sspi-enter .35s ease-out}
+h1,h2,p{margin:0}h1{font-size:38px;line-height:1.2;letter-spacing:-.025em;font-weight:500;margin:12px 0 16px}h2{font-size:22px;font-weight:500;line-height:1.35}.sspi-eyebrow{color:#7a7a81;font-size:14px;letter-spacing:.025em}.sspi-description{color:#a0a0a6;font-size:17px;max-width:760px;line-height:1.6}
+button,a{font:inherit}button{cursor:pointer}button:focus,a:focus,[tabindex]:focus{outline:3px solid #e4e4e1!important;outline-offset:5px;box-shadow:none!important}button:disabled{opacity:.45;cursor:default}
+.sspi-section-label{font-size:14px;font-weight:400;color:#a0a0a6;margin-bottom:12px}.sspi-log-panel{margin-top:32px}#logWrapper,#logContainer{font-family:"Cascadia Mono",Consolas,"Courier New",monospace;font-size:14px;line-height:1.7;word-wrap:break-word;overflow-wrap:break-word}
+#logWrapper{height:260px;overflow-y:auto;padding:18px 22px;border:1px solid rgba(255,255,255,.08);background:#111113;border-radius:10px}#logContainer{color:#a0a0a6}#logContainer .line{white-space:pre-wrap;margin-bottom:4px}#logContainer .info{color:#a0a0a6}#logContainer .success{color:#97c4a2}#logContainer .warning{color:#d8bd86}#logContainer .error,#logContainer.error{color:#e8a2a5}
+[hidden]{display:none!important}.sspi-hint{color:#7a7a81;font-size:13px;margin-top:24px}.sspi-hint kbd{border:1px solid rgba(255,255,255,.12);border-radius:4px;padding:2px 6px;color:#a0a0a6;background:#161618}
+::-webkit-scrollbar{width:7px}::-webkit-scrollbar-thumb{background:#333338;border-radius:5px}::-webkit-scrollbar-track{background:transparent}
+@-webkit-keyframes sspi-enter{from{opacity:0;-webkit-transform:translateY(7px)}to{opacity:1;-webkit-transform:translateY(0)}}@keyframes sspi-enter{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:translateY(0)}}
+@media(max-width:700px){body{font-size:16px}.sspi-header{height:76px}.sspi-logo{width:42px;height:42px}.sspi-header-note{display:none}main{margin:30px auto}h1{font-size:30px}.sspi-description{font-size:16px}#logWrapper{height:230px;padding:14px}#logContainer{font-size:12px}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;-webkit-animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+
+#status{font-size:19px;color:#a0a0a6;margin-top:22px}.bad{color:#e8a2a5!important}</style>
+</head>
+
+<body>
+<header class="sspi-header"><div class="sspi-brand"><img class="sspi-logo" src="sspi-logo.png" alt="SSPI" /><span>Web Launcher</span></div><span class="sspi-header-note">PlayStation 5</span></header>
+  <main>
+    <div class="sspi-eyebrow">Web Launcher</div><h1>Opening your launcher.</h1>
+    <p id="status" role="status" aria-live="polite">Loading&hellip;</p>
+  </main>
+
+  <script>
+    (function () {
+      'use strict';
+
+      var dir = '[[APP_DIR_PLACEHOLDER]]';
+      var version = '[[VERSION_PLACEHOLDER]]';
+      var statusEl = document.getElementById('status');
+
+      function fail() {
+        statusEl.textContent = 'Cache incomplete - run the installer again.';
+        statusEl.className = 'bad';
+      }
+
+      /* __complete__ is the LAST entry of the AppCache manifest, so if it is
+         present (with our version content) every file before it was downloaded.
+         Only then point at the app. If the marker is missing, this fetch falls
+         back to this very page (content mismatch) or errors - never redirect
+         into a partially cached directory. */
+      fetch('/app/' + dir + '/__complete__')
+        .then(function (r) {
+          return r.text();
+        })
+        .then(function (t) {
+          if (t.trim() === version) {
+            window.location.replace('/app/' + dir + '/index.html');
+          } else {
+            fail();
+          }
+        })
+        .catch(fail);
+    })();
+  </script>
+</body>
+
+</html>

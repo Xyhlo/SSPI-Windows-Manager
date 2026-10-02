@@ -3,7 +3,7 @@
    binloader manager), System (what the console reports, its kernel
    log, processes and payload logs) and Themes (PS4 system themes and
    game icon shapes). The switch picks the console for
-   payloads, system and game icons; 1 to 4 jump between them.
+   payloads, system and game icons; 1 to 5 jump between the tools.
    ===================================================================== */
 import { useEffect, useLayoutEffect, useRef } from "react"
 import type { ConsoleProbe } from "@/lib/console-types"
@@ -12,13 +12,15 @@ import { glide } from "@/lib/motion"
 import type { ConsoleKind, Settings } from "@/types"
 import { ConsoleSwitch } from "./Controls"
 import { PayloadsPanel } from "./tools/PayloadsPanel"
+import { WebLauncherPanel } from "./tools/WebLauncherPanel"
 import { SystemPanel } from "./tools/SystemPanel"
 import { ThemesPanel } from "./tools/ThemesPanel"
 import { IconMaskPanel } from "./tools/IconMaskPanel"
 
-export type ToolsTab = "payloads" | "system" | "themes" | "icons"
+export type ToolsTab = "payloads" | "system" | "themes" | "icons" | "web"
 const TOOLS: Array<{ id: ToolsTab; label: string; detail: string }> = [
   { id: "payloads", label: "Payloads", detail: "Send ELF and BIN payloads to your console's loader." },
+  { id: "web", label: "Web launcher", detail: "Host the PS5 WebKit Autoloader from this PC." },
   { id: "system", label: "System", detail: "What the receiver reads about your console." },
   { id: "themes", label: "Themes", detail: "PS4 system themes: wallpaper and system icons." },
   { id: "icons", label: "Game icons", detail: "Mask every game's icon, like Icon Mask." },
@@ -51,7 +53,7 @@ export function ToolsPage({ tab, setTab, target, settings, demo, probes, onConso
     if (isTyping() || event.ctrlKey || event.altKey || event.metaKey) return
     const { setTab, target, onConsole } = live.current
     const k = event.key
-    if (k === "1" || k === "2" || k === "3" || k === "4") { event.preventDefault(); setTab(TOOLS[Number(k) - 1].id); return }
+    if (/^[1-5]$/.test(k)) { event.preventDefault(); setTab(TOOLS[Number(k) - 1].id); return }
     if (k === "c" || k === "C") { event.preventDefault(); onConsole(target === "ps5" ? "ps4" : "ps5") }
   }), [])
 
@@ -64,10 +66,11 @@ export function ToolsPage({ tab, setTab, target, settings, demo, probes, onConso
           ))}
           <span className="ftab-ink" ref={inkRef} />
         </div>
-        {tab === "themes" ? <span className="tl-only">PS4 only</span> : <ConsoleSwitch value={target} onChange={onConsole} probes={probes} demo={demo} label="Console for tools" />}
+        {tab === "themes" || tab === "web" ? <span className="tl-only">{tab === "web" ? "PS5 only" : "PS4 only"}</span> : <ConsoleSwitch value={target} onChange={onConsole} probes={probes} demo={demo} label="Console for tools" />}
       </div>
       <div className="tl-body swap-fade" key={tab}>
         {tab === "payloads" && <PayloadsPanel target={target} settings={toolSettings} demo={demo} onReceiverLoaded={onReceiverLoaded} />}
+        {tab === "web" && <WebLauncherPanel demo={demo} />}
         {tab === "themes" && <ThemesPanel settings={toolSettings} demo={demo} probe={probes.ps4} />}
         {tab === "icons" && <IconMaskPanel target={target} settings={toolSettings} demo={demo} probe={probes[target]} />}
         {tab === "system" && <SystemPanel target={target} settings={toolSettings} demo={demo} probe={probes[target]} onLoadReceiver={() => onLoadReceiver(target)} />}

@@ -213,6 +213,27 @@ or add verified provenance and notices.
   scene structure and limits, and embeds the 420-byte plane model its generator
   writes. Keep the MIT notice with distributions.
 
+### SSPI console interfaces — WebKit Autoloader, Payload Manager and ELF loader
+
+- Based on PS5 WebKit Autoloader (https://github.com/itsPLK/ps5-webkit-autoloader),
+  Payload Manager (https://github.com/itsPLK/ps5-payload-manager), unified autoloader
+  and their pinned ELF loader dependencies. The original GPL license and source
+  notices remain applicable. SSPI's repository MIT license does not replace them.
+- SSPI modifies the browser layouts, branding, startup handoff, Manager edition
+  checks and the shared ELF loader's network binding/readiness reporting.
+  Upstream firmware selection and exploit-chain source/assets remain unchanged.
+- The pinned original v0.5.2 host has SHA-256
+  `6421f167d01ff1c0f3c8c2df1bf0e656691837b938aa924b3d2426c05ec2b7bf`.
+  Its chain assets and public HTTPS identity are reused. Windows reads the host's
+  embedded archive; it does not execute the Python server.
+- The distribution includes the GPL text under `resources/web-launcher/LICENSE`.
+  The accompanying host embeds `sspi-launcher-sources.zip` with tracked upstream
+  inputs, original licenses, pinned revisions, SSPI overrides and build recipe,
+  plus `sspi-build.json` with source and native payload hashes. These are also
+  downloadable from the local SSPI host at paths matching those filenames.
+- Runtime payloads downloaded from configured repositories retain their own
+  attribution and licensing and are not included in the public source export.
+
 ## Release rule
 
 A clean-room/public release should be generated from an explicit allowlist.

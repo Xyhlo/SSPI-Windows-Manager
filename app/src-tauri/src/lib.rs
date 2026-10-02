@@ -19,6 +19,7 @@ mod package_details;
 mod static_catalog;
 mod discovery;
 mod payloads;
+mod web_launcher;
 mod ps4_theme;
 mod ps4_protocol;
 mod ps4_inbox;
@@ -5678,6 +5679,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            web_launcher::get_web_launcher,
+            web_launcher::start_web_launcher,
+            web_launcher::stop_web_launcher,
             console_tools::list_console_library,
             console_tools::get_title_icon,
             console_tools::set_title_icon,

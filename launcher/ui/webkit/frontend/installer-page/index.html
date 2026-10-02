@@ -1,0 +1,626 @@
+<!doctype html>
+<html lang="en" manifest="/cache.appcache">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="icon" type="image/png" href="/sspi-logo.png" />
+  <title>SSPI Web Launcher · Setup</title>
+  <style>
+/* SSPI visual layer. Upstream WebKit Autoloader copyright and license retained in source distribution. */
+*{box-sizing:border-box;-webkit-box-sizing:border-box}html,body{margin:0;min-height:100%;background:#0b0b0c;color:#ededed}
+body{font:18px/1.55 "Geist","Segoe UI","Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased;background:radial-gradient(ellipse at 85% 0,rgba(255,255,255,.035),transparent 60%),#0b0b0c}
+.sspi-header{height:92px;display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;-webkit-justify-content:space-between;justify-content:space-between;padding:0 5%;border-bottom:1px solid rgba(255,255,255,.08);background:#111113}
+.sspi-brand{display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;font-size:18px;font-weight:400;color:#a0a0a6;letter-spacing:.01em}.sspi-logo{display:block;width:52px;height:52px;object-fit:contain;margin-right:18px}.sspi-header-note{font-size:13px;color:#7a7a81}
+main{width:90%;max-width:1120px;margin:48px auto;padding:0;position:relative;animation:sspi-enter .35s ease-out;-webkit-animation:sspi-enter .35s ease-out}
+h1,h2,p{margin:0}h1{font-size:38px;line-height:1.2;letter-spacing:-.025em;font-weight:500;margin:12px 0 16px}h2{font-size:22px;font-weight:500;line-height:1.35}.sspi-eyebrow{color:#7a7a81;font-size:14px;letter-spacing:.025em}.sspi-description{color:#a0a0a6;font-size:17px;max-width:760px;line-height:1.6}
+button,a{font:inherit}button{cursor:pointer}button:focus,a:focus,[tabindex]:focus{outline:3px solid #e4e4e1!important;outline-offset:5px;box-shadow:none!important}button:disabled{opacity:.45;cursor:default}
+.sspi-section-label{font-size:14px;font-weight:400;color:#a0a0a6;margin-bottom:12px}.sspi-log-panel{margin-top:32px}#logWrapper,#logContainer{font-family:"Cascadia Mono",Consolas,"Courier New",monospace;font-size:14px;line-height:1.7;word-wrap:break-word;overflow-wrap:break-word}
+#logWrapper{height:260px;overflow-y:auto;padding:18px 22px;border:1px solid rgba(255,255,255,.08);background:#111113;border-radius:10px}#logContainer{color:#a0a0a6}#logContainer .line{white-space:pre-wrap;margin-bottom:4px}#logContainer .info{color:#a0a0a6}#logContainer .success{color:#97c4a2}#logContainer .warning{color:#d8bd86}#logContainer .error,#logContainer.error{color:#e8a2a5}
+[hidden]{display:none!important}.sspi-hint{color:#7a7a81;font-size:13px;margin-top:24px}.sspi-hint kbd{border:1px solid rgba(255,255,255,.12);border-radius:4px;padding:2px 6px;color:#a0a0a6;background:#161618}
+::-webkit-scrollbar{width:7px}::-webkit-scrollbar-thumb{background:#333338;border-radius:5px}::-webkit-scrollbar-track{background:transparent}
+@-webkit-keyframes sspi-enter{from{opacity:0;-webkit-transform:translateY(7px)}to{opacity:1;-webkit-transform:translateY(0)}}@keyframes sspi-enter{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:translateY(0)}}
+@media(max-width:700px){body{font-size:16px}.sspi-header{height:76px}.sspi-logo{width:42px;height:42px}.sspi-header-note{display:none}main{margin:30px auto}h1{font-size:30px}.sspi-description{font-size:16px}#logWrapper{height:230px;padding:14px}#logContainer{font-size:12px}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;-webkit-animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+
+main{max-width:980px}#status{color:#ededed;font-size:22px;font-weight:500;margin:28px 0 8px}#detail{font-size:17px;line-height:1.6;color:#a0a0a6;max-width:850px}#choiceContainer{margin-top:26px}.choice-grid{display:-webkit-flex;display:flex;margin:0 -8px}.choice-card{-webkit-flex:1;flex:1;margin:0 8px;min-width:0;text-align:left;padding:24px;background:#111113;border:1px solid rgba(255,255,255,.12);border-radius:10px;color:#ededed;transition:background .15s,border-color .15s;-webkit-transition:background .15s,border-color .15s}.choice-card.selected{background:#1c1c1f;border-color:rgba(255,255,255,.3)}.choice-card:hover{background:#1c1c1f;border-color:rgba(255,255,255,.25)}.choice-title{font-size:24px;font-weight:500;margin-bottom:12px}.choice-fw{display:inline-block;color:#c8c8cc;background:#1c1c1f;border:1px solid rgba(255,255,255,.08);border-radius:6px;padding:4px 8px;font-size:13px;margin-bottom:15px}.choice-desc{font-size:16px;color:#a0a0a6;line-height:1.6}
+#progressWrap{position:relative;height:8px;background:#262629;border-radius:4px;margin:38px 0 34px}#progressBar{position:absolute;top:0;left:0;height:100%;width:100%;background:#e4e4e1!important;border-radius:4px;-webkit-transform:scaleX(0);transform:scaleX(0);-webkit-transform-origin:left center;transform-origin:left center;transition:transform .2s ease;-webkit-transition:-webkit-transform .2s ease}#progressPct{position:absolute;right:0;bottom:15px;color:#a0a0a6;font-size:14px}#logContainer{height:210px;overflow-y:auto;padding:18px 22px;border:1px solid rgba(255,255,255,.08);background:#111113;border-radius:10px;white-space:pre-wrap;margin-top:25px}
+#cacheCorruptOverlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;-webkit-justify-content:center;justify-content:center;z-index:100;padding:28px}#cacheCorruptOverlay .card{max-width:660px;padding:30px;border:1px solid rgba(255,255,255,.15);border-radius:12px;background:#161618;text-align:left}#cacheCorruptOverlay h2{color:#ededed;margin-bottom:16px}#cacheCorruptOverlay p{font-size:17px;color:#a0a0a6;line-height:1.6}#cacheCorruptOverlay strong{font-weight:500;color:#c8c8cc}#cacheCorruptOverlay .actions{display:-webkit-flex;display:flex;-webkit-flex-wrap:wrap;flex-wrap:wrap;margin-top:26px}.btn{padding:11px 17px;border:1px solid rgba(255,255,255,.12);border-radius:8px;font-size:16px;margin-right:12px;margin-top:8px}.btn.primary{background:#e4e4e1;color:#0b0b0c}.btn.secondary{background:#1c1c1f;color:#ededed}
+@media(max-width:700px){.choice-grid{display:block}.choice-card{width:calc(100% - 16px);margin-bottom:16px}.choice-title{font-size:21px}#cacheCorruptOverlay{padding:18px}#cacheCorruptOverlay .card{padding:24px}}
+</style>
+
+</head>
+
+<body>
+<header class="sspi-header"><div class="sspi-brand"><img class="sspi-logo" src="sspi-logo.png" alt="SSPI" /><span>Web Launcher</span></div><span class="sspi-header-note">PlayStation 5</span></header>
+  <main>
+    <div class="sspi-eyebrow">Setup</div>
+    <h1>Install your launcher.</h1>
+    <p class="sspi-description">Set up the launcher on your PS5 home screen.</p>
+    <p id="status" role="status" aria-live="polite">Loading&hellip;</p>
+    <p id="detail"></p>
+    <a id="openManager" class="btn primary" href="http://127.0.0.1:8084/" style="display:inline-block;text-decoration:none;margin-top:20px" hidden>Open Payload Manager</a>
+
+    <div id="choiceContainer" hidden>
+      <div class="choice-grid">
+        <button type="button" class="choice-card" id="btnPoops">
+          <div class="choice-title">Poops</div>
+          <div class="choice-fw">FW 7.00 &ndash; 12.00</div>
+          <div class="choice-desc">Works completely offline. Does not require any network connection or active network interface.</div>
+        </button>
+        <button type="button" class="choice-card" id="btnRelapse">
+          <div class="choice-title">Relapse</div>
+          <div class="choice-fw">FW 7.00 &ndash; 13.60 (except 9.05, 11.40)</div>
+          <div class="choice-desc">Requires an active network interface (Wi-Fi or Ethernet). Internet access is not required.</div>
+        </button>
+      </div>
+    </div>
+
+    <div id="progressWrap" hidden>
+      <div id="progressBar"></div>
+      <div id="progressPct">0%</div>
+    </div>
+    <div id="logContainer" hidden></div>
+
+  </main>
+
+  <!-- Upstream: WebKit Autoloader by PLK. Original LICENSE retained in distribution. -->
+
+  <script>
+    (function () {
+      'use strict';
+
+      function detectFirmware() {
+        var m = /PlayStation 5\/(\d+\.\d+)/.exec(navigator.userAgent);
+        if (!m) return null;
+        return { str: m[1], num: parseFloat(m[1]) };
+      }
+
+      var statusEl = document.getElementById('status');
+      var detailEl = document.getElementById('detail');
+      var choiceContainer = document.getElementById('choiceContainer');
+      var btnPoops = document.getElementById('btnPoops');
+      var btnRelapse = document.getElementById('btnRelapse');
+      var progressWrap = document.getElementById('progressWrap');
+      var progressBar = document.getElementById('progressBar');
+      var progressPct = document.getElementById('progressPct');
+      var completed = false;
+      var isDownloading = false;
+      var isRetry = false;
+      var currentUid = '';
+      var chosenExploit = '';
+      var fwParam = '';
+      var simulateCorrupt = false;
+      var corruptionPromptShown = false;
+
+      (function () {
+        var params = new URLSearchParams(window.location.search);
+        isRetry = params.get('retry') === '1';
+        currentUid = params.get('uid') || '';
+        chosenExploit = params.get('exploit') || '';
+        fwParam = params.get('fw') || '';
+        /* Test hook: ?simulate=corrupt forces the corruption prompt without
+         * needing a real AppCache error (e.g. for quick UI testing in a
+         * desktop browser via `make dev`). */
+        simulateCorrupt = params.get('simulate') === 'corrupt';
+      })();
+
+      /* Firmware support definitions:
+         - <= 5.50: umtx2
+         - 7.00 - 12.00: poops
+         - 7.00 - 13.60 (except 9.05, 11.40): relapse */
+      function isUmtx2Supported(num) {
+        var n = typeof num === 'number' ? num : parseFloat(num);
+        return n > 0 && n <= 5.50;
+      }
+
+      function isPoopsSupported(num) {
+        var n = typeof num === 'number' ? num : parseFloat(num);
+        return n >= 7.00 && n <= 12.00;
+      }
+
+      function isRelapseSupported(num, str) {
+        var n = typeof num === 'number' ? num : parseFloat(num);
+        var s = str || (typeof num === 'string' ? num : '');
+        var isExcluded = (s === '9.05' || s === '11.40' ||
+                          Math.abs(n - 9.05) < 0.001 || Math.abs(n - 11.40) < 0.001);
+        return n >= 7.00 && n <= 13.60 && !isExcluded;
+      }
+
+      var fw = detectFirmware();
+      var fwStr = fw ? fw.str : fwParam;
+      var fwNum = fw ? fw.num : (fwParam ? parseFloat(fwParam) : 0);
+      var hasUmtx2 = isUmtx2Supported(fwNum);
+      var hasPoops = isPoopsSupported(fwNum);
+      var hasRelapse = isRelapseSupported(fwNum, fwStr);
+      var isUnsupported = fwNum > 0 && !hasUmtx2 && !hasPoops && !hasRelapse;
+      var isDualSupported = (hasPoops && hasRelapse) || (!fw && !fwParam);
+      var needsChoice = isDualSupported && !chosenExploit;
+
+      function chooseExploit(choice) {
+        if (btnPoops) btnPoops.disabled = true;
+        if (btnRelapse) btnRelapse.disabled = true;
+        statusEl.textContent = 'Selected ' + (choice === 'poops' ? 'Poops' : 'Relapse') + '...';
+        detailEl.textContent = 'Preparing cache download...';
+        try {
+          localStorage.setItem('wkal_exploit', choice);
+        } catch (e) { }
+        var p = new URLSearchParams(window.location.search);
+        p.set('exploit', choice);
+        window.location.replace(window.location.pathname + '?' + p.toString());
+      }
+
+      if (btnPoops) {
+        btnPoops.addEventListener('click', function () {
+          chooseExploit('poops');
+        });
+      }
+      if (btnRelapse) {
+        btnRelapse.addEventListener('click', function () {
+          chooseExploit('relapse');
+        });
+      }
+
+      var logContainer = document.getElementById('logContainer');
+      var seenLogs = "";
+
+      function appendLog(msg) {
+        if (needsChoice || isUnsupported) return;
+        logContainer.hidden = false;
+        var div = document.createElement('div');
+        div.textContent = msg;
+        logContainer.appendChild(div);
+        logContainer.scrollTop = logContainer.scrollHeight;
+      }
+
+
+      var logPos = 0;
+      var logXhr = null;
+
+      function pollLogs() {
+        if (needsChoice || isUnsupported) return;
+        logXhr = new XMLHttpRequest();
+        logXhr.open('GET', '/logs?pos=' + logPos, true);
+        logXhr.onreadystatechange = function () {
+          if (logXhr.readyState === 4) {
+            if (logXhr.status === 200) {
+              var newLogs = logXhr.responseText;
+              if (newLogs.length > 0) {
+                var lines = newLogs.split('\n');
+                for (var i = 0; i < lines.length; i++) {
+                  if (lines[i].trim() !== '') appendLog(lines[i]);
+                }
+              }
+              var newPosStr = logXhr.getResponseHeader("X-Log-Pos");
+              if (newPosStr) {
+                logPos = parseInt(newPosStr, 10);
+              }
+              // Add a slight delay before reconnecting to reduce server load
+              setTimeout(pollLogs, 100);
+            } else {
+              // Server is down or error
+              if (completed) return; // Stop polling completely if we finished
+              setTimeout(pollLogs, 1000);
+            }
+          }
+        };
+        logXhr.send();
+      }
+      // Start the long-polling loop only when caching (not on choice, not on unsupported)
+      if (!needsChoice && !isUnsupported) {
+        pollLogs();
+      }
+
+
+      var probeOk = false;
+
+
+      var AUTOLOADER_URL = '/app/index.html';
+
+      function setProgress(pct) {
+        progressBar.style.webkitTransform = 'scaleX(' + pct / 100 + ')';
+        progressBar.style.transform = 'scaleX(' + pct / 100 + ')';
+        progressPct.textContent = pct + '%';
+      }
+
+      function setInstalled() {
+        statusEl.textContent = 'Launcher installed';
+        statusEl.style.color = '#97c4a2';
+        progressBar.style.background = '-webkit-linear-gradient(90deg, #16a34a 0%, #22c55e 100%)';
+        detailEl.textContent = 'Setup saved. Starting Payload Manager and checking the ELF loader…';
+        setProgress(100);
+        checkServices();
+      }
+
+      function checkServices() {
+        var deadline = Date.now() + 60000;
+        var managerReady = false;
+        var loaderState = 'unknown';
+        function read(path, done) {
+          var xhr = new XMLHttpRequest();
+          xhr.open('GET', 'http://127.0.0.1:8084' + path, true);
+          xhr.timeout = 2000;
+          xhr.onload = function () {
+            var value = null;
+            try { if (xhr.status === 200) value = JSON.parse(xhr.responseText); } catch (e) { }
+            done(value);
+          };
+          xhr.onerror = xhr.ontimeout = function () { done(null); };
+          xhr.send();
+        }
+        function poll() {
+          read('/sspi/identity', function (identity) {
+            managerReady = !!identity && identity.edition === 'sspi-payload-manager' && identity.protocol === 1 && identity.ready === true;
+            read('/sspi/loader-status', function (loader) {
+              loaderState = loader && loader.ready === true && loader.state === 'listening' && loader.port === 9021 && loader.scope === 'network' && loader.evidence === 'listener-and-process' ? 'listening' : 'unknown';
+              if (managerReady) {
+                statusEl.textContent = 'Payload Manager ready';
+                document.getElementById('openManager').hidden = false;
+                detailEl.textContent = loaderState === 'listening' ? 'ELF loader is listening on port 9021. Payload Manager opens according to your saved browser setting.' : 'Payload Manager is running. ELF loader status is unavailable. Your saved browser setting is preserved.';
+              }
+              if (managerReady && loaderState === 'listening') return;
+              if (Date.now() < deadline) { setTimeout(poll, 1500); return; }
+              if (!managerReady) detailEl.textContent = 'The launcher is saved on your home screen. Service readiness could not be confirmed; check the launcher activity before retrying.';
+            });
+          });
+        }
+        poll();
+      }
+
+      function setFailed() {
+        statusEl.textContent = 'Install failed';
+        statusEl.style.color = '#e8a2a5';
+        progressBar.style.background = '-webkit-linear-gradient(90deg, #dc2626 0%, #ef4444 100%)';
+        detailEl.textContent = 'The app could not be installed. Close this page and re-run the installer.';
+      }
+
+      function setSlow() {
+        statusEl.textContent = 'Caching is taking unusually long';
+        detailEl.textContent = 'The shortcut is only created after the cache finishes. If this never completes, close the browser and re-run the installer.';
+      }
+
+      function setCaching() {
+        statusEl.textContent = 'Caching content...';
+        detailEl.textContent = 'Please wait a moment. Do not close this page yet!';
+        progressWrap.hidden = false;
+        if (!logXhr) {
+          pollLogs();
+        }
+      }
+
+      function goToAutoloader() {
+        window.location.replace(AUTOLOADER_URL);
+      }
+
+      function probeServer() {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', '/version', true);
+        xhr.timeout = 1000;
+        xhr.onreadystatechange = function () {
+          if (xhr.readyState === 4) {
+            if (xhr.status === 200) {
+              var hdrUid = xhr.getResponseHeader("X-User-Id");
+              if (hdrUid) currentUid = hdrUid;
+              probeOk = true;
+              setCaching();
+            } else {
+              goToAutoloader();
+            }
+          }
+        };
+        xhr.onerror = function () {
+          goToAutoloader();
+        };
+        xhr.ontimeout = function () {
+          goToAutoloader();
+        };
+        xhr.send();
+      }
+
+      function installApp() {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', '/install', true);
+        xhr.timeout = 30000;
+        xhr.onreadystatechange = function () {
+          if (xhr.readyState === 4) {
+            if (xhr.status === 200) {
+              setInstalled();
+            } else {
+              setFailed();
+            }
+          }
+        };
+        xhr.onerror = function () {
+          setFailed();
+        };
+        xhr.ontimeout = function () {
+          setFailed();
+        };
+        xhr.send();
+      }
+
+      function maybeInstall() {
+        if (completed) {
+          return;
+        }
+        completed = true;
+        installApp();
+      }
+
+      function setCacheCorrupted() {
+        if (corruptionPromptShown) {
+          return;
+        }
+        corruptionPromptShown = true;
+        completed = true;
+        progressWrap.hidden = true;
+        logContainer.hidden = true;
+        statusEl.textContent = 'Caching failed';
+        detailEl.textContent = '';
+
+        var overlay = document.createElement('div');
+        overlay.id = 'cacheCorruptOverlay';
+
+        var card = document.createElement('div');
+        card.className = 'card';
+        card.setAttribute('role', 'dialog');
+        card.setAttribute('aria-modal', 'true');
+        card.setAttribute('aria-label', 'WebKit cache recovery');
+
+        var title = document.createElement('h2');
+        var msg = document.createElement('p');
+        var actions = null;
+
+        var webkitShellPath = '/user/home/' + (currentUid || '<userid>') + '/webkit/shell/';
+
+        if (isRetry) {
+          title.textContent = 'Cache issue persists';
+          msg.textContent = 'Clearing WebKit data from ' + webkitShellPath + ' didn\'t seem to fix the issue. You can close this page.';
+          var exitXhr = new XMLHttpRequest();
+          exitXhr.open('GET', '/exit', true);
+          exitXhr.send();
+        } else {
+          title.textContent = 'WebKit cache appears corrupted';
+          msg.textContent = 'Your PS5\'s WebKit browser data may be corrupted, preventing the cache from completing. Clearing it may fix the issue. ';
+          var strong = document.createElement('strong');
+          strong.textContent = 'This will remove all browser data in ' + webkitShellPath + ' (AppCache, cookies, local storage) for the current user.';
+          msg.appendChild(strong);
+
+          actions = document.createElement('div');
+          actions.className = 'actions';
+
+          var clearBtn = document.createElement('button');
+          clearBtn.className = 'btn primary';
+          clearBtn.textContent = 'Clear WebKit Data & Retry';
+          clearBtn.addEventListener('click', function () {
+            actions.hidden = true;
+            actions.style.display = 'none';
+            msg.textContent = 'Clearing data and restarting browser...';
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', '/clear-webkit-data', true);
+            xhr.timeout = 30000;
+            xhr.onreadystatechange = function () {
+              if (xhr.readyState === 4 && xhr.status !== 200) {
+                msg.textContent = 'Failed to clear WebKit data';
+                actions.hidden = false;
+                actions.style.display = '';
+              }
+            };
+            xhr.onerror = function () {
+              msg.textContent = 'Failed to clear WebKit data';
+              actions.hidden = false;
+              actions.style.display = '';
+            };
+            xhr.ontimeout = function () {
+              msg.textContent = 'Failed to clear WebKit data';
+              actions.hidden = false;
+              actions.style.display = '';
+            };
+            xhr.send();
+          });
+          actions.appendChild(clearBtn);
+
+          var cancelBtn = document.createElement('button');
+          cancelBtn.className = 'btn secondary';
+          cancelBtn.textContent = 'Cancel';
+          cancelBtn.addEventListener('click', function () {
+            msg.textContent = 'You can close this page. Re-run the installer ELF to try again.';
+            actions.hidden = true;
+            actions.style.display = 'none';
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', '/exit', true);
+            xhr.send();
+          });
+          actions.appendChild(cancelBtn);
+        }
+
+        card.appendChild(title);
+        card.appendChild(msg);
+        if (actions) {
+          card.appendChild(actions);
+        }
+        overlay.appendChild(card);
+        document.body.appendChild(overlay);
+      }
+
+      window.addEventListener('load', function () {
+        /* Test hook: ?simulate=corrupt forces the corruption prompt as if an
+         * AppCache error fired during download, and skips the probe/install
+         * polling so the prompt stays up for UI testing (e.g. make dev). */
+        if (simulateCorrupt) {
+          isDownloading = true;
+          setCacheCorrupted();
+          return;
+        }
+
+        if (needsChoice) {
+          statusEl.textContent = 'Select Exploit';
+          var fwDisplay = fw ? ('Firmware ' + fw.str) : (fwParam ? ('Firmware ' + fwParam) : 'Your firmware');
+          detailEl.textContent = '';
+          detailEl.appendChild(document.createTextNode(fwDisplay + ' supports both Poops and Relapse.'));
+          detailEl.appendChild(document.createElement('br'));
+          detailEl.appendChild(document.createTextNode('Select which one to install:'));
+          choiceContainer.hidden = false;
+          logContainer.hidden = true;
+          var storedPref = '';
+          try { storedPref = localStorage.getItem('wkal_exploit'); } catch (e) { }
+          if (storedPref === 'relapse' && btnRelapse) {
+            btnRelapse.classList.add('selected');
+            btnRelapse.focus();
+          } else if (storedPref === 'poops' && btnPoops) {
+            btnPoops.classList.add('selected');
+            btnPoops.focus();
+          } else if (btnPoops) {
+            btnPoops.focus();
+          }
+          return;
+        }
+
+        if (isUnsupported) {
+          statusEl.textContent = 'Unsupported firmware';
+          statusEl.style.color = '#e8a2a5';
+          var fwDisplay = fw ? ('Firmware ' + fw.str) : (fwParam ? ('Firmware ' + fwParam) : 'Your firmware');
+          detailEl.textContent = fwDisplay + ' is not supported (supported: 1.00–5.50 via umtx2, 7.00–12.00 via poops, 7.00–13.60 via relapse).';
+          return;
+        }
+
+        var effectiveExploit = '';
+        if (hasUmtx2) {
+          effectiveExploit = 'umtx2';
+        } else if (hasPoops && !hasRelapse) {
+          effectiveExploit = 'poops';
+        } else if (hasRelapse && !hasPoops) {
+          effectiveExploit = 'relapse';
+        } else if (hasPoops && hasRelapse) {
+          effectiveExploit = (chosenExploit === 'poops') ? 'poops' : 'relapse';
+        } else if (chosenExploit) {
+          effectiveExploit = chosenExploit;
+        }
+        if (effectiveExploit) {
+          try {
+            localStorage.setItem('wkal_exploit', effectiveExploit);
+          } catch (e) { }
+        }
+
+        probeServer();
+
+        /* The shortcut is created only once the AppCache is current, so the
+           installer never installs a partial cache. /install then both installs
+           the homescreen app and stops the server. */
+        var waitTimer = setInterval(function () {
+          if (completed) {
+            clearInterval(waitTimer);
+            return;
+          }
+          if (!probeOk) {
+            clearInterval(waitTimer);
+            goToAutoloader();
+            return;
+          }
+          if (!window.applicationCache) {
+            clearInterval(waitTimer);
+            maybeInstall();
+            return;
+          }
+          if (window.applicationCache.status === window.applicationCache.UPDATEREADY) {
+            clearInterval(waitTimer);
+            try {
+              window.applicationCache.swapCache();
+            } catch (e) { }
+            maybeInstall();
+            return;
+          }
+        }, 1000);
+
+        /* Safety cap — never leave the installer hanging on screen. It does NOT
+           install or exit: a partial cache must never create a shortcut, so the
+           user simply re-runs the installer if this never completes. */
+        setTimeout(function () {
+          if (!completed && probeOk) {
+            setSlow();
+          }
+        }, 120000);
+      });
+
+
+      if (window.applicationCache) {
+        window.applicationCache.addEventListener('checking', function () {
+          progressWrap.hidden = false;
+          appendLog("[AppCache] Checking for manifest...");
+        });
+        window.applicationCache.addEventListener('downloading', function () {
+          isDownloading = true;
+          appendLog("[AppCache] Downloading cache...");
+        });
+        window.applicationCache.addEventListener('progress', function (e) {
+          if (e.url) appendLog("[AppCache] Fetching: " + e.url);
+          if (e.total && e.total > 0) {
+            var pct = Math.min(99, Math.round((e.loaded / e.total) * 100));
+            setProgress(pct);
+          }
+        });
+        window.applicationCache.addEventListener('error', function (e) {
+          appendLog("[AppCache] Error occurred! Status: " + window.applicationCache.status);
+          logContainer.className = 'error';
+          if (isDownloading) {
+            setCacheCorrupted();
+          }
+        });
+        window.applicationCache.addEventListener('obsolete', function (e) {
+          appendLog("[AppCache] Manifest is obsolete.");
+        });
+        window.applicationCache.addEventListener('cached', function() {
+          isDownloading = false;
+          appendLog("[AppCache] Caching complete.");
+          maybeInstall();
+        });
+        window.applicationCache.addEventListener('noupdate', function() {
+          isDownloading = false;
+          appendLog("[AppCache] No update needed.");
+          maybeInstall();
+        });
+        window.applicationCache.addEventListener('updateready', function () {
+          isDownloading = false;
+          if (window.applicationCache.status === window.applicationCache.UPDATEREADY) {
+            try {
+              window.applicationCache.swapCache();
+            } catch (e) { }
+          }
+          appendLog("[AppCache] Update ready.");
+          maybeInstall();
+        });
+      }
+    })();
+  </script>
+
+  <script>
+    (function () {
+      function controls() {
+        var dialog = document.getElementById('cacheCorruptOverlay');
+        return Array.prototype.filter.call((dialog || document).querySelectorAll('button:not(:disabled),a[href]'), function (el) { return el.getClientRects().length > 0; });
+      }
+      document.addEventListener('keydown', function (event) {
+        var key = event.key || event.keyCode;
+        var backward = key === 'ArrowLeft' || key === 'ArrowUp' || key === 37 || key === 38;
+        var forward = key === 'ArrowRight' || key === 'ArrowDown' || key === 39 || key === 40;
+        var dialog = document.getElementById('cacheCorruptOverlay');
+        if (!backward && !forward && !(dialog && key === 'Tab')) return;
+        var list = controls();
+        if (!list.length) return;
+        event.preventDefault();
+        var index = list.indexOf(document.activeElement);
+        var step = backward || (key === 'Tab' && event.shiftKey) ? -1 : 1;
+        list[(index + step + list.length) % list.length].focus();
+      });
+      new MutationObserver(function () {
+        var dialog = document.getElementById('cacheCorruptOverlay');
+        if (dialog && !dialog.contains(document.activeElement)) {
+          var list = controls();
+          if (list.length) list[list.length - 1].focus();
+        }
+      }).observe(document.body, { childList: true });
+    })();
+  </script>
+</body>
+
+</html>
