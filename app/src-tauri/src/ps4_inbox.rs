@@ -1167,13 +1167,9 @@ mod tests {
         server.put(&path, b"1\n100\nftpinbox=1 transfer=1 bgft=1 build=test\n");
         assert_eq!(session.worker(ROOT).await.unwrap().0, "stale");
         for (tick, caps, expected) in [(101, "ftpinbox=1 transfer=1 bgft=1 build=test", "ready"), (102, "ftpinbox=1 build=test", "starting")] {
-            let reads = server.commands().iter().filter(|s| *s == &format!("RETR {path}")).count();
-            let update = async {
-                while server.commands().iter().filter(|s| *s == &format!("RETR {path}")).count() <= reads { sleep(Duration::from_millis(1)).await; }
-                sleep(Duration::from_millis(1)).await; server.put(&path, format!("1\n{tick}\n{caps}\n").as_bytes());
-            };
-            let (probe, ()) = tokio::join!(session.worker(ROOT), update);
-            let (state, build) = probe.unwrap(); assert_eq!(state, expected); assert_eq!(build.as_deref(), Some("test"));
+            server.replace_after_next_retr(&path, format!("1\n{tick}\n{caps}\n").as_bytes());
+            let (state, build) = session.worker(ROOT).await.unwrap();
+            assert_eq!(state, expected); assert_eq!(build.as_deref(), Some("test"));
         }
     }
     #[test]
