@@ -12,6 +12,19 @@ See `docs/PKG_PROVENANCE.json` for the machine-readable inventory and hashes.
 
 ## Reviewed components
 
+### Microsoft Visual C++ 2022 runtime
+
+- SSPI Windows x64 statically links the C/C++ runtime for the application and
+  its native archive dependencies.
+- The prebuilt publishing library under `resources/fpkg/` still imports the
+  dynamic runtime. Its application-local x64 runtime DLLs come from the installed
+  Visual Studio 2022 Build Tools redistributable directory, version 14.44.35112.
+- Copyright Microsoft Corporation. These runtime files retain Microsoft's terms
+  and are not covered by this repository's MIT license.
+- The distribution includes `Microsoft-VC-Redist.txt` and
+  `MSVC-RUNTIME-NOTICE.txt` beside these DLLs. Preserve those notices.
+- Reference: https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files
+
 ### suppaftp — Rust FTP client
 
 - Version: 12.1.0, pinned in `app/src-tauri/Cargo.lock`.

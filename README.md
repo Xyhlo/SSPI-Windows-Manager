@@ -46,6 +46,7 @@ This is a private development repository with a selected source export. Starting
 - **PS4:** GoldHEN 2.4b18.5 or newer, with BinLoader enabled.
 - The PC and the console on the same local network. Allow SSPI through Windows Firewall when asked.
 - Nothing else to install: the packaging engines and the .NET runtime they run on come with SSPI.
+- The repaired 2.24.4 installer also includes the required Microsoft C++ runtime support, so a separate Visual C++ Redistributable install is not required.
 
 ## Getting started
 
