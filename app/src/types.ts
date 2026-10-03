@@ -121,6 +121,7 @@ export type PackageCandidate = {
 
 export type DeliveryRequest = {
   target?: ConsoleKind
+  packageDumps?: boolean
   package: PackageCandidate
   titleId: string
   titleName: string
@@ -186,6 +187,7 @@ export type DeliveryJob = {
   retryable?: boolean
   space?: SpacePlan | null
   packaging?: PackagingInfo | null
+  providerPreparation?: { provider: string; state: string; progress: number | null; bytesDone: number; bytesTotal: number; speedBps: number; etaSeconds: number | null } | null
   jobId: string
   titleId?: string
   packageKind?: string

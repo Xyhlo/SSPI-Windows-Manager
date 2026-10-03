@@ -1,6 +1,6 @@
 [package]
 name = "game-search"
-version = "2.23.1"
+version = "2.24.4"
 edition = "2021"
 
 [lib]
@@ -27,6 +27,9 @@ uuid = { version = "1", features = ["v4"] }
 url = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+hmac = "0.12"
 regex = "1"
 scraper = "0.21"
 strsim = "0.11"

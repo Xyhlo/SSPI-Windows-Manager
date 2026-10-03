@@ -49,7 +49,7 @@ fn last_capture(text: &str, pattern: &str) -> String {
 }
 
 pub(super) fn scoped_titles(docs: &[WorkItem], step: &Value) -> Vec<WorkItem> {
-    let id_re = Regex::new(r"(?i)\b(?:CUSA|PPSA)\d{5}\b").unwrap();
+    let id_re = Regex::new(r"(?i)\b(?:CUSA|PPSA|SLUS|SLES|SCUS|SCES|SLPS|SLPM|SCPS|SCAJ|SLAJ|SLKA|SLKS|SCKA)\d{5}\b").unwrap();
     let mut out = Vec::new(); let mut seen = HashSet::new();
     for doc in docs {
         let html = Html::parse_document(&doc.html);
@@ -77,7 +77,7 @@ pub(super) fn scoped_titles(docs: &[WorkItem], step: &Value) -> Vec<WorkItem> {
 }
 
 pub(super) fn scoped_packages(docs: &[WorkItem], requested: &str, step: &Value) -> Vec<WorkItem> {
-    let id_re = Regex::new(r"(?i)\b(?:CUSA|PPSA)\d{5}\b").unwrap();
+    let id_re = Regex::new(r"(?i)\b(?:CUSA|PPSA|SLUS|SLES|SCUS|SCES|SLPS|SLPM|SCPS|SCAJ|SLAJ|SLKA|SLKS|SCKA)\d{5}\b").unwrap();
     let anchor = Selector::parse("a").unwrap();
     let allowed = step_strings(step, "allowedLinkHosts");
     let mut out = Vec::new(); let mut seen = HashSet::new();

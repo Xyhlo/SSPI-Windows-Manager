@@ -16,7 +16,7 @@ import { toast } from "@/components/toasts"
 import { demoGames, demoJobs, demoMetadata, demoPackages } from "@/data/demo"
 import { applyAccentVars, loadAppearance, saveAppearance, type Appearance } from "@/lib/appearance"
 import { notificationCase } from "@/lib/covers"
-import { sendBlockReason } from "@/lib/consoles"
+import { packageTitle, sendBlockReason } from "@/lib/consoles"
 import { listConsoleLibrary, probeConsoles, sendPayload } from "@/lib/console-api"
 import { hasCapability, loaderEndpoint, receiverEndpoint } from "@/lib/console-helpers"
 import type { ConsoleProbe } from "@/lib/console-types"
@@ -680,8 +680,9 @@ export default function App() {
   const deliver = useCallback(async (game: Game, candidates: PackageCandidate[], available: PackageCandidate[], options: { provider?: string; from?: HTMLElement | null; target?: ConsoleKind } = {}): Promise<string[]> => {
     if (deliveryPending.current) return []
     const target = options.target || settings.activeConsole
-    const packageOnly = settings.packageDumps && settings.downloadPackageOnly
-    const plan = planPackages(candidates, available, game.titleId, { packageDumps: settings.packageDumps, autoBackports: autoBackports && target === "ps5", targetFw: settings.targetFw, catalog: available })
+    const packageDumps = packageTitle(settings, game.titleId)
+    const packageOnly = packageDumps && settings.downloadPackageOnly
+    const plan = planPackages(candidates, available, game.titleId, { packageDumps, autoBackports: autoBackports && target === "ps5", targetFw: settings.targetFw, catalog: available })
     if (plan.problems.length) { toast({ tone: "warning", title: "Check your selection", text: plan.problems.join(" ") }); return [] }
     if (!packageOnly && target === "ps4") {
       const reason = plan.items.map(item => sendBlockReason(target, { titleId: game.titleId, backport: !!item.backport || packageKind(item.base) === "backport" })).find(Boolean)
@@ -703,6 +704,7 @@ export default function App() {
       for (const { base, backport } of plan.items) {
         const request: DeliveryRequest = {
           target,
+          packageDumps,
           package: { ...base, kind: packageKind(base) }, titleId: game.titleId,
           titleName: game.name, icon: notificationIcon, archiveParts: archivePartsFor(base, available), provider: options.provider,
           ...(backport ? { backport: { package: { ...backport, kind: "backport" }, parts: archivePartsFor(backport, available) } } : {}),
@@ -789,7 +791,7 @@ export default function App() {
   const backLabel = origin === "downloads" ? "Downloads" : origin === "library" ? "Library" : origin === "tools" ? "Tools" : searchState === "idle" ? "Search" : "Search results"
   return (
     <ProviderContext settings={settings}>
-      <Updater />
+      <Updater demo={demo} />
       <div className="app">
         <Header
           tab={tab} activeJobs={activeJobs} settings={settings} consoleState={consoleState} probes={probes} demo={demo} brandRef={brandRef} menuDisabled={Boolean(options || receiverPrompt)}

@@ -49,7 +49,7 @@ const PAYLOAD_NAMES = /\.elf$|etahen|kstuff|shadowmount|ftpsrv|klogsrv|elfldr|we
 export type ProcessKind = "payload" | "game" | "system" | "process"
 export function processKind(process: ConsoleProcess): ProcessKind {
   if (PAYLOAD_NAMES.test(process.name)) return "payload"
-  if (process.titleId && /^(?:CUSA|PPSA)\d{5}$/.test(process.titleId)) return "game"
+  if (process.titleId && /^(?:CUSA|PPSA|SLUS|SLES|SCUS|SCES|SLPS|SLPM|SCPS|SCAJ|SLAJ|SLKA|SLKS|SCKA)\d{5}$/.test(process.titleId)) return "game"
   if (process.titleId?.startsWith("NPXS") || process.name.startsWith("Sce")) return "system"
   return "process"
 }

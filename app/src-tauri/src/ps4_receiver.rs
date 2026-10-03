@@ -135,7 +135,7 @@ fn installed_metadata_field<'a>(bytes: &'a [u8], cursor: &mut usize, limit: usiz
 }
 
 fn valid_installed_title_id(value: &str) -> bool {
-    value.len() == 9 && value.starts_with("CUSA") && value.as_bytes()[4..].iter().all(u8::is_ascii_digit)
+    super::ps4_title_id(value)
 }
 
 pub(super) fn compact_installed_icon(bytes: &[u8]) -> Option<Vec<u8>> {

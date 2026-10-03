@@ -1,0 +1,43 @@
+/* Action menu: the console popover's glass, opening from its button. */
+.am-trigger > .i { transition: transform var(--spring-bouncy-ms) var(--spring-bouncy); }
+.am-trigger.spins[aria-expanded=true] > .i { transform: rotate(135deg); }
+.am-trigger[aria-expanded=true] { background: var(--surface-3); border-color: var(--line-3); }
+.am-trigger .lbl { margin-right: 1px; }
+
+.am-menu {
+  position: fixed; z-index: 120; display: grid; gap: 2px; min-width: 248px; max-width: min(340px, calc(100vw - 24px));
+  padding: 6px; overflow-y: auto; overscroll-behavior: contain;
+  border: 1px solid var(--line-2); border-radius: 12px; background: rgba(22, 22, 24, .98); backdrop-filter: blur(14px);
+  box-shadow: 0 24px 60px -20px rgba(0, 0, 0, .9), 0 0 0 1px rgba(0, 0, 0, .35);
+  animation: amIn var(--spring-snappy-ms) var(--spring-snappy) both;
+}
+.am-menu.is-closing { animation: amOut 140ms cubic-bezier(.4, 0, 1, 1) both; pointer-events: none; }
+@keyframes amIn { from { opacity: 0; transform: translateY(-4px) scale(.95); } to { opacity: 1; transform: none; } }
+@keyframes amOut { to { opacity: 0; transform: scale(.97); } }
+
+.am-item {
+  display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 11px;
+  width: 100%; min-height: 42px; padding: 5px 10px 5px 5px; border: 0; border-radius: 8px; background: none;
+  color: var(--ink-2); text-align: left; outline: 0;
+  animation: amItemIn 300ms var(--spring-soft) both; animation-delay: calc(var(--i, 0) * 22ms + 30ms);
+  transition: background 120ms, color 120ms;
+}
+@keyframes amItemIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+.am-item:hover, .am-item:focus-visible { background: rgba(255, 255, 255, .06); color: var(--ink); }
+.am-item:focus-visible { box-shadow: inset 0 0 0 1px var(--line-3); }
+.am-item:disabled { opacity: .42; cursor: default; }
+.am-ico { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 8px; background: rgba(255, 255, 255, .05); color: var(--ink-2); transition: background 120ms, color 120ms, transform 260ms var(--spring-bouncy); }
+.am-ico .i { width: 16px; height: 16px; }
+.am-ico .spinner { width: 13px; height: 13px; }
+.am-item:hover .am-ico, .am-item:focus-visible .am-ico { background: rgba(255, 255, 255, .09); color: var(--ink); }
+.am-item:active .am-ico { transform: scale(.9); }
+.am-text { min-width: 0; display: grid; gap: 1px; }
+.am-text strong { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.am-text span { font-size: 11.5px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.am-check { display: grid; place-items: center; width: 18px; height: 18px; color: var(--ink); }
+.am-check .i { width: 15px; height: 15px; stroke-width: 2.2; }
+.am-item.danger { color: var(--fail-ink); }
+.am-item.danger .am-ico { color: var(--fail-ink); background: rgba(229, 72, 77, .08); }
+.am-item.danger:hover .am-ico, .am-item.danger:focus-visible .am-ico { background: rgba(229, 72, 77, .16); color: var(--fail); }
+/* Downloads keeps the word "Add" when the window narrows; the other tool labels give way. */
+.dl-tools .am-trigger span.lbl { display: inline; }

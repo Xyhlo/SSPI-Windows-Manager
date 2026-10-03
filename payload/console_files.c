@@ -45,6 +45,12 @@ bool ct_valid_id(const char *id) {
     for (unsigned i=0; i<9; ++i) if (i<4 ? (id[i]<'A'||id[i]>'Z') : (id[i]<'0'||id[i]>'9')) return false;
     return true;
 }
+bool ct_ps4_title_id(const char *id) {
+    if (!ct_valid_id(id)) return false;
+    static const char *const prefixes[]={"CUSA","SLUS","SLES","SCUS","SCES","SLPS","SLPM","SCPS","SCAJ","SLAJ","SLKA","SLKS","SCKA"};
+    for (size_t i=0;i<sizeof(prefixes)/sizeof(prefixes[0]);i++) if (!memcmp(id,prefixes[i],4)) return true;
+    return false;
+}
 static uint32_t ct_be32(const uint8_t *p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
 static uint32_t ct_crc(const uint8_t *p, size_t n) {
     uint32_t crc=0xffffffffu;

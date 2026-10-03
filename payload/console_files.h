@@ -9,6 +9,7 @@
 extern const char *const ct_metadata_roots[];
 extern const size_t ct_metadata_root_count;
 bool ct_valid_id(const char *id);
+bool ct_ps4_title_id(const char *id);
 bool ct_valid_png(const uint8_t *bytes, size_t size);
 /* 0 absent, 1 regular file, 2 directory, -1 unsafe/unreadable. */
 int ct_kind(const char *path);

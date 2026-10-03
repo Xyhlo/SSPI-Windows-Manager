@@ -1,6 +1,6 @@
 import React from 'react'
 import { useTranslation } from 'react-i18next'
-import { Package, Loader2, Globe, Star, ChevronLeft, ChevronRight, CheckCircle2, Play } from 'lucide-react'
+import { Package, Loader2, Globe, Star, ChevronUp, ChevronDown, CheckCircle2, Play } from 'lucide-react'
 import PayloadName from './PayloadName'
 
 export default function PayloadButton({ path, onClick, isLoading, sourceName, version, isFavorite, isLaunched, isEditMode, onMoveFavorite, canMoveLeft, canMoveRight }) {
@@ -24,8 +24,8 @@ export default function PayloadButton({ path, onClick, isLoading, sourceName, ve
       </button>
       {isEditMode && isFavorite && (
         <div className="sspi-payload-reorder">
-          <button type="button" onClick={() => onMoveFavorite(path, -1)} disabled={!canMoveLeft} aria-label={t('sspi.move_earlier', 'Move {{name}} earlier', { name })}><ChevronLeft size={18} /></button>
-          <button type="button" onClick={() => onMoveFavorite(path, 1)} disabled={!canMoveRight} aria-label={t('sspi.move_later', 'Move {{name}} later', { name })}><ChevronRight size={18} /></button>
+          <button type="button" onClick={() => onMoveFavorite(path, -1)} disabled={!canMoveLeft} aria-label={t('sspi.move_earlier', 'Move {{name}} earlier', { name })}><ChevronUp size={18} /></button>
+          <button type="button" onClick={() => onMoveFavorite(path, 1)} disabled={!canMoveRight} aria-label={t('sspi.move_later', 'Move {{name}} later', { name })}><ChevronDown size={18} /></button>
         </div>
       )}
     </div>

@@ -12,7 +12,7 @@ import { Collapse } from "./Collapse"
 import { Icon } from "./Icon"
 import type { OptionsTab } from "./OptionsOverlay"
 import { toast } from "./toasts"
-import { consoleAddress, sendBlockReason } from "@/lib/consoles"
+import { consoleAddress, packageTitle, sendBlockReason, platformOf } from "@/lib/consoles"
 import { volumeOf } from "@/lib/downloads"
 import { compareVersions, errorText, fmtBytes, plural } from "@/lib/format"
 import { setPageKeys } from "@/lib/keys"
@@ -81,7 +81,8 @@ export function DetailsPage(props: Props) {
 
   const titleId = game.titleId
   const target = settings.activeConsole
-  const packageOnly = settings.packageDumps && settings.downloadPackageOnly
+  const packageDumps = packageTitle(settings, titleId)
+  const packageOnly = packageDumps && settings.downloadPackageOnly
   const includeBackports = autoBackports && target === "ps5"
   const installBlock = packageOnly ? undefined : sendBlockReason(target, { titleId })
   const raw = metadata?.game
@@ -93,14 +94,14 @@ export function DetailsPage(props: Props) {
   const groups = useMemo(() => structurePackages(visible), [visible])
   const selectedMirrors = groups.flatMap(group => groupParts(group, hostByKey[group.key]))
   const selectedCandidates = groups.filter(group => checked.includes(group.key)).map(group => groupParts(group, hostByKey[group.key])[0]).filter(Boolean)
-  const selection = planPackages(selectedCandidates, selectedMirrors, titleId, { packageDumps: settings.packageDumps, autoBackports: includeBackports, targetFw: settings.targetFw, catalog: packages })
+  const selection = planPackages(selectedCandidates, selectedMirrors, titleId, { packageDumps, autoBackports: includeBackports, targetFw: settings.targetFw, catalog: packages })
   const included = new Set(selection.added.map(packageReleaseKey))
   const selectionBlock = packageOnly ? undefined : selectedCandidates.map(candidate => sendBlockReason(target, { titleId, backport: packageKind(candidate) === "backport" })).find(Boolean)
 
   const rowState = (group: PackageGroup): RowState => {
     const parts = groupParts(group, hostByKey[group.key])
     const candidate = parts[0]
-    const pairing = settings.packageDumps && group.kind === "backport"
+    const pairing = packageDumps && group.kind === "backport"
     const block = packageOnly ? undefined : sendBlockReason(target, { titleId, backport: group.kind === "backport" })
     let problem = candidate ? packageProblem(candidate, packages, pairing) : "No package is available."
     if (!problem && isSevenZip(parts)) problem = "7z extraction is unavailable in this build. Choose a RAR or ZIP mirror."
@@ -122,7 +123,7 @@ export function DetailsPage(props: Props) {
 
   const baseCandidates = visible.filter(candidate => packageKind(candidate) === "base").sort((a, b) => (a.archivePartNumber || 1) - (b.archivePartNumber || 1))
   const basePackage = baseCandidates[0]
-  const heroPlan = basePackage ? planPackages([basePackage], visible, titleId, { packageDumps: settings.packageDumps, autoBackports: includeBackports, targetFw: settings.targetFw, catalog: packages }) : null
+  const heroPlan = basePackage ? planPackages([basePackage], visible, titleId, { packageDumps, autoBackports: includeBackports, targetFw: settings.targetFw, catalog: packages }) : null
   const heroBackport = heroPlan?.items[0]?.backport
   const heroParts = basePackage ? (basePackage.archiveSetId ? archivePartsFor(basePackage, visible) : [basePackage]) : []
   const heroBytes = [...heroParts, ...(heroBackport ? (heroBackport.archiveSetId ? archivePartsFor(heroBackport, visible) : [heroBackport]) : [])].reduce((sum, part) => sum + (part.expectedSize || 0), 0)
@@ -131,7 +132,7 @@ export function DetailsPage(props: Props) {
   const focusRow = focusGroup ? rowState(focusGroup) : null
 
   const firmware = basePackage?.firmware || raw?.firmware || ""
-  const platform = /^CUSA/i.test(titleId) ? "PS4" : "PS5"
+  const platform = platformOf(titleId) === "ps4" ? "PS4" : "PS5"
   const variants = game.variants || [game]
   const variantIndex = Math.max(0, variants.findIndex(item => variantKey(item) === variantKey(game)))
   const enabledProviders = [
@@ -375,7 +376,7 @@ export function DetailsPage(props: Props) {
                   )}
                   <button type="button" className="btn ghost sm" disabled={deliveryBusy} onClick={() => setChecked([])}>Clear</button>
                   <button type="button" className="btn primary" disabled={deliveryBusy || !!trayProblem || !selectedCandidates.length} onClick={() => void installSelected()}>
-                    {deliveryBusy ? <span className="spinner" /> : <Icon name="download" />}{settings.packageDumps ? "Download and pack selected" : demo ? "Preview selected" : "Install selected"}
+                    {deliveryBusy ? <span className="spinner" /> : <Icon name="download" />}{demo ? "Preview selected" : packageOnly ? "Download and pack selected" : "Install selected"}
                   </button>
                 </div>
               )}
@@ -450,7 +451,7 @@ function About({ game, raw, metadataState, attribution, basePackage, backport, f
           <dt>Content ID</dt><dd>{basePackage?.expectedContentId || "Not listed"}</dd>
           <dt>Base version</dt><dd>{basePackage?.version || (basePackage && packageVersion(basePackage)) || raw?.version || "Not listed"}</dd>
           <dt>Firmware</dt><dd>{firmware || "Not listed"}</dd>
-          <dt>Backport</dt><dd>{/^CUSA/i.test(game.titleId) ? "PS5 games only" : hasBackport ? "Available" : "Not listed"}</dd>
+          <dt>Backport</dt><dd>{platformOf(game.titleId) === "ps4" ? "PS5 games only" : hasBackport ? "Available" : "Not listed"}</dd>
           <dt>Install status</dt><dd className={installed ? "good" : ""}>{installed || "Not installed through SSPI"}</dd>
           {raw?.released && <><dt>Released</dt><dd>{raw.released}</dd></>}
           {raw?.size && <><dt>Storage</dt><dd>{raw.size}</dd></>}

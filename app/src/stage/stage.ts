@@ -34,6 +34,16 @@ vec3 ps4Pattern(int p, vec2 uv, vec3 col, float t) {
   if (p == 7) return vec3((9.0 + 18.0 * exp(-(pow(uv.x - .2, 2.0) + pow(uv.y - .15, 2.0)) * 3.0)) / 255.0);
   vec3 base = vec3(11.0, 11.0, 12.0) / 255.0;
   if (p == 0) return base;
+  if (p == 9) {
+    float light = 0.0;
+    for (int i = 0; i < 5; i++) {
+      float n = float(i);
+      float ridge = .18 + n * .16 + .11 * sin(uv.x * 4.2 + n * .65 + t * .12);
+      float d = uv.y - ridge;
+      light += .06 * exp(-d * d * 180.0) + .07 * exp(-d * d * 4200.0);
+    }
+    return base + col * light * (.5 + .5 * uv.x) * uStrength;
+  }
   if (p == 8) {
     float fx = uv.x - .82, fy = uv.y - .78;
     float fglow = .075 * exp(-(fx * fx + fy * fy) * 5.0) * (.85 + .15 * sin(t * .5));
@@ -480,14 +490,28 @@ function createStage() {
   })
 
   /* ---------- card surfaces */
-  type Surface = { mesh: THREE.Mesh; material: THREE.ShaderMaterial; alpha: Spring; art: Spring; hover: Spring; banner: Spring; head: HTMLElement | null; radius: number; spec: CoverSpec }
+  type Surface = { mesh: THREE.Mesh; material: THREE.ShaderMaterial; alpha: Spring; art: Spring; hover: Spring; banner: Spring; head: HTMLElement | null; radius: number; spec: CoverSpec; poster: boolean }
   const surfaces = new Map<HTMLElement, Surface>()
   const blankTex = new THREE.DataTexture(new Uint8Array([17, 17, 19, 255]), 1, 1)
   blankTex.needsUpdate = true
+  const loadSurfaceArt = (el: HTMLElement, surface: Surface) => {
+    const { spec, poster, material } = surface
+    void blurredArt(spec, poster).then(canvas => {
+      if (surfaces.get(el) !== surface || surface.spec !== spec || surface.poster !== poster) return
+      material.uniforms.uMap.value = tex(canvas, THREE.NoColorSpace)
+      material.uniforms.uHasMap.value = 1
+    }).catch(() => undefined)
+  }
   const surfacesApi = {
-    register(el: HTMLElement, spec: CoverSpec) {
+    register(el: HTMLElement, spec: CoverSpec, poster = false) {
       const existing = surfaces.get(el)
-      if (existing) { existing.alpha.set(1); return }
+      if (existing) {
+        existing.alpha.set(1)
+        existing.spec = spec
+        existing.poster = poster
+        loadSurfaceArt(el, existing)
+        return
+      }
       const material = new THREE.ShaderMaterial({
         uniforms: {
           uMap: { value: blankTex }, uHasMap: { value: 0 }, uOpacity: { value: 0 }, uAspect: { value: 1 }, uRadius: { value: 12 },
@@ -504,14 +528,10 @@ function createStage() {
       const surface: Surface = {
         mesh, material, alpha: new Spring(0, 120, 22).set(1), art: new Spring(0, 90, 20), hover: new Spring(0, 260, 26),
         banner: new Spring(Number(el.dataset.banner ?? 0), 90, 20), head: el.querySelector<HTMLElement>(".dhead"),
-        radius: parseFloat(getComputedStyle(el).borderTopLeftRadius) || 12, spec,
+        radius: parseFloat(getComputedStyle(el).borderTopLeftRadius) || 12, spec, poster,
       }
       surfaces.set(el, surface)
-      void blurredArt(spec).then(canvas => {
-        if (!surfaces.has(el)) return
-        material.uniforms.uMap.value = tex(canvas, THREE.NoColorSpace)
-        material.uniforms.uHasMap.value = 1
-      }).catch(() => undefined)
+      loadSurfaceArt(el, surface)
     },
     unregister(el: HTMLElement) {
       const surface = surfaces.get(el)

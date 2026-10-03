@@ -54,7 +54,7 @@ static pthread_mutex_t library_lock=PTHREAD_MUTEX_INITIALIZER;
 
 #define PS5_DATA_ROOT "/data/SSPI"
 static const char *const app_roots[]={"/user/app","/mnt/ext0/user/app","/mnt/ext1/user/app","/system_ex/app"};
-static bool ps5_library_id(const char *id) { return ct_valid_id(id) && (!memcmp(id,"PPSA",4)||!memcmp(id,"CUSA",4)); }
+static bool ps5_library_id(const char *id) { return ct_valid_id(id) && (!memcmp(id,"PPSA",4)||ct_ps4_title_id(id)); }
 static uint32_t meta_be32(const uint8_t *p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
 static uint64_t meta_le64(const uint8_t *p) { uint64_t n=0; for (unsigned i=0;i<8;i++) n|=(uint64_t)p[i]<<(i*8); return n; }
 static void meta_le32(uint8_t *p,uint32_t n) { for(unsigned i=0;i<4;i++) p[i]=(uint8_t)(n>>(i*8)); }

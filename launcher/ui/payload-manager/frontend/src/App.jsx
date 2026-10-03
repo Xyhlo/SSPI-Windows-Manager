@@ -9,13 +9,15 @@ import {
   Package,
   Terminal,
   X,
-  Star
+  Star,
+  Search
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import './App.css'
 import './sspi.css'
 import { installControllerFocus } from './utils/controllerFocus'
+import { filterPayloads } from './utils/payloadLibrary'
 
 // Utilities
 import { cn, isPS5, isSystemPayload } from './utils/helpers'
@@ -42,6 +44,7 @@ function App() {
   const { t } = useTranslation();
   const [view, setView] = useState('dashboard')
   const [isFavoriteEditMode, setIsFavoriteEditMode] = useState(false)
+  const [payloadQuery, setPayloadQuery] = useState('')
   const mainRef = useRef(null)
   const logTrigger = useRef(null)
   useEffect(() => installControllerFocus(), [])
@@ -463,10 +466,7 @@ function App() {
       </Modal>
 
       <header className="sspi-topbar">
-        <div className="sspi-heading-row">
-          <div className="sspi-brand"><LogoIcon /><span>Payload Manager</span></div>
-          <div className="sspi-connection">{ip}:8084</div>
-        </div>
+        <div className="sspi-brand" aria-label="SSPI"><LogoIcon /></div>
         <nav className="sspi-navigation" aria-label={t('sspi.navigation', 'Main navigation')}>
           <NavButton active={view === 'dashboard'} onClick={() => setView('dashboard')} icon={LayoutDashboard} label={t('app.nav.dashboard', 'Dashboard')} />
           <NavButton active={view === 'storage' || view === 'move_from_usb'} onClick={() => setView('storage')} icon={Database} label={t('app.nav.storage', 'Manage Payloads')} />
@@ -474,7 +474,9 @@ function App() {
           <NavButton active={view === 'processes'} onClick={() => setView('processes')} icon={Cpu} label={t('app.nav.processes', 'Active Processes')} />
           <NavButton active={view === 'settings' || view === 'sources'} onClick={() => setView('settings')} icon={Settings} label={t('app.nav.settings', 'Settings')} />
         </nav>
+        <span className="sspi-product-label">Payload Manager</span>
       </header>
+      <ServiceStatus ip={ip} />
 
       {/* MAIN CONTENT AREA */}
       <div className={cn(
@@ -485,18 +487,13 @@ function App() {
           "sspi-content custom-scrollbar mx-auto w-full flex flex-col",
           isPS5 ? "pt-16 px-16 pb-12 flex-1 overflow-y-auto" : "pt-6 px-6 pb-36 md:pt-16 md:px-16 md:pb-12 md:flex-1 md:overflow-y-auto"
         )}>
-          {view === 'dashboard' && <ServiceStatus />}
           {view === 'dashboard' && (() => {
             const visiblePayloads = payloads.filter(p => !isSystemPayload(p))
+            const matching = filterPayloads(visiblePayloads, payloadQuery)
             const activeFavorites = favoritePayloads.filter(p => visiblePayloads.includes(p))
-            const unfavorited = visiblePayloads.filter(p => !favoritePayloads.includes(p))
-            
-            // Extract translations to variables for i18next-parser compatibility
-            const txtFavorites = t("app.dashboard.favorites", "Favorites")
-            const txtOthers = t("app.dashboard.others", "Others")
-
-            const gridCols = 'sspi-payload-grid'
-            const makeCard = (p) => (
+            const matchingFavorites = activeFavorites.filter(p => matching.includes(p))
+            const unfavorited = matching.filter(p => !favoritePayloads.includes(p))
+            const makeRow = (p) => (
               <PayloadButton
                 key={p}
                 path={p}
@@ -512,81 +509,24 @@ function App() {
                 canMoveRight={activeFavorites.indexOf(p) < activeFavorites.length - 1}
               />
             )
-            return (
-              <div className={cn(
-                "space-y-8 md:space-y-12 transition-all",
-                isFavoriteEditMode && "-m-4 md:-m-6 p-4 md:p-6 border-2 border-yellow-400/50 bg-yellow-400/5 rounded-ps-2xl"
-              )}>
-                <div className="flex items-center justify-between">
-                  <h2 className={cn(
-                    "text-4xl font-extrabold tracking-tight",
-                    isFavoriteEditMode ? "text-yellow-400" : "text-white"
-                  )}>
-                    {isFavoriteEditMode ? (
-                      t("app.dashboard.editFavorites", "Edit Favorites")
-                    ) : (
-                      <>{t("app.dashboard.title_1", "Launch")} <span className="text-ps-blue">{t("app.dashboard.title_2", "Payload")}</span></>
-                    )}
-                  </h2>
-                  <button
-                    onClick={() => setIsFavoriteEditMode(!isFavoriteEditMode)}
-                    className={cn(
-                      "p-3 rounded-full transition-colors flex items-center justify-center",
-                      isFavoriteEditMode ? "bg-yellow-400/20 text-yellow-400" : "bg-white/5 text-zinc-400 hover:text-white hover:bg-white/10"
-                    )}
-                    title={t("app.dashboard.editFavorites", "Edit Favorites")}
-                  >
-                    <Star className={cn("w-6 h-6", isFavoriteEditMode && "fill-yellow-400")} />
-                  </button>
+            return <section className="sspi-page sspi-library" aria-labelledby="payloads-heading">
+              <div className="sspi-library-heading">
+                <h2 id="payloads-heading">{t('sspi.payloads', 'Payloads')}<span className="sspi-count">{visiblePayloads.length}</span></h2>
+                <div className="sspi-inline-actions">
+                  <button className="sspi-button quiet" onClick={() => setIsFavoriteEditMode(!isFavoriteEditMode)} aria-pressed={isFavoriteEditMode}><Star size={16} />{isFavoriteEditMode ? t('sspi.done', 'Done') : t('app.dashboard.editFavorites', 'Edit Favorites')}</button>
+                  <button className="sspi-icon-button" onClick={() => refreshPayloads()} disabled={loadingPayloads} aria-label={t('sspi.refresh_payloads', 'Refresh payloads')}><RefreshCw size={16} /></button>
                 </div>
-                {loadingPayloads ? (
-                  <div className={gridCols}>
-                    {Array.from({ length: 4 }).map((_, i) => (
-                      <div key={i} className="glass-card p-6 rounded-ps-xl flex flex-col space-y-2 border-white/5">
-                        <div className="h-7 w-40 bg-white/5 rounded-lg" />
-                        <div className="h-3 w-20 bg-white/5 rounded-md opacity-50" />
-                      </div>
-                    ))}
-                  </div>
-                ) : visiblePayloads.length === 0 ? (
-                  <div className={gridCols}>
-                    <div className="col-span-full py-20 border-2 border-dashed border-white/5 rounded-ps-xl flex flex-col items-center justify-center space-y-6 bg-white/[0.01]">
-                      <Package className="w-16 h-16 text-white/10" />
-                      <div className="text-center">
-                        <p className="text-white font-extrabold tracking-tight text-2xl">{t("app.dashboard.empty.title", "Empty Library")}</p>
-                        <p className="text-zinc-500 font-medium">{t("app.dashboard.empty.message", "Add payloads from the Cloud Hub to get started.")}</p>
-                      </div>
-                      <button onClick={() => { setStorageScrollTarget('cloud-repository'); setView('storage'); }} className="px-8 py-3 bg-ps-blue text-white rounded-xl font-bold tracking-tight">{t("app.dashboard.empty.button", "Open Repository")}</button>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="space-y-8 md:space-y-12">
-                    {activeFavorites.length > 0 && (
-                      <div className="space-y-4">
-                        <div className="flex items-center gap-3">
-                          <Star className="w-5 h-5 text-yellow-400 fill-yellow-400" />
-                          <span className="text-sm font-bold tracking-widest uppercase text-yellow-400">{txtFavorites}</span>
-                        </div>
-                        <div className={gridCols}>
-                          {activeFavorites.map(makeCard)}
-                        </div>
-                        <div className="border-t border-white/5 pt-8">
-                          <p className="text-sm font-bold tracking-widest uppercase text-zinc-500 mb-4">{txtOthers}</p>
-                          <div className={gridCols}>
-                            {unfavorited.map(makeCard)}
-                          </div>
-                        </div>
-                      </div>
-                    )}
-                    {activeFavorites.length === 0 && (
-                      <div className={gridCols}>
-                        {visiblePayloads.map(makeCard)}
-                      </div>
-                    )}
-                  </div>
-                )}
               </div>
-            )
+              <label className="sspi-search sspi-library-search"><Search size={17} aria-hidden="true" /><input type="search" value={payloadQuery} onChange={event => setPayloadQuery(event.target.value)} placeholder={t('sspi.find_payload', 'Find a payload')} aria-label={t('sspi.find_payload', 'Find a payload')} /></label>
+              {isFavoriteEditMode && <p className="sspi-muted sspi-edit-hint">{t('sspi.favorites_hint', 'Select a payload to add or remove its favorite. Use the arrows to change the order.')}</p>}
+              {loadingPayloads ? <div className="sspi-list sspi-loading-list" role="status" aria-label={t('sspi.loading_payloads', 'Loading payloads')}>{[0, 1, 2, 3].map(index => <div key={index} className="sspi-loading-row"><span /><span /></div>)}</div> : visiblePayloads.length === 0 ? <div className="sspi-empty">
+                <Package size={25} aria-hidden="true" /><p>{t('app.dashboard.empty.title', 'Empty Library')}</p><button className="sspi-button" onClick={() => { setStorageScrollTarget('cloud-repository'); setView('storage') }}>{t('app.dashboard.empty.button', 'Open Repository')}</button>
+              </div> : matching.length === 0 ? <div className="sspi-empty"><p>{t('sspi.no_payload_match', 'No payloads match this search.')}</p><button className="sspi-button quiet" onClick={() => setPayloadQuery('')}>{t('sspi.clear_search', 'Clear search')}</button></div> : <div className="sspi-library-groups">
+                {matchingFavorites.length > 0 && <section><h3 className="sspi-list-heading"><Star size={14} />{t('app.dashboard.favorites', 'Favorites')}<span>{matchingFavorites.length}</span></h3><div className="sspi-payload-list">{matchingFavorites.map(makeRow)}</div></section>}
+                {unfavorited.length > 0 && <section>{matchingFavorites.length > 0 && <h3 className="sspi-list-heading">{t('sspi.other_payloads', 'Other payloads')}<span>{unfavorited.length}</span></h3>}<div className="sspi-payload-list">{unfavorited.map(makeRow)}</div></section>}
+              </div>}
+              <p className="sspi-library-footnote">{t('sspi.launch_history_hint', 'A check mark means launched recently; it does not confirm a payload is still running.')}</p>
+            </section>
           })()}
 
           {view === 'storage' && (

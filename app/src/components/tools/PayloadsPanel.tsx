@@ -8,7 +8,7 @@ import { useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode 
 import { Collapse } from "../Collapse"
 import { Seg } from "../Controls"
 import { Icon } from "../Icon"
-import { ActionBubbleMenu } from "../ActionBubbleMenu"
+import { ActionMenu } from "../ActionMenu"
 import { toast } from "../toasts"
 import { addPayloads, listPayloads, removePayload, sendPayload, updatePayload } from "@/lib/console-api"
 import { loaderEndpoint } from "@/lib/console-helpers"
@@ -17,8 +17,11 @@ import { errorText, fmtBytes, fmtSpeed } from "@/lib/format"
 import { isTyping, setPanelKeys } from "@/lib/keys"
 import { clamp } from "@/lib/motion"
 import type { ConsoleKind, Settings } from "@/types"
-import { getAutostart, setAutostart, getPayloadCatalog, downloadCatalogPayload, launcherAvailable, type AutostartStatus, type PayloadCatalog } from "@/lib/launcher-api"
-import "./WebLauncherPanel.css"
+import { autostartRunning, getAutostart, launcherAvailable, runAutostart, setAutostart, stopAutostart, type AutostartOrder, type AutostartStatus } from "@/lib/launcher-api"
+import { AutostartCard } from "./payloads/AutostartCard"
+import { AutostartDialog, Glyph } from "./payloads/AutostartDialog"
+import { CatalogDialog } from "./payloads/CatalogDialog"
+import "./payloads/payloads.css"
 
 type Props = { target: ConsoleKind; settings: Settings; demo: boolean; onReceiverLoaded: (target: ConsoleKind) => void }
 type SessionSend = { id: string; name: string; at: number; result: string; ok: boolean; totalMs?: number; bytesPerSecond?: number | null }
@@ -29,6 +32,7 @@ const time = (at: number) => new Date(at).toLocaleTimeString([], { hour: "numeri
 const fmtMs = (ms: number) => ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(2)} s`
 /** One monospace line of header facts; raw payloads have none to show. */
 const techLine = (entry: PayloadEntry) => entry.elf ? `${entry.elf.class} ${entry.elf.endian} · ${entry.elf.machine} · ${entry.elf.kind} · entry ${entry.elf.entry}` : "Raw binary, no ELF header"
+const ordinal = (n: number) => `${n}${n % 10 === 1 && n % 100 !== 11 ? "st" : n % 10 === 2 && n % 100 !== 12 ? "nd" : n % 10 === 3 && n % 100 !== 13 ? "rd" : "th"}`
 const when = (at: number) => {
   const day = new Date(at), today = new Date()
   return day.toDateString() === today.toDateString() ? time(at) : day.toLocaleDateString([], { month: "short", day: "numeric" })
@@ -49,7 +53,8 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
   const [traces, setTraces] = useState<Record<string, Traced>>({})
   const [autostart, setAutostartState] = useState<AutostartStatus[]>([])
   const [autoBusy, setAutoBusy] = useState(false)
-  const [autoError, setAutoError] = useState("")
+  const [ordering, setOrdering] = useState<{ adding?: string } | null>(null)
+  const [catalogOpen, setCatalogOpen] = useState(false)
   const autoGeneration = useRef(0)
   const fileRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
@@ -64,15 +69,19 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
   useEffect(() => {
     let live = true, fetching = false
     if (!launcherAvailable(demo)) return
+    let timer = 0
+    // Polls quickly while an order is running, so each payload's state shows as it changes.
     const poll = async () => {
       if (fetching) return
       fetching = true; const generation = autoGeneration.current
-      try { const next = await getAutostart(demo); if (live && generation === autoGeneration.current) setAutostartState(next) }
-      catch (reason) { if (live) setAutoError(errorText(reason)) }
+      let running = false
+      try { const next = await getAutostart(demo); running = next.some(item => autostartRunning(item)); if (live && generation === autoGeneration.current) setAutostartState(next) }
+      catch { /* The card keeps its last state; the next poll retries. */ }
       finally { fetching = false }
+      if (live) timer = window.setTimeout(() => void poll(), running ? 500 : 2000)
     }
-    void poll(); const timer = window.setInterval(() => void poll(), 2000)
-    return () => { live = false; clearInterval(timer) }
+    void poll()
+    return () => { live = false; clearTimeout(timer) }
   }, [demo])
 
   const shown = useMemo(() => payloads
@@ -80,12 +89,21 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
     .sort((a, b) => Number(b.builtin) - Number(a.builtin) || a.name.localeCompare(b.name)), [payloads, target])
   const current = shown.find(payload => payload.id === selected) || shown[0]
   const auto = autostart.find(item => item.target === target)
-  const changeAutostart = async (id: string) => {
-    autoGeneration.current += 1; setAutoBusy(true); setAutoError("")
-    try { setAutostartState(await setAutostart(target, id || null, demo)) }
-    catch (reason) { setAutoError(errorText(reason)) }
+  const order = (status?: AutostartStatus): AutostartOrder => (status?.steps || []).map(step => ({ payloadId: step.payloadId, delayMs: step.delayMs }))
+  const autoAction = async (action: () => Promise<AutostartStatus[]>, failure: string) => {
+    autoGeneration.current += 1; setAutoBusy(true)
+    try { setAutostartState(await action()) }
+    catch (reason) { toast({ tone: "error", title: failure, text: errorText(reason) }); throw reason }
     finally { autoGeneration.current += 1; setAutoBusy(false) }
   }
+  const saveOrder = (enabled: boolean, next: AutostartOrder) => autoAction(() => setAutostart(target, enabled, next, demo), "Autostart wasn't saved").then(() => {
+    toast({ tone: "success", title: enabled ? "Autostart order saved" : "Autostart is off", text: enabled ? `${next.length} payload${next.length === 1 ? "" : "s"} will be sent in this order${demo ? " (offline preview)" : ""}.` : "The order is kept for later." })
+  })
+  const toggleAutostart = (on: boolean) => {
+    if (on && !auto?.steps.length) { setOrdering({}); return }
+    void autoAction(() => setAutostart(target, on, order(auto), demo), "Autostart wasn't changed").catch(() => undefined)
+  }
+  const autostartPlace = (id: string) => (auto?.steps.findIndex(step => step.payloadId === id) ?? -1) + 1
 
   const addPaths = async (paths: string[]) => {
     if (!paths.length) return
@@ -165,25 +183,19 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
           <span className={`dot ${endpoint.host ? "good" : ""}`} />
           <span>{endpoint.host ? <>Sends to <strong>{endpoint.host}:{endpoint.port}</strong>, the {loader} on your {name}</> : <>Add your {name}'s address in Options, Consoles to send payloads</>}</span>
         </p>
+        {target === "ps5" && <button type="button" className="btn sm ghost" onClick={() => setCatalogOpen(true)}><Icon name="globe" />Catalog</button>}
         <button type="button" className="btn sm" disabled={busy === "add"} onClick={() => void choose()}>{busy === "add" ? <span className="spinner" /> : <Icon name="plus" />}Add payloads</button>
         <input ref={fileRef} type="file" accept=".elf,.bin" multiple hidden onChange={(event: ChangeEvent<HTMLInputElement>) => { const files = Array.from(event.currentTarget.files || []); event.currentTarget.value = ""; void addPaths(files.map(file => `preview/${file.name}`)) }} />
       </div>
       {error && <p className="pl-error" role="alert">{error}</p>}
-      <div className="pl-autostart">
-        <label className="pl-autostart-label" htmlFor="payload-autostart">Autostart</label>
-        <select id="payload-autostart" value={auto?.payloadId || ""} disabled={loading || autoBusy || !!busy || !launcherAvailable(demo)} onChange={event => void changeAutostart(event.target.value)}>
-          <option value="">Off</option>
-          {shown.map(entry => <option key={entry.id} value={entry.id}>{entry.name}</option>)}
-          {auto?.payloadId && !shown.some(entry => entry.id === auto.payloadId) && <option value={auto.payloadId}>Payload unavailable</option>}
-        </select>
-        <span className="pl-autostart-status" role="status">{autoBusy ? "Saving…" : autoError || auto?.message || "Sends once when SSPI starts."}</span>
-        <details className="pl-autostart-details"><summary>Details</summary><p>Off by default, with one payload per console. Choosing a payload arms it now and on each SSPI launch. Connection failures retry twice, then stop. A completed or partial send is never repeated automatically. The console’s loader must already be running and reachable over your network.</p>{auto?.lastAttemptAt && <p>Last attempt {when(auto.lastAttemptAt)} · {auto.attempts} of 3{auto.nextAttemptAt ? ` · next ${time(auto.nextAttemptAt)}` : ""}. {auto.phase === "sent" ? "Bytes were sent; execution was not verified." : auto.phase === "verified" ? "The SSPI receiver answered after loading." : ""}</p>}</details>
-      </div>
+      <AutostartCard status={auto} payloads={shown} loader={loader} busy={autoBusy || loading} available={launcherAvailable(demo)}
+        onToggle={toggleAutostart} onEdit={() => setOrdering({})}
+        onRun={() => void autoAction(() => runAutostart(target, demo), "Autostart didn't start").catch(() => undefined)}
+        onStop={() => void autoAction(() => stopAutostart(target, demo), "Autostart didn't stop").catch(() => undefined)} />
       <div ref={listRef} className="pl-list scroll" role="listbox" aria-label={`Payloads for your ${name}`}>
         {loading && Array.from({ length: 3 }, (_, n) => <div key={n} className="skeleton" style={{ height: 68, flex: "none" }} />)}
         {!loading && shown.map((entry, n) => {
           const isCurrent = entry.id === current?.id
-          const ext = entry.fileName.split(".").pop()?.toUpperCase() || "ELF"
           const failed = !!entry.lastResult && entry.lastSentAt && !/sent|running|loaded|verified|preview/i.test(entry.lastResult)
           return (
             <div key={entry.id} className={`pl-item ${isCurrent ? "is-current" : ""}`}>
@@ -192,20 +204,24 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
                 className="pl-row enter" style={{ animationDelay: `${Math.min(n, 10) * 30}ms` }}
                 onClick={() => setSelected(entry.id)} onDoubleClick={() => void send(entry)} onFocus={() => setSelected(entry.id)}
               >
-                <span className={`pl-glyph ${entry.builtin ? "builtin" : ""}`}>{entry.builtin ? <Icon name="shield" /> : ext}</span>
+                <Glyph entry={entry} size="md" />
                 <span className="pl-main">
                   <strong>{entry.name}</strong>
-                  <span>{entry.fileName}&ensp;{fmtBytes(entry.size)}{entry.builtin ? <>&ensp;Built in</> : entry.target === "any" ? <>&ensp;Any console</> : null}</span>
+                  <span>{entry.fileName}&ensp;{fmtBytes(entry.size)}{entry.builtin ? <>&ensp;Built in</> : entry.target === "any" ? <>&ensp;Any console</> : null}{autostartPlace(entry.id) > 0 && auto?.enabled && <span className="pl-auto-tag"><Icon name="bolt" />Autostart {autostartPlace(entry.id)}</span>}</span>
                 </span>
                 <span className={`pl-last ${failed ? "fail" : ""}`}>
                   {entry.lastSentAt ? <><b>{failed ? "Failed" : "Sent"} {when(entry.lastSentAt)}</b>{isCurrent && <small>{entry.lastResult}</small>}</> : <b>Not sent yet</b>}
                 </span>
-                {isCurrent && !entry.builtin && (
+                {isCurrent && (
                   <span className="pl-tools" onClick={event => event.stopPropagation()}>
-                    <ActionBubbleMenu label={`Actions for ${entry.name}`} actions={[
-                      { id: "rename", label: "Rename", icon: "pencil", disabled: !!busy, onSelect: () => { setRemoving(""); setEditing(editing === entry.id ? "" : entry.id) } },
-                      { id: "autostart", label: auto?.payloadId === entry.id ? "Disable autostart" : "Autostart", icon: "play", disabled: autoBusy || !!busy, checked: auto?.payloadId === entry.id, onSelect: () => changeAutostart(auto?.payloadId === entry.id ? "" : entry.id) },
-                      { id: "remove", label: "Remove", icon: "trash", disabled: !!busy, onSelect: () => { setEditing(""); setRemoving(removing === entry.id ? "" : entry.id) } },
+                    <ActionMenu label={`Actions for ${entry.name}`} trigger={{ icon: "more", title: "More actions" }} actions={[
+                      autostartPlace(entry.id) > 0
+                        ? { id: "autostart", label: "Edit autostart order", description: `Sent ${ordinal(autostartPlace(entry.id))} when SSPI starts`, icon: "bolt", disabled: autoBusy, onSelect: () => setOrdering({}) }
+                        : { id: "autostart", label: "Add to autostart", description: "Choose where it goes in the order", icon: "bolt", disabled: autoBusy || !launcherAvailable(demo), onSelect: () => setOrdering({ adding: entry.id }) },
+                      ...(!entry.builtin ? [
+                        { id: "rename", label: "Rename", description: "Name, console and notes", icon: "pencil" as const, disabled: !!busy, onSelect: () => { setRemoving(""); setEditing(editing === entry.id ? "" : entry.id) } },
+                        { id: "remove", label: "Remove", description: "Deletes the copy SSPI keeps", icon: "trash" as const, tone: "danger" as const, disabled: !!busy, onSelect: () => { setEditing(""); setRemoving(removing === entry.id ? "" : entry.id) } },
+                      ] : []),
                     ]} />
                   </span>
                 )}
@@ -238,7 +254,9 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
           </div>
         )}
       </div>
-      {target === "ps5" && <CatalogBrowser demo={demo} onImported={setPayloads} />}
+      <AutostartDialog open={!!ordering} adding={ordering?.adding} target={target} loader={loader} payloads={shown} status={auto}
+        onClose={() => setOrdering(null)} onSave={saveOrder} />
+      {target === "ps5" && <CatalogDialog open={catalogOpen} demo={demo} onClose={() => setCatalogOpen(false)} onImported={setPayloads} />}
       {history.length > 0 && (
         <details className="tech pl-log">
           <summary>This session: {history.length === 1 ? "1 send" : `${history.length} sends`}, last {history[0].name} at {time(history[0].at)}</summary>
@@ -249,41 +267,6 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
       )}
     </div>
   )
-}
-
-function CatalogBrowser({ demo, onImported }: { demo: boolean; onImported: (entries: PayloadEntry[]) => void }) {
-  const [catalog, setCatalog] = useState<PayloadCatalog | null>(null)
-  const [search, setSearch] = useState("")
-  const [busy, setBusy] = useState("")
-  const [error, setError] = useState("")
-  const refresh = async (force: boolean) => {
-    if (busy) return
-    setBusy("refresh"); setError("")
-    try { setCatalog(await getPayloadCatalog(force, demo)) }
-    catch (reason) { setError(errorText(reason)) }
-    finally { setBusy("") }
-  }
-  const download = async (filename: string) => {
-    if (busy) return
-    if (demo) { toast({ tone: "info", title: "Offline preview", text: "No payload was downloaded." }); return }
-    setBusy(filename); setError("")
-    try { onImported(await downloadCatalogPayload(filename)); setCatalog(await getPayloadCatalog(false, demo)); toast({ tone: "success", title: "Payload added", text: "The selected repository version is in your library. Use Send when ready." }) }
-    catch (reason) { setError(errorText(reason)) }
-    finally { setBusy("") }
-  }
-  const entries = catalog?.entries.filter(item => `${item.name} ${item.category} ${item.description}`.toLowerCase().includes(search.trim().toLowerCase())) || []
-  return <details className="tech pl-catalog" onToggle={event => { if (event.currentTarget.open && !catalog && !busy) void refresh(false) }}>
-    <summary>Payload catalog · PS5</summary>
-    <div className="tech-body">
-      <div className="pl-catalog-top"><input className="field" placeholder="Find a payload" aria-label="Search payload catalog" value={search} onChange={e => setSearch(e.target.value)} /><button type="button" className="btn sm" disabled={!!busy || !launcherAvailable(demo)} onClick={() => void refresh(true)}>{busy === "refresh" ? "Loading…" : "Refresh"}</button></div>
-      <p>From <a href="https://github.com/itsPLK/ps5-payloads-mirror" target="_blank" rel="noreferrer">Payload Manager’s repository</a>. Refresh checks available versions. Downloads add a local copy; your existing payloads and autostart selection stay as chosen.</p>
-      {(error || catalog?.warning) && <p className="pl-error" role="alert">{error || catalog?.warning}</p>}
-      <div className="pl-catalog-list">
-        {entries.map(entry => <div className="pl-catalog-item" key={entry.filename}><div><strong>{entry.name} {entry.version}</strong><p>{entry.description}</p><small>{entry.checksum ? "SHA-256 checked on download" : "No published checksum"}{entry.source && <> · <a href={entry.source} target="_blank" rel="noreferrer">Source & compatibility</a></>}</small></div><button type="button" className="btn sm" disabled={!!busy || entry.installed} onClick={() => void download(entry.filename)}>{busy === entry.filename ? "Downloading…" : entry.installed ? "Added" : "Download"}</button></div>)}
-        {!entries.length && <p className="pl-catalog-empty">{busy === "refresh" ? "Loading repository…" : catalog ? "No payloads match this search." : "Open the catalog in the SSPI app to download payloads."}</p>}
-      </div>
-    </div>
-  </details>
 }
 
 /** Header facts for the selected payload and, after a send, what the send measured. */

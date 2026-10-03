@@ -1,78 +1,231 @@
+/* The local web host: setup, observed console traffic and the host log. */
 import { useEffect, useRef, useState } from "react"
 import { getWebLauncher, startWebLauncher, stopWebLauncher, launcherAvailable, type WebLauncherStatus } from "@/lib/launcher-api"
 import { errorText } from "@/lib/format"
 import { Icon } from "../Icon"
 import { toast } from "../toasts"
-import "./WebLauncherPanel.css"
+import "./web-launcher.css"
+
+const ago = (at: number | null, now: number) => {
+  if (!at) return "No requests"
+  const seconds = Math.max(0, Math.round((now - at) / 1000))
+  if (seconds < 2) return "Just now"
+  if (seconds < 60) return `${seconds}s ago`
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
+  return `${Math.floor(seconds / 3600)}h ago`
+}
 
 export function WebLauncherPanel({ demo }: { demo: boolean }) {
   const [status, setStatus] = useState<WebLauncherStatus | null>(null)
   const [address, setAddress] = useState("")
   const [busy, setBusy] = useState("")
   const [error, setError] = useState("")
+  const [pollError, setPollError] = useState("")
+  const [now, setNow] = useState(Date.now)
+  const [follow, setFollow] = useState(true)
   const live = useRef(true)
+  const generation = useRef(0)
+  const acting = useRef(false)
+  const editedAddress = useRef(false)
+  const feed = useRef<HTMLDivElement>(null)
   const available = launcherAvailable(demo)
+
   useEffect(() => {
     live.current = true
-    if (!available) return () => { live.current = false }
+    let active = true
     let fetching = false
+    if (!available) return () => { live.current = false }
     const poll = async () => {
-      if (fetching) return
+      setNow(Date.now())
+      if (fetching || acting.current) return
       fetching = true
-      try { const result = await getWebLauncher(demo); if (live.current) { setStatus(result); setAddress(old => old || result.address) } }
-      catch (reason) { if (live.current) setError(errorText(reason)) }
-      finally { fetching = false }
+      const current = generation.current
+      try {
+        const result = await getWebLauncher(demo)
+        if (active && current === generation.current) {
+          setStatus(result)
+          if (!editedAddress.current) setAddress(result.address)
+          setNow(Date.now())
+          setPollError("")
+        }
+      } catch (reason) {
+        if (active && current === generation.current) setPollError(errorText(reason))
+      } finally { fetching = false }
     }
-    void poll(); const timer = window.setInterval(() => void poll(), 2500)
-    return () => { live.current = false; clearInterval(timer) }
+    void poll()
+    const timer = window.setInterval(() => void poll(), 1000)
+    return () => { active = false; live.current = false; clearInterval(timer) }
   }, [demo, available])
-  const run = async (operation: string, action: () => Promise<WebLauncherStatus>) => {
-    if (busy) return
-    setBusy(operation); setError("")
+
+  const logs = status?.logs || []
+  const lastLine = logs[logs.length - 1]
+  useEffect(() => {
+    if (follow && feed.current) feed.current.scrollTop = feed.current.scrollHeight
+  }, [lastLine, logs.length, follow])
+
+  const run = async (operation: "start" | "stop") => {
+    if (acting.current) return
+    acting.current = true
+    generation.current++
+    setBusy(operation)
+    setError("")
     try {
-      const result = await action()
-      if (live.current) setStatus(result)
-    } catch (reason) { if (live.current) setError(errorText(reason)) }
-    finally { if (live.current) setBusy("") }
+      const result = await (operation === "stop" ? stopWebLauncher(demo) : startWebLauncher(address.trim(), demo))
+      if (live.current) {
+        setStatus(result)
+        setAddress(result.address)
+        editedAddress.current = false
+        setNow(Date.now())
+        setPollError("")
+        if (operation === "start") setFollow(true)
+      }
+    } catch (reason) {
+      if (live.current) setError(errorText(reason))
+    } finally {
+      acting.current = false
+      generation.current++
+      if (live.current) setBusy("")
+    }
   }
-  const running = status?.running
-  const copyAddress = async () => {
-    try { await navigator.clipboard.writeText(status?.address || address); toast({ tone: "success", title: "DNS address copied", text: status?.address || address }) }
-    catch (reason) { setError(errorText(reason)) }
+  const copy = async (value: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(value)
+      toast({ tone: "success", title: `${label} copied` })
+    } catch (reason) {
+      toast({ tone: "error", title: "Copying failed", text: errorText(reason) })
+    }
   }
-  return <div className="wl scroll">
-    <div className="wl-main">
-      <div className="wl-heading"><span className={`dot ${running ? "good" : status?.phase === "error" ? "fail" : ""}`} /><span>{running ? status?.phase === "loading" ? "Loading on the console" : status?.phase === "connected" ? "Browser connected" : "Host ready" : "Local web host"}</span>{demo && <span className="wl-preview">Offline preview</span>}</div>
-      <h2>SSPI Web Launcher</h2>
-      <p className="wl-intro">Open the SSPI console interface from your PS5’s User’s Guide. Payload Manager starts automatically after setup.</p>
-      <div className="wl-action">
-        <button type="button" className={`btn ${running ? "" : "primary"}`} disabled={!!busy || !status} onClick={() => void run(running ? "stop" : "start", () => running ? stopWebLauncher(demo) : startWebLauncher(address, demo))}>{busy === "start" || busy === "stop" ? <span className="spinner" /> : <Icon name={running ? "x" : "play"} />}{busy === "start" ? "Starting host" : busy === "stop" ? "Stopping" : running ? "Stop hosting" : "Host on this PC"}</button>
-        <span className="wl-status" role="status">{!available ? "Available in the SSPI app." : status?.message || (error ? "Host unavailable." : "Loading host settings…")}</span>
-      </div>
-      {error && <p className="pl-error" role="alert">{error}</p>}
-      <div className={`wl-setup ${running ? "is-ready" : ""}`}>
-        <div className="wl-address"><span>PS5 primary DNS</span><strong>{status?.address || address || "Connect this PC to your network"}</strong><button type="button" className="btn sm ghost icon" aria-label="Copy DNS address" disabled={!address} onClick={() => void copyAddress()}><Icon name="copy" /></button></div>
-        <ol>
-          <li>Connect this PC and your PS5 to the same local network. Start hosting above; allow SSPI on your private network if Windows Firewall asks.</li>
-          <li>On PS5, open <strong>Settings → Network → Settings → Set Up Internet Connection</strong>. Select your connected network, then <strong>Advanced Settings → DNS Settings → Manual</strong>. Enter the address above as primary DNS and <strong>0.0.0.0</strong> as secondary.</li>
-          <li>Open <strong>Settings → User’s Guide, Health & Safety, and Other Information → User’s Guide</strong>. The SSPI launcher starts automatically. Follow the console’s setup progress.</li>
-        </ol>
-        <p>When setup finishes, Payload Manager opens. For later sessions, use the <strong>WebKit Autoloader</strong> home screen app. Restore your previous DNS settings after you finish using this host; this DNS blocks other domains.</p>
-      </div>
-      <details className="tech wl-details">
-        <summary>Host details, updates and compatibility</summary>
-        <div className="tech-body">
-          <p>SSPI console runtime {status?.version || "—"}</p>
-          <label className="wl-ip">This PC’s LAN address<input className="field" aria-label="Web launcher LAN IPv4 address" value={address} disabled={!!running || !!busy} placeholder="192.168.1.10" onChange={e => setAddress(e.target.value)} /></label>
-          <p>DNS UDP 53 and HTTPS TCP 443 are required. HTTP TCP 80 provides a browser preview when available. A busy port is reported without stopping another app.</p>
-          {running && status?.url && <p>Preview: <a href={status.url} target="_blank" rel="noreferrer">{status.url}</a>. A PC browser may show a self-signed certificate notice over HTTPS.</p>}
-          {status?.lastClient && <p>Last client {status.lastClient} · {status.requests} requests{status.lastRequestAt ? ` · ${new Date(status.lastRequestAt).toLocaleTimeString()}` : ""}. Serving a page does not confirm console installation.</p>}
-          <p>Upstream supports firmware 1.00–5.50 and 7.00–13.60. Its own page checks firmware and chooses the supported chain. Relapse requires an active local network interface; internet access is not required.</p>
-          <p>Payload Manager keeps your catalog, repositories, history and autoload settings. The ELF loader starts with the launcher and accepts payloads on port 9021. Existing autoload.txt entries run in their saved order; the SSPI Manager starts once. If automatic browser opening is disabled in Manager settings, it remains disabled.</p>
-          <p>Launcher updates arrive with SSPI Windows through Options → Updates. After updating Windows, host again and rerun setup to refresh the console’s cached SSPI interfaces. Saved payloads and autoload.txt are preserved.</p>
-          {!!status?.logs.length && <pre className="wl-log">{status.logs.join("\n")}</pre>}
+
+  const running = !!status?.running
+  const phase = status?.phase || "idle"
+  const host = running ? status?.address || address : address
+  const phaseLabel = {
+    idle: "Stopped",
+    ready: "Listening",
+    dns: "DNS received",
+    connected: "Launcher requested",
+    loading: "Serving launcher files",
+    error: "Host error",
+  }[phase]
+  const consoleSeen = status?.consoleLastSeenAt ?? null
+  const managerChecked = status?.managerCheckedAt ?? null
+  const managerFresh = !!managerChecked && now - managerChecked < 15_000
+  const managerReady = running && status?.managerReady && managerFresh
+  const failure = error || pollError || (phase === "error" ? status?.message : "")
+
+  if (!available) return (
+    <div className="empty-state"><Icon name="globe" /><h3>Available in the SSPI app</h3><p>The web launcher runs a DNS and web host on this PC, so it needs the installed app.</p></div>
+  )
+
+  return (
+    <div className="wl scroll">
+      <div className="wl-wrap">
+        <header className="wl-toolbar">
+          <div className="wl-title">
+            <h2>Web host</h2>
+            <span className={`wl-state ${phase === "error" ? "fail" : running ? "on" : ""}`} role="status"><i />{phaseLabel}</span>
+            {demo && <span className="wl-preview">Offline preview</span>}
+          </div>
+          <div className="wl-controls">
+            <label className="wl-address">
+              <span>This PC</span>
+              <span className="field"><Icon name="monitor" /><input value={host} readOnly={running} disabled={!!busy} aria-label="This PC's LAN IPv4 address" spellCheck={false} placeholder="LAN IPv4 address"
+                onChange={event => { editedAddress.current = true; setAddress(event.target.value) }}
+                onKeyDown={event => { if (event.key === "Enter" && !running && !busy && status) void run("start") }} /></span>
+            </label>
+            <button type="button" className={`btn ${running ? "" : "primary"}`} disabled={!!busy || !status} onClick={() => void run(running ? "stop" : "start")}>
+              {busy ? <span className="spinner" /> : <Icon name={running ? "square" : "play"} />}
+              {busy === "start" ? "Starting…" : busy === "stop" ? "Stopping…" : running ? "Stop host" : "Start host"}
+            </button>
+          </div>
+        </header>
+
+        {failure && <div className="wl-error" role="alert"><Icon name="alert" /><span>{failure}</span></div>}
+
+        <div className="wl-grid">
+          <aside className="wl-setup" aria-labelledby="wl-setup-title">
+            <h3 id="wl-setup-title">PS5 setup</h3>
+            <p>Connect the PS5 to the same network as this PC, then start the host.</p>
+            <div className="wl-dns">
+              <DnsValue label="Primary DNS" value={host || "—"} disabled={!host} onCopy={() => void copy(host, "Primary DNS")} />
+              <DnsValue label="Secondary DNS" value="0.0.0.0" onCopy={() => void copy("0.0.0.0", "Secondary DNS")} />
+            </div>
+            <ol className="wl-instructions">
+              <li>
+                <strong>Set DNS to Manual</strong>
+                <p>Settings → Network → Settings → Set Up Internet Connection → your network → Advanced Settings.</p>
+                <p>Enter the two DNS addresses above.</p>
+              </li>
+              <li>
+                <strong>Open User’s Guide</strong>
+                <p>Settings → User’s Guide, Health &amp; Safety, and Other Information → User’s Guide.</p>
+                <p>Follow the launcher on the console. Setup saves it for later sessions.</p>
+              </li>
+            </ol>
+            <p className="wl-setup-note">After setup, use the installed launcher on the PS5 home screen. Restore DNS to Automatic when you stop using this host.</p>
+            {running && status?.url && <a className="wl-preview-link" href={status.url} target="_blank" rel="noreferrer"><Icon name="globe" />Open host in browser<Icon name="right" /></a>}
+          </aside>
+
+          <div className="wl-session">
+            <section className="wl-connection" aria-label="Observed connection">
+              <div className="wl-console">
+                <Icon name="gamepad" />
+                <div>
+                  <span>PS5</span><strong>{status?.consoleClient || "Waiting for console"}</strong>
+                  <p>{consoleSeen ? `Last seen ${ago(consoleSeen, now).toLowerCase()}` : status?.consoleClient ? "No traffic seen from this address" : running ? "Open User’s Guide using this PC’s DNS" : "Start the host to see console traffic"}</p>
+                </div>
+                <div className="wl-counts"><span><b>{status?.dnsRequests ?? 0}</b> DNS</span><span><b>{status?.requests ?? 0}</b> HTTP</span></div>
+              </div>
+              <dl className="wl-traffic">
+                <div>
+                  <dt>DNS request</dt>
+                  <dd><strong>{status?.lastDnsClient || "—"}</strong><span title={status?.lastDnsName || ""}>{status?.lastDnsName || "Waiting for a lookup"}</span></dd>
+                  <dd className="wl-when">{ago(status?.lastDnsAt ?? null, now)}</dd>
+                </div>
+                <div>
+                  <dt>Web request</dt>
+                  <dd><strong>{status?.lastClient || "—"}</strong><span>{status?.lastClient ? "Last browser or console request" : "Waiting for a browser"}</span></dd>
+                  <dd className="wl-when">{ago(status?.lastRequestAt ?? null, now)}</dd>
+                </div>
+                <div>
+                  <dt>Payload Manager</dt>
+                  <dd><strong className={managerReady ? "wl-ready" : ""}>{managerReady ? "Ready" : running ? "Waiting" : "Not checked"}</strong><span>{managerReady ? "Current session confirmed" : managerChecked ? "No current session confirmed" : "Checked after console contact"}</span></dd>
+                  <dd className="wl-when">{managerChecked ? `Checked ${ago(managerChecked, now).toLowerCase()}` : "—"}</dd>
+                </div>
+              </dl>
+            </section>
+
+            <section className="wl-terminal" aria-labelledby="wl-log-title">
+              <header className="wl-terminal-head">
+                <h3 id="wl-log-title">Host log</h3>
+                <div>
+                  <button type="button" className={`btn sm wl-follow ${follow ? "is-on" : ""}`} aria-pressed={follow} onClick={() => setFollow(value => !value)}><Icon name="chevD" />Follow</button>
+                  <button type="button" className="btn sm icon-only" title="Copy host log" aria-label="Copy host log" disabled={!logs.length} onClick={() => void copy(logs.join("\n"), "Host log")}><Icon name="copy" /></button>
+                </div>
+              </header>
+              <div ref={feed} className="wl-feed scroll" role="log" aria-label="Host activity" aria-live={follow ? "polite" : "off"} aria-relevant="additions text" tabIndex={0}
+                onScroll={event => { const node = event.currentTarget; if (node.scrollHeight - node.scrollTop - node.clientHeight > 32) setFollow(false) }}>
+                {logs.map((line, n) => <div className={`wl-log-line ${/\b(error|failed|refused|fatal)\b/i.test(line) ? "fail" : ""}`} key={`${n}:${line}`}><span aria-hidden>{n + 1}</span><code>{line}</code></div>)}
+                {!logs.length && <p className="wl-feed-empty">{!status ? "Reading host status…" : running ? "Waiting for DNS and web requests…" : "Host is stopped. Start it to see DNS, web requests and launcher output."}</p>}
+              </div>
+              <p className="wl-log-note">Traffic confirms contact with this PC. Follow the console and its reported log messages for setup progress.</p>
+            </section>
+          </div>
         </div>
-      </details>
+
+        <details className="tech wl-details">
+          <summary>Ports, runtime and updates</summary>
+          <div className="tech-body">
+            <p>Console runtime {status?.version || "—"}. DNS uses UDP 53, HTTPS uses TCP 443, and HTTP uses TCP 80 for the browser preview. Allow SSPI on private networks if Windows Firewall asks. A busy port is reported in the log.</p>
+            <p>The launcher checks firmware and selects the matching chain. The ELF loader accepts payloads on port 9021. Saved autoload.txt entries run in their order and SSPI’s Payload Manager starts once.</p>
+            <p>Launcher updates arrive with SSPI updates. Host again and rerun setup on the PS5 to refresh its cached interface. Saved payloads and autoload.txt are kept.</p>
+          </div>
+        </details>
+      </div>
     </div>
-  </div>
+  )
+}
+
+function DnsValue({ label, value, disabled, onCopy }: { label: string; value: string; disabled?: boolean; onCopy: () => void }) {
+  return <button type="button" className="wl-dns-value" disabled={disabled} onClick={onCopy} title={`Copy ${label.toLowerCase()}`}><span>{label}</span><strong>{value}</strong><Icon name="copy" /></button>
 }

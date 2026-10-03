@@ -51,7 +51,7 @@ export function packageProblem(candidate: PackageCandidate, packages: PackageCan
 }
 
 function belongsToTitle(candidate: PackageCandidate, titleId: string) {
-  const identifiers = `${candidate.expectedContentId || ""} ${candidate.label}`.match(/(?:PPSA|CUSA)\d{5}/gi) || []
+  const identifiers = `${candidate.expectedContentId || ""} ${candidate.label}`.match(/(?:CUSA|PPSA|SLUS|SLES|SCUS|SCES|SLPS|SLPM|SCPS|SCAJ|SLAJ|SLKA|SLKS|SCKA)\d{5}/gi) || []
   return identifiers.every((identifier) => identifier.toUpperCase() === titleId.toUpperCase())
 }
 

@@ -4,42 +4,334 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <link rel="icon" type="image/png" href="/sspi-logo.png" />
-  <title>SSPI Web Launcher · Setup</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <title>WebKit Autoloader Installer v[[VERSION_PLACEHOLDER]] by PLK (built [[BUILD_TIME_PLACEHOLDER]])</title>
   <style>
-/* SSPI visual layer. Upstream WebKit Autoloader copyright and license retained in source distribution. */
-*{box-sizing:border-box;-webkit-box-sizing:border-box}html,body{margin:0;min-height:100%;background:#0b0b0c;color:#ededed}
-body{font:18px/1.55 "Geist","Segoe UI","Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased;background:radial-gradient(ellipse at 85% 0,rgba(255,255,255,.035),transparent 60%),#0b0b0c}
-.sspi-header{height:92px;display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;-webkit-justify-content:space-between;justify-content:space-between;padding:0 5%;border-bottom:1px solid rgba(255,255,255,.08);background:#111113}
-.sspi-brand{display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;font-size:18px;font-weight:400;color:#a0a0a6;letter-spacing:.01em}.sspi-logo{display:block;width:52px;height:52px;object-fit:contain;margin-right:18px}.sspi-header-note{font-size:13px;color:#7a7a81}
-main{width:90%;max-width:1120px;margin:48px auto;padding:0;position:relative;animation:sspi-enter .35s ease-out;-webkit-animation:sspi-enter .35s ease-out}
-h1,h2,p{margin:0}h1{font-size:38px;line-height:1.2;letter-spacing:-.025em;font-weight:500;margin:12px 0 16px}h2{font-size:22px;font-weight:500;line-height:1.35}.sspi-eyebrow{color:#7a7a81;font-size:14px;letter-spacing:.025em}.sspi-description{color:#a0a0a6;font-size:17px;max-width:760px;line-height:1.6}
-button,a{font:inherit}button{cursor:pointer}button:focus,a:focus,[tabindex]:focus{outline:3px solid #e4e4e1!important;outline-offset:5px;box-shadow:none!important}button:disabled{opacity:.45;cursor:default}
-.sspi-section-label{font-size:14px;font-weight:400;color:#a0a0a6;margin-bottom:12px}.sspi-log-panel{margin-top:32px}#logWrapper,#logContainer{font-family:"Cascadia Mono",Consolas,"Courier New",monospace;font-size:14px;line-height:1.7;word-wrap:break-word;overflow-wrap:break-word}
-#logWrapper{height:260px;overflow-y:auto;padding:18px 22px;border:1px solid rgba(255,255,255,.08);background:#111113;border-radius:10px}#logContainer{color:#a0a0a6}#logContainer .line{white-space:pre-wrap;margin-bottom:4px}#logContainer .info{color:#a0a0a6}#logContainer .success{color:#97c4a2}#logContainer .warning{color:#d8bd86}#logContainer .error,#logContainer.error{color:#e8a2a5}
-[hidden]{display:none!important}.sspi-hint{color:#7a7a81;font-size:13px;margin-top:24px}.sspi-hint kbd{border:1px solid rgba(255,255,255,.12);border-radius:4px;padding:2px 6px;color:#a0a0a6;background:#161618}
-::-webkit-scrollbar{width:7px}::-webkit-scrollbar-thumb{background:#333338;border-radius:5px}::-webkit-scrollbar-track{background:transparent}
-@-webkit-keyframes sspi-enter{from{opacity:0;-webkit-transform:translateY(7px)}to{opacity:1;-webkit-transform:translateY(0)}}@keyframes sspi-enter{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:translateY(0)}}
-@media(max-width:700px){body{font-size:16px}.sspi-header{height:76px}.sspi-logo{width:42px;height:42px}.sspi-header-note{display:none}main{margin:30px auto}h1{font-size:30px}.sspi-description{font-size:16px}#logWrapper{height:230px;padding:14px}#logContainer{font-size:12px}}
-@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;-webkit-animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+    * {
+      margin: 0;
+      padding: 0;
+      -webkit-box-sizing: border-box;
+      box-sizing: border-box;
+    }
 
-main{max-width:980px}#status{color:#ededed;font-size:22px;font-weight:500;margin:28px 0 8px}#detail{font-size:17px;line-height:1.6;color:#a0a0a6;max-width:850px}#choiceContainer{margin-top:26px}.choice-grid{display:-webkit-flex;display:flex;margin:0 -8px}.choice-card{-webkit-flex:1;flex:1;margin:0 8px;min-width:0;text-align:left;padding:24px;background:#111113;border:1px solid rgba(255,255,255,.12);border-radius:10px;color:#ededed;transition:background .15s,border-color .15s;-webkit-transition:background .15s,border-color .15s}.choice-card.selected{background:#1c1c1f;border-color:rgba(255,255,255,.3)}.choice-card:hover{background:#1c1c1f;border-color:rgba(255,255,255,.25)}.choice-title{font-size:24px;font-weight:500;margin-bottom:12px}.choice-fw{display:inline-block;color:#c8c8cc;background:#1c1c1f;border:1px solid rgba(255,255,255,.08);border-radius:6px;padding:4px 8px;font-size:13px;margin-bottom:15px}.choice-desc{font-size:16px;color:#a0a0a6;line-height:1.6}
-#progressWrap{position:relative;height:8px;background:#262629;border-radius:4px;margin:38px 0 34px}#progressBar{position:absolute;top:0;left:0;height:100%;width:100%;background:#e4e4e1!important;border-radius:4px;-webkit-transform:scaleX(0);transform:scaleX(0);-webkit-transform-origin:left center;transform-origin:left center;transition:transform .2s ease;-webkit-transition:-webkit-transform .2s ease}#progressPct{position:absolute;right:0;bottom:15px;color:#a0a0a6;font-size:14px}#logContainer{height:210px;overflow-y:auto;padding:18px 22px;border:1px solid rgba(255,255,255,.08);background:#111113;border-radius:10px;white-space:pre-wrap;margin-top:25px}
-#cacheCorruptOverlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);display:-webkit-flex;display:flex;-webkit-align-items:center;align-items:center;-webkit-justify-content:center;justify-content:center;z-index:100;padding:28px}#cacheCorruptOverlay .card{max-width:660px;padding:30px;border:1px solid rgba(255,255,255,.15);border-radius:12px;background:#161618;text-align:left}#cacheCorruptOverlay h2{color:#ededed;margin-bottom:16px}#cacheCorruptOverlay p{font-size:17px;color:#a0a0a6;line-height:1.6}#cacheCorruptOverlay strong{font-weight:500;color:#c8c8cc}#cacheCorruptOverlay .actions{display:-webkit-flex;display:flex;-webkit-flex-wrap:wrap;flex-wrap:wrap;margin-top:26px}.btn{padding:11px 17px;border:1px solid rgba(255,255,255,.12);border-radius:8px;font-size:16px;margin-right:12px;margin-top:8px}.btn.primary{background:#e4e4e1;color:#0b0b0c}.btn.secondary{background:#1c1c1f;color:#ededed}
-@media(max-width:700px){.choice-grid{display:block}.choice-card{width:calc(100% - 16px);margin-bottom:16px}.choice-title{font-size:21px}#cacheCorruptOverlay{padding:18px}#cacheCorruptOverlay .card{padding:24px}}
-</style>
+    html,
+    body {
+      height: 100%;
+    }
+
+    body {
+      font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+      background: #0f172a;
+      background: -webkit-linear-gradient(180deg, #0f172a 0%, #0b1220 100%);
+      color: #e2e8f0;
+      display: -webkit-box;
+      display: -webkit-flex;
+      display: flex;
+      -webkit-box-align: center;
+      -webkit-align-items: center;
+      align-items: center;
+      -webkit-box-pack: center;
+      -webkit-justify-content: center;
+      justify-content: center;
+      min-height: 100%;
+      text-align: center;
+    }
+
+    #footer {
+      position: fixed;
+      bottom: 12px;
+      left: 50%;
+      -webkit-transform: translateX(-50%);
+      transform: translateX(-50%);
+      font-size: 0.75rem;
+      color: #4b5563;
+      line-height: 1.5;
+      text-align: center;
+      z-index: 20;
+    }
+
+
+
+    main {
+      max-width: 42rem;
+      padding: 2rem;
+    }
+
+    .logo {
+      display: inline-block;
+      width: 8rem;
+      height: 8rem;
+      margin-bottom: 2rem;
+    }
+
+    h1 {
+      font-size: 2.5rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      margin-bottom: 1rem;
+    }
+
+    p {
+      font-size: 1.375rem;
+      line-height: 1.5;
+      color: #94a3b8;
+    }
+
+    #status {
+      font-size: 1.5rem;
+      font-weight: 500;
+      color: #38bdf8;
+      margin-bottom: 0.5rem;
+    }
+
+    #progressWrap {
+      position: relative;
+      width: 100%;
+      max-width: 30rem;
+      height: 1.25rem;
+      margin: 1.75rem auto 0;
+      background: #1b2436;
+      border: 1px solid #2c3e5a;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    #progressBar {
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      width: 100%;
+      background: #38bdf8;
+      background: -webkit-linear-gradient(90deg, #2563eb 0%, #38bdf8 100%);
+      -webkit-transform: scaleX(0);
+      transform: scaleX(0);
+      -webkit-transform-origin: left center;
+      transform-origin: left center;
+      -webkit-transition: -webkit-transform 0.3s ease-out;
+      transition: transform 0.3s ease-out;
+    }
+
+    #progressPct {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      display: -webkit-box;
+      display: -webkit-flex;
+      display: flex;
+      -webkit-box-align: center;
+      -webkit-align-items: center;
+      align-items: center;
+      -webkit-box-pack: center;
+      -webkit-justify-content: center;
+      justify-content: center;
+      color: #fff;
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+      z-index: 1;
+      pointer-events: none;
+    }
+
+    #logContainer {
+      margin-top: 1rem;
+      width: 100%;
+      max-width: 40rem;
+      height: 12rem;
+      background: #000;
+      border: 1px solid #2c3e5a;
+      border-radius: 8px;
+      overflow-y: auto;
+      text-align: left;
+      font-family: monospace;
+      font-size: 0.8rem;
+      padding: 0.5rem;
+      color: #cbd5e1;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    #logContainer.error {
+      color: #f00;
+    }
+
+    #cacheCorruptOverlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(2, 6, 23, 0.85);
+      display: -webkit-box;
+      display: -webkit-flex;
+      display: flex;
+      -webkit-box-align: center;
+      -webkit-align-items: center;
+      align-items: center;
+      -webkit-box-pack: center;
+      -webkit-justify-content: center;
+      justify-content: center;
+      z-index: 100;
+    }
+
+    #cacheCorruptOverlay .card {
+      background: #1b2436;
+      border: 1px solid #2c3e5a;
+      border-radius: 12px;
+      max-width: 34rem;
+      padding: 2rem;
+      text-align: center;
+    }
+
+    #cacheCorruptOverlay h2 {
+      font-size: 1.6rem;
+      font-weight: 600;
+      color: #fbbf24;
+      margin-bottom: 1rem;
+    }
+
+    #cacheCorruptOverlay p {
+      font-size: 1.125rem;
+      line-height: 1.6;
+      color: #cbd5e1;
+      margin-bottom: 1.5rem;
+    }
+
+    #cacheCorruptOverlay .actions {
+      display: -webkit-box;
+      display: -webkit-flex;
+      display: flex;
+      -webkit-box-pack: center;
+      -webkit-justify-content: center;
+      justify-content: center;
+      gap: 1rem;
+    }
+
+    #cacheCorruptOverlay .actions[hidden] {
+      display: none !important;
+    }
+
+    #cacheCorruptOverlay .btn {
+      font-size: 1.125rem;
+      font-weight: 600;
+      padding: 0.75rem 1.5rem;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+    }
+
+    #cacheCorruptOverlay .btn.primary {
+      background: #2563eb;
+      background: -webkit-linear-gradient(90deg, #2563eb 0%, #38bdf8 100%);
+      color: #fff;
+    }
+
+    #cacheCorruptOverlay .btn.secondary {
+      background: #334155;
+      color: #e2e8f0;
+    }
+
+    #choiceContainer {
+      margin-top: 1.5rem;
+      width: 100%;
+      max-width: 38rem;
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    #choiceContainer[hidden] {
+      display: none !important;
+    }
+
+    .choice-grid {
+      display: -webkit-box;
+      display: -webkit-flex;
+      display: flex;
+      gap: 1.25rem;
+      margin-top: 1rem;
+      text-align: left;
+    }
+
+    .choice-card {
+      -webkit-box-flex: 1;
+      -webkit-flex: 1;
+      flex: 1;
+      background: #1b2436;
+      border: 2px solid #2c3e5a;
+      border-radius: 12px;
+      padding: 1.5rem 1.25rem;
+      display: -webkit-box;
+      display: -webkit-flex;
+      display: flex;
+      -webkit-box-orient: vertical;
+      -webkit-box-direction: normal;
+      -webkit-flex-direction: column;
+      flex-direction: column;
+      cursor: pointer;
+      color: inherit;
+      font-family: inherit;
+      -webkit-transition: border-color 0.2s, -webkit-transform 0.2s, background-color 0.2s;
+      transition: border-color 0.2s, transform 0.2s, background-color 0.2s;
+      outline: none;
+    }
+
+    .choice-card.selected {
+      border-color: rgba(56, 189, 248, 0.4);
+      background-color: rgba(56, 189, 248, 0.05);
+    }
+
+    .choice-card:hover,
+    .choice-card:focus {
+      border-color: #38bdf8;
+      background-color: #22304a;
+      -webkit-transform: translateY(-2px);
+      transform: translateY(-2px);
+      box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.4);
+    }
+
+    .choice-card:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+
+    .choice-card .choice-title {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: #38bdf8;
+      margin-bottom: 0.25rem;
+    }
+
+    .choice-card .choice-fw {
+      display: inline-block;
+      align-self: flex-start;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: #7dd3fc;
+      background: rgba(56, 189, 248, 0.12);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      border-radius: 4px;
+      padding: 0.15rem 0.5rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .choice-card .choice-desc {
+      font-size: 0.95rem;
+      color: #cbd5e1;
+      line-height: 1.5;
+    }
+  </style>
 
 </head>
 
 <body>
-<header class="sspi-header"><div class="sspi-brand"><img class="sspi-logo" src="sspi-logo.png" alt="SSPI" /><span>Web Launcher</span></div><span class="sspi-header-note">PlayStation 5</span></header>
   <main>
-    <div class="sspi-eyebrow">Setup</div>
-    <h1>Install your launcher.</h1>
-    <p class="sspi-description">Set up the launcher on your PS5 home screen.</p>
-    <p id="status" role="status" aria-live="polite">Loading&hellip;</p>
+    <img class="logo" src="/logo.svg" alt="WebKit Autoloader" />
+    <h1>WebKit Autoloader Installer</h1>
+    <p id="status">Loading&hellip;</p>
     <p id="detail"></p>
-    <a id="openManager" class="btn primary" href="http://127.0.0.1:8084/" style="display:inline-block;text-decoration:none;margin-top:20px" hidden>Open Payload Manager</a>
+    <a id="openManager" href="http://127.0.0.1:8084/" hidden>Open Payload Manager</a>
 
     <div id="choiceContainer" hidden>
       <div class="choice-grid">
@@ -64,7 +356,7 @@ main{max-width:980px}#status{color:#ededed;font-size:22px;font-weight:500;margin
 
   </main>
 
-  <!-- Upstream: WebKit Autoloader by PLK. Original LICENSE retained in distribution. -->
+  <footer id="footer">WebKit Autoloader Installer v[[VERSION_PLACEHOLDER]] by PLK (built [[BUILD_TIME_PLACEHOLDER]])<br />This project is free and open source: github.com/itsPLK/ps5-webkit-autoloader</footer>
 
   <script>
     (function () {
@@ -76,6 +368,8 @@ main{max-width:980px}#status{color:#ededed;font-size:22px;font-weight:500;margin
         return { str: m[1], num: parseFloat(m[1]) };
       }
 
+      var detectedConsole = detectFirmware();
+      if (document.getElementById('consoleTag')) document.getElementById('consoleTag').textContent = detectedConsole ? 'PS5 / ' + detectedConsole.str : 'Browser / firmware unavailable';
       var statusEl = document.getElementById('status');
       var detailEl = document.getElementById('detail');
       var choiceContainer = document.getElementById('choiceContainer');
@@ -135,6 +429,12 @@ main{max-width:980px}#status{color:#ededed;font-size:22px;font-weight:500;margin
       var hasRelapse = isRelapseSupported(fwNum, fwStr);
       var isUnsupported = fwNum > 0 && !hasUmtx2 && !hasPoops && !hasRelapse;
       var isDualSupported = (hasPoops && hasRelapse) || (!fw && !fwParam);
+      // Match the autoloader's firmware default without stopping automatic setup.
+      if (!chosenExploit && fwNum > 0 && !isUnsupported) {
+        var savedExploit = '';
+        try { savedExploit = localStorage.getItem('wkal_exploit') || ''; } catch (e) { }
+        chosenExploit = hasUmtx2 ? 'umtx2' : hasPoops && savedExploit === 'poops' ? 'poops' : hasRelapse ? 'relapse' : 'poops';
+      }
       var needsChoice = isDualSupported && !chosenExploit;
 
       function chooseExploit(choice) {
@@ -224,7 +524,7 @@ main{max-width:980px}#status{color:#ededed;font-size:22px;font-weight:500;margin
       }
 
       function setInstalled() {
-        statusEl.textContent = 'Launcher installed';
+        statusEl.textContent = 'SSPI installed';
         statusEl.style.color = '#97c4a2';
         progressBar.style.background = '-webkit-linear-gradient(90deg, #16a34a 0%, #22c55e 100%)';
         detailEl.textContent = 'Setup saved. Starting Payload Manager and checking the ELF loader…';
@@ -255,12 +555,12 @@ main{max-width:980px}#status{color:#ededed;font-size:22px;font-weight:500;margin
               loaderState = loader && loader.ready === true && loader.state === 'listening' && loader.port === 9021 && loader.scope === 'network' && loader.evidence === 'listener-and-process' ? 'listening' : 'unknown';
               if (managerReady) {
                 statusEl.textContent = 'Payload Manager ready';
-                document.getElementById('openManager').hidden = false;
+                if (document.getElementById('openManager')) document.getElementById('openManager').hidden = false;
                 detailEl.textContent = loaderState === 'listening' ? 'ELF loader is listening on port 9021. Payload Manager opens according to your saved browser setting.' : 'Payload Manager is running. ELF loader status is unavailable. Your saved browser setting is preserved.';
               }
               if (managerReady && loaderState === 'listening') return;
               if (Date.now() < deadline) { setTimeout(poll, 1500); return; }
-              if (!managerReady) detailEl.textContent = 'The launcher is saved on your home screen. Service readiness could not be confirmed; check the launcher activity before retrying.';
+              if (!managerReady) detailEl.textContent = 'SSPI is saved on your home screen. Service readiness could not be confirmed; check the activity before retrying.';
             });
           });
         }
@@ -590,35 +890,6 @@ main{max-width:980px}#status{color:#ededed;font-size:22px;font-weight:500;margin
           maybeInstall();
         });
       }
-    })();
-  </script>
-
-  <script>
-    (function () {
-      function controls() {
-        var dialog = document.getElementById('cacheCorruptOverlay');
-        return Array.prototype.filter.call((dialog || document).querySelectorAll('button:not(:disabled),a[href]'), function (el) { return el.getClientRects().length > 0; });
-      }
-      document.addEventListener('keydown', function (event) {
-        var key = event.key || event.keyCode;
-        var backward = key === 'ArrowLeft' || key === 'ArrowUp' || key === 37 || key === 38;
-        var forward = key === 'ArrowRight' || key === 'ArrowDown' || key === 39 || key === 40;
-        var dialog = document.getElementById('cacheCorruptOverlay');
-        if (!backward && !forward && !(dialog && key === 'Tab')) return;
-        var list = controls();
-        if (!list.length) return;
-        event.preventDefault();
-        var index = list.indexOf(document.activeElement);
-        var step = backward || (key === 'Tab' && event.shiftKey) ? -1 : 1;
-        list[(index + step + list.length) % list.length].focus();
-      });
-      new MutationObserver(function () {
-        var dialog = document.getElementById('cacheCorruptOverlay');
-        if (dialog && !dialog.contains(document.activeElement)) {
-          var list = controls();
-          if (list.length) list[list.length - 1].focus();
-        }
-      }).observe(document.body, { childList: true });
     })();
   </script>
 </body>

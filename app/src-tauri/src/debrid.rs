@@ -419,6 +419,7 @@ pub(super) async fn resolve(
     settings: &Settings,
     url: &str,
     preferred: Option<&str>,
+    progress: &(dyn Fn(Option<PreparationProgress>) + Send + Sync),
 ) -> Result<(String, Option<String>, Option<u64>), String> {
     if !http_url(url) {
         return Err("Invalid provider link".into());
@@ -450,10 +451,11 @@ pub(super) async fn resolve(
     });
     let mut errors = Vec::new();
     for candidate in candidates {
+        progress(None);
         let provider = candidate.provider.as_str();
         let key = token(provider, None)?;
         let result = match provider {
-            "torbox" => torbox(http, &key, url).await,
+            "torbox" => torbox(http, &key, url, progress).await,
             "alldebrid" => alldebrid(http, &key, url).await,
             _ => super::unrestrict_hoster(http, url)
                 .await
@@ -512,6 +514,49 @@ fn remember(key: String, id: String) {
 fn id(value: &Value) -> Option<String> {
     number(value).map(|number| number.to_string())
 }
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PreparationProgress {
+    pub provider: String,
+    pub state: String,
+    pub progress: Option<f64>,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub speed_bps: f64,
+    pub eta_seconds: Option<u64>,
+}
+
+fn positive_number(value: &Value) -> Option<f64> {
+    value.as_f64().or_else(|| value.as_str()?.parse().ok())
+        .filter(|n| n.is_finite() && *n >= 0.)
+}
+
+fn torbox_progress(job: &Value) -> PreparationProgress {
+    let state = job["download_state"].as_str().unwrap_or("").to_ascii_lowercase();
+    let progress = positive_number(&job["progress"])
+        .filter(|v| *v <= 1. && !matches!(state.as_str(), "queued" | "pending"));
+    let total = positive_number(&job["size"]).unwrap_or(0.) as u64;
+    let done = positive_number(&job["total_downloaded"])
+        .unwrap_or_else(|| progress.unwrap_or(0.) * total as f64) as u64;
+    let downloading = state == "downloading";
+    PreparationProgress {
+        provider: "TorBox".into(),
+        state: match state.as_str() {
+            "downloading" => "Downloading to TorBox",
+            "queued" | "pending" => "Queued on TorBox",
+            "paused" | "stalled" => "Waiting on TorBox",
+            "completed" | "cached" | "finished" => "Preparing download link",
+            "processing" | "checking" => "Processing on TorBox",
+            _ => "Preparing on TorBox",
+        }.into(),
+        progress,
+        bytes_done: if total > 0 { done.min(total) } else { done },
+        bytes_total: total,
+        speed_bps: if downloading { positive_number(&job["download_speed"]).unwrap_or(0.) } else { 0. },
+        eta_seconds: if downloading { positive_number(&job["eta"]).filter(|v| *v > 0.).map(|v| v.ceil() as u64) } else { None },
+    }
+}
+
 fn ready_file(job: &Value) -> Result<Option<&Value>, ApiError> {
     let Some(files) = job["files"].as_array() else {
         return Ok(None);
@@ -521,7 +566,8 @@ fn ready_file(job: &Value) -> Result<Option<&Value>, ApiError> {
             "TorBox returned multiple files; select one package or archive volume",
         ));
     }
-    if job["download_finished"] != true && job["download_present"] != true {
+    if job["download_present"] != true
+        || (job["download_finished"] != true && job["download_state"] != "cached") {
         return Ok(None);
     }
     match files.first() {
@@ -554,6 +600,7 @@ async fn torbox(
     http: &Client,
     key: &str,
     url: &str,
+    progress: &(dyn Fn(Option<PreparationProgress>) + Send + Sync),
 ) -> Result<(String, Option<String>, Option<u64>), ApiError> {
     let cache_key = super::sha256_hex(format!("torbox\n{key}\n{url}").as_bytes());
     let gate = CREATE_GATE.get_or_init(Default::default).lock().await;
@@ -580,7 +627,7 @@ async fn torbox(
         }
     };
     drop(gate);
-    let deadline = Instant::now() + Duration::from_secs(600);
+    let deadline = Instant::now() + Duration::from_secs(6 * 3600);
     while Instant::now() < deadline {
         let response = request(
             "torbox",
@@ -590,6 +637,7 @@ async fn torbox(
         )
         .await?;
         let job = find_job(&response["data"], &download.id)?;
+        progress(Some(torbox_progress(job)));
         if let Some(file) = ready_file(job)? {
             let file_id = id(&file["id"]).unwrap();
             let link = request(
@@ -756,9 +804,29 @@ mod tests {
         assert!(
             ready_file(&json!({"files":[{"id":0},{"id":1}],"download_finished":true})).is_err()
         );
-        let data = json!([{"id":9,"files":[{"id":0}],"download_finished":true}]);
+        let data = json!([{"id":9,"files":[{"id":0}],"download_finished":true,"download_present":true}]);
         assert!(ready_file(find_job(&data, "9").unwrap()).unwrap().is_some());
         assert!(find_job(&data, "8").is_err());
+        assert!(ready_file(&json!({"files":[{"id":0}],"download_present":true,"download_finished":false})).unwrap().is_none());
+        assert!(ready_file(&json!({"files":[{"id":0}],"download_present":true,"download_state":"cached"})).unwrap().is_some());
+    }
+    #[test]
+    fn torbox_preparation_reports_remote_metrics_and_unknowns() {
+        let p = torbox_progress(&json!({"download_state":"downloading", "progress":0.05,
+            "size":1_000_000_000, "download_speed":799_000, "eta":1620}));
+        assert_eq!(p.state, "Downloading to TorBox");
+        assert_eq!(p.progress, Some(0.05));
+        assert_eq!(p.bytes_done, 50_000_000);
+        assert_eq!(p.speed_bps, 799_000.);
+        assert_eq!(p.eta_seconds, Some(1620));
+        let queued = torbox_progress(&json!({"download_state":"queued", "progress":null, "download_speed":42, "eta":20}));
+        assert_eq!(queued.progress, None);
+        assert_eq!(queued.speed_bps, 0.);
+        assert_eq!(queued.eta_seconds, None);
+        let malformed = torbox_progress(&json!({"download_state":"downloading", "progress":50, "size":-1, "download_speed":"NaN", "eta":-1}));
+        assert_eq!(malformed.progress, None);
+        assert_eq!(malformed.bytes_total, 0);
+        assert_eq!(malformed.speed_bps, 0.);
     }
     #[test]
     fn auth_and_quota_errors_do_not_trigger_host_fallback() {

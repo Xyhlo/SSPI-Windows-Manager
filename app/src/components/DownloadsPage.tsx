@@ -8,7 +8,7 @@ import { invoke } from "@tauri-apps/api/core"
 import { open as openDialog } from "@tauri-apps/plugin-dialog"
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { CaseAnchor } from "./CaseAnchor"
-import { ActionBubbleMenu } from "./ActionBubbleMenu"
+import { ActionMenu } from "./ActionMenu"
 import { Collapse } from "./Collapse"
 import { DoctorReportView } from "./DoctorReportView"
 import { ImportDialog, type ManualRow } from "./Dialogs"
@@ -19,7 +19,7 @@ import type { OptionsTab } from "./OptionsOverlay"
 import { SpeedChart } from "./SpeedChart"
 import { toast } from "./toasts"
 import type { CardSize, CardStyle } from "@/lib/appearance"
-import { consoleAddress, jobTarget, sendBlockReason } from "@/lib/consoles"
+import { consoleAddress, jobTarget, packageTitle, sendBlockReason } from "@/lib/consoles"
 import {
   activeTransfer, errorContext, groupDownloads, honestPercent, kindLabel, kindOf, phaseDetail, phaseState, stageLabel,
   stagingLocations, systemDriveWarning, transferPhases, transferStats, UploadTracker, type DownloadGroup, type UploadState,
@@ -30,7 +30,7 @@ import { activeStage, engineRate, fmtClock, fmtDuration, packEngine, packHeadlin
 import { setPageKeys } from "@/lib/keys"
 import { clamp, glide } from "@/lib/motion"
 import { speedNow, speedSamples } from "@/lib/speed"
-import { coverTint } from "@/stage/art"
+import { blurredArt, coverTint } from "@/stage/art"
 import { getStage } from "@/stage/stage"
 import type { ConsoleKind, DeliveryJob, LocalPackage, ManualCandidate, ManualItem, PackEngine, Settings } from "@/types"
 
@@ -94,6 +94,7 @@ function barPercent(job: DeliveryJob, upload?: UploadState | null) {
 
 function barIndeterminate(job: DeliveryJob) {
   const active = activeTransfer(job)
+  if (job.stage === "unlocking" && job.providerPreparation) return !job.paused && job.providerPreparation.progress == null
   if (job.stage === "queued" || /^waiting for another extraction/i.test(job.message || "")) return false
   if (job.stage === "packaging") return !job.paused && active && stageProgress(job.packaging) == null
   if (phaseDetail(job).indeterminate) return !job.paused && active
@@ -416,7 +417,7 @@ export function DownloadsPage(props: Props) {
         </div>
         {!demo && (
           <div className="dl-tools">
-            <ActionBubbleMenu label="Add to downloads" actions={[
+            <ActionMenu label="Add to downloads" trigger={{ icon: "plus", text: "Add" }} actions={[
               { id: "file", label: "Import file", icon: "box", description: "Import a PKG, ZIP or RAR", onSelect: () => choose(false) },
               { id: "scan", label: "Scan folder", icon: "library", description: "Scan a folder for packages", onSelect: () => choose(true) },
               { id: "folders", label: "Add game folders", icon: "folder", description: "Package game folders", busy: manualBusy, onSelect: addFolders },
@@ -484,6 +485,7 @@ function Card({ group, index, open, onToggle, job, setCurrent, drawer, setDrawer
   actions: ReturnType<typeof useJobActions> | null; cancelArmed: boolean; onCancel: () => void; onRetryJob: (jobId: string) => Promise<void>
 }) {
   const cardRef = useRef<HTMLElement>(null)
+  const [posterUrl, setPosterUrl] = useState<string>()
   const primary = group.primary
   const headActions = useJobActions({ job: primary, demo, onPause: async (id, paused) => { await invoke("pause_job", { jobId: id, paused }) }, onCancel: async id => { await invoke("cancel_job", { jobId: id }) }, onRetry: async id => { await invoke("retry_job", { jobId: id }) } })
   const upload = trackUpload(job)
@@ -507,15 +509,23 @@ function Card({ group, index, open, onToggle, job, setCurrent, drawer, setDrawer
   useLayoutEffect(() => {
     const stage = getStage(), el = cardRef.current
     if (!stage || !el) return
-    stage.surfaces.register(el, cover)
+    stage.surfaces.register(el, cover, cardStyle === "poster")
     return () => stage.surfaces.unregister(el)
-  }, [group.icon, group.title])
+  }, [group.icon, group.title, cardStyle])
+
+  useEffect(() => {
+    setPosterUrl(undefined)
+    if (cardStyle !== "poster" || getStage()) return
+    let live = true
+    void blurredArt(cover, true).then(canvas => { if (live) setPosterUrl(canvas.toDataURL("image/webp", .9)) }).catch(() => undefined)
+    return () => { live = false }
+  }, [group.icon, group.title, cardStyle])
 
   return (
     <article
       ref={cardRef} className={`dcard ${open ? "is-open" : ""} ${hasAttention ? "attn" : ""} ${cardStyle} ${cardSize} enter`}
-      style={{ animationDelay: `${Math.min(index, 10) * 30}ms`, ["--art" as string]: cardStyle === "art" && group.icon?.startsWith("data:image/") && !group.icon.startsWith("data:image/svg") ? `url("${group.icon}")` : undefined }}
-      data-group={group.key} data-art-level={open ? 1 : 0} data-banner={cardStyle === "art" ? 1 : 0}
+      style={{ animationDelay: `${Math.min(index, 10) * 30}ms`, ["--art" as string]: cardStyle === "poster" && posterUrl ? `url("${posterUrl}")` : cardStyle === "art" && group.icon?.startsWith("data:image/") && !group.icon.startsWith("data:image/svg") ? `url("${group.icon}")` : undefined }}
+      data-group={group.key} data-art-level={open ? 1 : 0} data-banner={cardStyle !== "plain" ? 1 : 0}
     >
       <button type="button" className="dhead" aria-expanded={open} aria-label={`${group.title}, ${stageLabel(job)}${showPct ? `, ${pct}%` : ""}`} data-hover-case onClick={onToggle} onContextMenu={event => void headActions.contextMenu(event)} onKeyDown={headActions.onKeyDown}>
         <CaseAnchor spec={{ key: (group.titleId || group.key).toUpperCase(), cover: group.icon, title: group.title, titleId: group.titleId, kind: "download" }} className="dcase" />
@@ -551,7 +561,7 @@ function Drawer({ group, job, setCurrent, drawer, setDrawer, statsForNerds, setS
 }) {
   const tabsRef = useRef<HTMLDivElement>(null)
   const inkRef = useRef<HTMLSpanElement>(null)
-  const showPackaging = !!(settings.packageDumps || job.packaging || job.stageHistory?.includes("packaging"))
+  const showPackaging = !!(packageTitle(settings, job.titleId || "") || job.packaging || job.stageHistory?.includes("packaging"))
   const phases = transferPhases.map((name, index) => ({ name, index })).filter(({ name, index }) => !(name === "Package" && !showPackaging) && !(job.packageOnly && index > 2))
   const errors = group.jobs.filter(item => errorContext(item) || (item.space && !item.space.enough))
   const fileCount = (job.components || []).reduce((sum, component) => sum + component.parts.length, 0) + (job.packaging?.outputPath ? 1 : 0)

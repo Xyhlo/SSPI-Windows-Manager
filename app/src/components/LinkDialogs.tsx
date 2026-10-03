@@ -105,7 +105,7 @@ export function PasteLinksDialog({ open, onClose }: { open: boolean; onClose: ()
     catch { setError("The clipboard couldn't be read. Paste into the box instead (Ctrl+V).") }
   }
   const start = async () => {
-    if (chosen.some(item => item.titleId && !/^(CUSA|PPSA)\d{5}$/.test(item.titleId))) { setError("Title IDs look like CUSA01234 or PPSA01234."); return }
+    if (chosen.some(item => item.titleId && !/^(CUSA|PPSA|SLUS|SLES|SCUS|SCES|SLPS|SLPM|SCPS|SCAJ|SLAJ|SLKA|SLKS|SCKA)\d{5}$/.test(item.titleId))) { setError("Title IDs look like CUSA01234, PPSA01234, or SLUS01234."); return }
     setBusy(true); setError("")
     try { await queue(chosen, asSet); onClose() } catch (err) { setError(errorText(err)) } finally { setBusy(false) }
   }

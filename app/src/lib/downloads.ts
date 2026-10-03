@@ -28,7 +28,7 @@ export function kindOf(job: DeliveryJob) {
 }
 
 export function titleIdOf(job: DeliveryJob) {
-  return `${job.titleId || ""} ${job.packageLabel || ""} ${job.title || ""} ${job.message}`.match(/\b(?:CUSA|PPSA)\d{5}\b/i)?.[0].toUpperCase()
+  return `${job.titleId || ""} ${job.packageLabel || ""} ${job.title || ""} ${job.message}`.match(/\b(?:CUSA|PPSA|SLUS|SLES|SCUS|SCES|SLPS|SLPM|SCPS|SCAJ|SLAJ|SLKA|SLKS|SCKA)\d{5}\b/i)?.[0].toUpperCase()
 }
 
 export const kindLabel = (kind: string) => ({base: "Base package", combined: "Base + backport", update: "Game update", dlc: "DLC", backport: "Backport", batch: "Manual batch"}[kind] || "Package")
@@ -46,6 +46,7 @@ export function jobControls(job: Pick<DeliveryJob, "stage" | "retryable">) {
 
 export function stageLabel(job: DeliveryJob) {
   if (job.paused) return "Paused"
+  if (job.stage === "unlocking" && job.providerPreparation) return `Preparing on ${job.providerPreparation.provider}`
   if (job.target === "ps4") {
     return ({
       uploading: "Sending to PS4",
@@ -62,6 +63,7 @@ export function stageLabel(job: DeliveryJob) {
 
 export function transferPercent(job: DeliveryJob) {
   if (["complete", "delivered"].includes(job.stage)) return 100
+  if (job.stage === "unlocking" && job.providerPreparation) return Math.round(Math.max(0, Math.min(1, job.providerPreparation.progress ?? 0)) * 100)
   const progress = Number.isFinite(job.progress) ? Math.max(0, job.progress) * 100 : 0
   const bytes = job.bytesTotal && job.bytesTotal > 0 ? Math.max(0, job.bytesDone || 0) / job.bytesTotal * 100 : null
   return Math.round(Math.max(0, Math.min(99, bytes == null ? progress : progress > 0 ? Math.min(bytes, progress) : bytes)))
@@ -109,6 +111,15 @@ export function transferSize(bytes: number) {
 }
 
 export function transferStats(job: DeliveryJob, upload?: UploadState | null) {
+  const preparation = job.stage === "unlocking" ? job.providerPreparation : null
+  if (preparation) {
+    const rate = preparation.speedBps
+    return {
+      label: preparation.bytesTotal > 0 ? `${transferSize(preparation.bytesDone)} / ${transferSize(preparation.bytesTotal)} on ${preparation.provider}` : preparation.state,
+      speedBps: !job.paused && Number.isFinite(rate) && rate > 0 ? rate : null,
+      etaSeconds: !job.paused && preparation.etaSeconds != null && preparation.etaSeconds > 0 ? preparation.etaSeconds : null,
+    }
+  }
   const detail = phaseDetail(job)
   const tracked = job.stage === "uploading" ? upload : null
   const done = tracked ? tracked.bytesDone : job.bytesDone || 0
@@ -232,7 +243,7 @@ export function retainJobPaths(prev: JobPaths | undefined, next: JobPaths): JobP
 
 export type WorkPhase = "inspection" | "extraction" | "finalization" | "packaging" | "cleanup" | "staging" | "upload" | "unknown"
 
-type JobSnapshot = Pick<DeliveryJob, "stage" | "progress" | "bytesDone" | "bytesTotal" | "message" | "packageLabel"> & { stageHistory?: string[]; packaging?: { format?: string } | null }
+type JobSnapshot = Pick<DeliveryJob, "stage" | "progress" | "bytesDone" | "bytesTotal" | "message" | "packageLabel" | "providerPreparation"> & { stageHistory?: string[]; packaging?: { format?: string } | null }
 
 /** Recovers the failing phase from a tagged backend error ("extraction/inspection: …", "cleanup: …"); "unknown" for untagged errors rather than guessing. */
 export function errorWorkPhase(message: string): WorkPhase {
@@ -303,6 +314,10 @@ export type PhaseDetail =
 
 /** Explicit pipeline phase for a job snapshot: inspection → extraction → finalization → cleanup/staging/upload. Unknown totals report counts + indeterminate progress. */
 export function phaseDetail(job: JobSnapshot): PhaseDetail {
+  if (job.stage === "unlocking") {
+    const preparation = job.providerPreparation
+    return { phase: "staging", label: preparation?.state || "Preparing link", indeterminate: preparation?.progress == null }
+  }
   if (job.stage === "extracting") {
     if (/^waiting for another extraction/i.test(job.message || "")) {
       return { phase: "extraction", label: "Waiting for another extraction on this drive", indeterminate: false }

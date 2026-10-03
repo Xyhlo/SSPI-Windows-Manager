@@ -15,7 +15,7 @@ import type { ConsoleProbe } from "@/lib/console-types"
 import { compareVersions, errorText, plural } from "@/lib/format"
 import { portraitFromIcon } from "@/lib/image"
 import { isTyping, setPageKeys } from "@/lib/keys"
-import { installedVersion, type LibraryEntry } from "@/lib/library"
+import { installedVersion, shelfLayout, type LibraryEntry } from "@/lib/library"
 import { Spring, SPRINGS, clamp, motionOK, onFrame } from "@/lib/motion"
 import { packageKind, packageVersion } from "@/lib/package-selection"
 import { compatibleProviders, directCandidate, type ProviderHosts } from "@/lib/providers"
@@ -155,12 +155,13 @@ export function LibraryPage(props: Props) {
     const strip = stripRef.current, lib = libRef.current
     if (!strip || !lib) return
     const { index, expanded, count } = live.current
-    const gap = expanded ? 22 : 28
-    const width = strip.clientWidth - 24
+    const width = Math.max(1, strip.clientWidth - 24)
+    const shelf = shelfLayout(width, strip.clientHeight, count, CASE_ASPECT)
+    const gap = expanded ? 22 : shelf.gap
     const caseW = expanded
       ? clamp((width + gap) / Math.max(2, Math.round((width + gap) / (148 + gap))) - gap, 112, 168)
-      : clamp((strip.clientHeight - 24 - 58) / CASE_ASPECT, 104, 208)
-    const cols = clamp(Math.floor((width + gap) / (caseW + gap)), 2, 14)
+      : shelf.caseW
+    const cols = expanded ? Math.max(1, Math.min(count, Math.floor((width + gap) / (caseW + gap)))) : shelf.cols
     layout.current.cols = cols
     layout.current.caseW = caseW
     lib.style.setProperty("--case-w", `${caseW.toFixed(1)}px`)
@@ -173,7 +174,7 @@ export function LibraryPage(props: Props) {
     else if (mode === "reveal" && index > first + cols - 1) first = index - (cols - 1)
     first = clamp(first, 0, Math.max(0, count - cols))
     layout.current.first = first
-    const targetX = -first * (caseW + gap)
+    const targetX = shelf.offset - Math.min(shelf.overflow, first * (caseW + gap))
     layout.current.x.set(targetX)
     if (instant || !motionOK()) layout.current.x.snap(targetX)
   }
@@ -189,7 +190,7 @@ export function LibraryPage(props: Props) {
       track.style.transform = `translate3d(${layout.current.x.step(dt)}px, 0, 0)`
     })
     return () => { observer.disconnect(); stop() }
-  }, [expanded])
+  }, [expanded, library.length])
 
   // The mouse wheel scrolls the row a case at a time without changing the selection.
   const wheel = useRef(0)
