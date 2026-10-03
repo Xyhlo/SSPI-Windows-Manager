@@ -6,16 +6,17 @@
    ===================================================================== */
 import { invoke } from "@tauri-apps/api/core"
 import { open as openDialog } from "@tauri-apps/plugin-dialog"
-import { useEffect, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from "react"
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from "react"
 import { DoctorReportView } from "./DoctorReportView"
 import { UpdatePanel } from "./Updater"
 import { CheckDraw, ConsoleGlyph, Icon } from "./Icon"
 import { Field, Row, Seg, Switch } from "./Controls"
 import { toast } from "./toasts"
-import { ACCENTS, DEFAULT_APPEARANCE, PATTERNS, type Appearance } from "@/lib/appearance"
+import { ACCENTS, DEFAULT_APPEARANCE, PATTERNS, accentColor, type Appearance } from "@/lib/appearance"
 import { discoverConsoles } from "@/lib/console-api"
+import { installCommunitySource, listCommunitySources, type CommunitySource, type CommunitySources } from "@/lib/community-sources"
 import { displayText } from "@/lib/display"
-import { errorText } from "@/lib/format"
+import { errorText, fmtBytes } from "@/lib/format"
 import { FPKG_LEVELS, FPKG_PRESETS, levelName, presetOf, type FpkgPreset } from "@/lib/fpkg-presets"
 import { glide } from "@/lib/motion"
 import { patternPreview } from "@/stage/art"
@@ -315,6 +316,8 @@ export function OptionsOverlay(props: Props) {
       <p className="opt-note">{draft.ps4Transport === "receiver" ? "Needs GoldHEN 2.4b18.5 or newer with BinLoader on." : "Needs GoldHEN's FTP server."}</p>
     </>,
     sources: <>
+      <CommunitySourceList sources={sources} setSources={setSources} demo={demo} disabled={disabled} busy={busy} setBusy={setBusy} />
+      <div className="opt-section">Add a source</div>
       <div className="orows">
         <Row label="Install from a URL">
           <Field label="Source URL" value={sourceUrl} onChange={setSourceUrl} placeholder="https://…/source.gssource" icon="link" width={280} />
@@ -440,7 +443,7 @@ export function OptionsOverlay(props: Props) {
       {doctor && <div className="opt-msg"><DoctorReportView report={doctor} /></div>}
     </>,
     appearance: <AppearanceSection appearance={appearance} setAppearance={setAppearance} reduceMotion={draft.reduceMotion} setReduceMotion={value => patch({ reduceMotion: value })} />,
-    updates: <UpdatePanel disabled={demo} />,
+    updates: <UpdatePanel demo={demo} />,
   }
 
   return (
@@ -481,8 +484,97 @@ export function OptionsOverlay(props: Props) {
   )
 }
 
+function CommunitySourceList({ sources, setSources, demo, disabled, busy, setBusy }: { sources: PackageSource[]; setSources: Props["setSources"]; demo: boolean; disabled: boolean; busy: string; setBusy: (value: string) => void }) {
+  const [catalog, setCatalog] = useState<CommunitySources | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState("")
+  const active = useRef(false)
+  const request = useRef(0)
+  const installing = useRef(false)
+  const available = demo || !disabled
+
+  const refresh = useCallback(async () => {
+    if (!available) return
+    const current = ++request.current
+    setLoading(true)
+    setError("")
+    try {
+      const result = await listCommunitySources(demo)
+      if (active.current && current === request.current) setCatalog(result)
+    } catch (reason) {
+      if (active.current && current === request.current) setError(errorText(reason))
+    } finally {
+      if (active.current && current === request.current) setLoading(false)
+    }
+  }, [available, demo])
+
+  useEffect(() => {
+    active.current = true
+    setCatalog(null)
+    void refresh()
+    return () => { active.current = false; request.current++ }
+  }, [refresh])
+
+  const install = async (entry: CommunitySource) => {
+    if (disabled || busy || loading || installing.current) return
+    installing.current = true
+    setBusy(`community-${entry.id}`)
+    setError("")
+    const existing = sources.find(source => source.id === entry.source)
+    try {
+      const result = await installCommunitySource(entry.id)
+      setSources(result)
+      if (active.current) setCatalog(current => current && ({ ...current, entries: current.entries.map(item => item.source === entry.source ? { ...item, installed: item.id === entry.id } : item) }))
+      const installed = result.find(source => source.id === entry.source)
+      toast({ tone: "success", title: `${displayText(entry.name)} ${existing ? "updated" : "installed"}`, text: installed?.enabled ? "Search now includes this source." : "The source is installed and remains disabled." })
+    } catch (reason) {
+      const message = `${displayText(entry.name)}: ${errorText(reason)}`
+      if (active.current) setError(message)
+      toast({ tone: "error", title: "The source couldn't be installed", text: message })
+    } finally {
+      installing.current = false
+      setBusy("")
+    }
+  }
+
+  return <section aria-label="Community sources">
+    <div className="opt-section"><Icon name="globe" />Community sources
+      <button type="button" className="btn ghost sm" style={{ marginLeft: "auto" }} disabled={loading || !!busy || !available} onClick={() => void refresh()}>{loading ? <span className="spinner" /> : <Icon name="refresh" />}{loading ? "Loading…" : "Refresh"}</button>
+    </div>
+    {catalog?.warning && <p className="opt-msg" role="status">{catalog.warning}</p>}
+    {error && <p className="opt-msg" role="alert">{error}</p>}
+    {!available && <p className="opt-note">Open the installed SSPI app to browse community sources.</p>}
+    {loading && !catalog && <p className="opt-note" role="status">Loading the community directory…</p>}
+    {catalog && !catalog.entries.length && !loading && !error && <p className="opt-note">No community sources are available.</p>}
+    {!!catalog?.entries.length && <div className="orows" aria-busy={loading}>
+      {catalog.entries.map(entry => {
+        const installed = sources.find(source => source.id === entry.source)
+        const current = !!installed && entry.installed
+        const pending = busy === `community-${entry.id}`
+        const metadata = [...entry.tags, entry.revision ? `Revision ${entry.revision}` : "", entry.date, entry.size ? fmtBytes(entry.size) : ""].filter(Boolean).join(" · ")
+        return <div key={entry.id} className="orow">
+          <div className="source-row">
+            <span className="src-ico"><Icon name="library" /></span>
+            <div className="ol">
+              <strong>{displayText(entry.name)}</strong>
+              {entry.description && <span>{entry.description}</span>}
+              {metadata && <span>{metadata}</span>}
+              {installed && <span className={installed.enabled ? "good" : ""}>Installed{installed.version ? ` · ${installed.version}` : ""}{installed.enabled ? " · Enabled" : " · Disabled"}</span>}
+            </div>
+          </div>
+          <div className="or"><button type="button" className="btn sm" disabled={disabled || !!busy || loading || current} onClick={() => void install(entry)} aria-label={`${current ? "Installed" : installed ? "Update" : "Install"} ${displayText(entry.name)}`}>
+            {pending ? <span className="spinner" /> : <Icon name={current ? "check" : installed ? "refresh" : "download"} />}{pending ? installed ? "Updating…" : "Installing…" : current ? "Installed" : installed ? "Update" : "Install"}
+          </button></div>
+        </div>
+      })}
+    </div>}
+  </section>
+}
+
 function AppearanceSection({ appearance, setAppearance, reduceMotion, setReduceMotion }: { appearance: Appearance; setAppearance: Props["setAppearance"]; reduceMotion: boolean; setReduceMotion: (value: boolean) => void }) {
   const tilesRef = useRef<HTMLDivElement>(null)
+  const [customAccent, setCustomAccent] = useState(appearance.accent)
+  useEffect(() => { setCustomAccent(appearance.accent) }, [appearance.accent])
   useEffect(() => {
     tilesRef.current?.querySelectorAll<HTMLCanvasElement>("canvas[data-pattern]").forEach(canvas => patternPreview(canvas.dataset.pattern || "solid", appearance.accent, canvas))
   }, [appearance.accent])
@@ -503,6 +595,14 @@ function AppearanceSection({ appearance, setAppearance, reduceMotion, setReduceM
         </button>
       ))}
     </div>
+    <div className="accent-picker">
+      <label className="accent-custom"><input type="color" aria-label="Choose custom accent" value={appearance.accent} onChange={event => setAppearance(prev => ({ ...prev, accent: event.target.value.toUpperCase() }))} /><span>Custom colour</span></label>
+      <label className="accent-hex"><span>Hex</span><input aria-label="Accent hex colour" value={customAccent} maxLength={7} spellCheck={false} placeholder="#E4E4E1" aria-invalid={!accentColor(customAccent)} onChange={event => {
+        setCustomAccent(event.target.value)
+        const accent = accentColor(event.target.value)
+        if (accent) setAppearance(prev => ({ ...prev, accent }))
+      }} onBlur={() => setCustomAccent(appearance.accent)} onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur() }} /></label>
+    </div>
     <div className="opt-section">Artwork and motion</div>
     <div className="orows">
       <Row label="Tint with game artwork"><Switch label="Tint with game artwork" checked={appearance.gameTint} onChange={value => setAppearance(prev => ({ ...prev, gameTint: value }))} /></Row>
@@ -514,7 +614,7 @@ function AppearanceSection({ appearance, setAppearance, reduceMotion, setReduceM
     <div className="opt-section">Download cards</div>
     <div className="orows">
       <Row label="Card style">
-        <Seg label="Download card style" value={appearance.cardStyle} options={[["art", "Artwork"], ["plain", "Plain"]]} onChange={cardStyle => setAppearance(prev => ({ ...prev, cardStyle }))} />
+        <Seg label="Download card style" value={appearance.cardStyle} options={[["art", "Artwork"], ["poster", "Poster"], ["plain", "Plain"]]} onChange={cardStyle => setAppearance(prev => ({ ...prev, cardStyle }))} />
       </Row>
       <Row label="Card size">
         <Seg label="Download card size" value={appearance.cardSize} options={[["large", "Large"], ["compact", "Compact"]]} onChange={cardSize => setAppearance(prev => ({ ...prev, cardSize }))} />

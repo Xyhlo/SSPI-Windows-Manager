@@ -138,7 +138,8 @@ body.booting .app > * { opacity: 0; }
 .console-chip .cc-kind { font-weight: 600; font-size: 12.5px; letter-spacing: .02em; }
 .console-chip .cc-addr { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .console-chip .i { width: 13px; height: 13px; color: var(--faint); }
-.console-glyph { width: 20px; height: 20px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round; }
+.console-glyph { display: block; width: 20px; height: 20px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round; }
+.console-glyph-image { object-fit: contain; object-position: center; }
 .console-glyph .lt { fill: currentColor; stroke: none; }
 .console-glyph .dk { fill: #111114; }
 .cc-badge { position: relative; display: inline-grid; place-items: center; width: 20px; height: 20px; margin-left: -2px; color: var(--ink-2); }
@@ -356,7 +357,7 @@ body.booting .app > * { opacity: 0; }
 .library:not(.is-expanded) .lib-strip { display: flex; align-items: center; }
 .lib-track { display: flex; flex: none; gap: var(--lib-gap); align-items: flex-start; will-change: transform; }
 .library.is-expanded .lib-strip { overflow-y: auto; scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.16) transparent; }
-.library.is-expanded .lib-track { display: grid; grid-template-columns: repeat(var(--lib-cols), var(--case-w)); row-gap: 26px; justify-content: space-between; transform: none !important; padding-bottom: 12px; }
+.library.is-expanded .lib-track { display: grid; grid-template-columns: repeat(var(--lib-cols), var(--case-w)); row-gap: 26px; justify-content: center; transform: none !important; padding-bottom: 12px; }
 .lib-card { position: relative; flex: none; width: var(--case-w); display: flex; flex-direction: column; align-items: stretch; min-width: 0; padding: 0; border: 0; background: none; text-align: left; border-radius: 8px; outline-offset: 8px; }
 .lib-card .case-anchor { margin-bottom: 14px; }
 /* The underline and the lifted case mark the selection, the same whether it came from the mouse or the keyboard. */
@@ -604,6 +605,7 @@ body.booting .app > * { opacity: 0; }
 .dcard.large .dbar { height: 4px; }
 /* Without WebGL the banner art is drawn by CSS from the cover (data URLs only). */
 .no-webgl .dcard.art .dhead::before { content: ""; position: absolute; inset: -32px; z-index: -1; background: var(--art, none) center / cover; filter: blur(26px) saturate(1.1) brightness(.4); }
+.no-webgl .dcard.poster .dhead::before { content: ""; position: absolute; inset: 0; z-index: -1; background: linear-gradient(90deg, rgba(0,0,0,.76), rgba(0,0,0,.5)), var(--art, none) center / cover; }
 .ddrawer { overflow: hidden; }
 .ddrawer-inner { margin: 0 22px; padding: 4px 0 18px; border-top: 1px solid var(--line); }
 
@@ -788,15 +790,16 @@ body.booting .app > * { opacity: 0; }
   transform-origin: top right; animation: popIn var(--spring-snappy-ms) var(--spring-snappy);
 }
 @keyframes popIn { from { opacity: 0; transform: translateY(-6px) scale(.97); } to { opacity: 1; transform: none; } }
-.pop-item { display: grid; grid-template-columns: 34px minmax(0, 1fr) 16px; align-items: center; gap: 11px; width: 100%; padding: 8px 10px 8px 8px; border: 0; border-radius: 7px; background: none; text-align: left; }
+.pop-item { display: grid; grid-template-columns: 44px minmax(0, 1fr) 16px; align-items: center; gap: 12px; width: 100%; padding: 10px; border: 0; border-radius: 7px; background: none; text-align: left; }
 .pop-item:hover { background: rgba(255,255,255,.06); }
 .pop-item[aria-checked=true] { background: rgba(255,255,255,.06); }
 .pop-item .ck { opacity: 0; color: var(--ink); }
 .pop-item[aria-checked=true] .ck { opacity: 1; }
 .pop-item strong { display: block; font-size: 13.5px; font-weight: 500; }
-.pop-item span { display: block; font-size: 12px; color: var(--faint); margin-top: 1px; }
-.pop-ico { width: 34px; height: 34px; border-radius: 8px; display: grid; place-items: center; background: rgba(255,255,255,.05); color: var(--ink-2); position: relative; }
-.pop-ico .console-glyph { width: 24px; height: 24px; }
+.pop-item > span:not(.pop-ico) { display: block; min-width: 0; }
+.pop-item > span > span { display: block; font-size: 12px; color: var(--faint); margin-top: 3px; }
+.pop-ico { width: 44px; height: 44px; border-radius: 9px; display: grid; place-items: center; background: rgba(255,255,255,.045); color: var(--ink); position: relative; }
+.pop-ico .console-glyph { width: 32px; height: 32px; }
 .pop-ico .dot { position: absolute; right: -2px; bottom: -2px; box-shadow: 0 0 0 2.5px #161618; }
 .pop-sep { height: 1px; margin: 6px 8px; background: var(--line); }
 .pop-foot { padding: 5px 10px 3px; font-size: 12px; color: var(--faint); }
@@ -913,6 +916,13 @@ body.booting .app > * { opacity: 0; }
 .pattern:hover { border-color: var(--line-3); }
 .pattern:active { transform: scale(.98); }
 .pattern[aria-checked=true] { border-color: rgba(255,255,255,.4); color: var(--ink); }
+.accent-picker { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-top: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
+.accent-custom, .accent-hex { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--ink-2); }
+.accent-custom input[type=color] { appearance: none; width: 36px; height: 32px; padding: 3px; border: 1px solid var(--line-3); border-radius: 7px; background: transparent; cursor: pointer; }
+.accent-custom input::-webkit-color-swatch-wrapper { padding: 0; }
+.accent-custom input::-webkit-color-swatch { border: 0; border-radius: 4px; }
+.accent-hex input { width: 106px; height: 34px; padding: 0 10px; border: 1px solid var(--line-2); border-radius: 7px; background: #0e0e10; color: var(--ink); font-family: inherit; font-size: 13px; font-variant-numeric: tabular-nums; text-transform: uppercase; }
+.accent-hex input[aria-invalid=true] { border-color: var(--fail-ink); }
 .source-row { display: grid; grid-template-columns: 40px minmax(0, 1fr) auto auto; align-items: center; gap: 14px; }
 .src-ico { width: 40px; height: 40px; border-radius: 8px; display: grid; place-items: center; background: rgba(255,255,255,.05); color: var(--ink-2); }
 .signal { display: inline-flex; gap: 2px; align-items: flex-end; height: 13px; }
@@ -938,6 +948,10 @@ body.booting .app > * { opacity: 0; }
 .tl-head .ftab { font-size: 16px; }
 .tl-head > :last-child { margin-left: auto; }
 .tl-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+/* Customize: game icons and PS4 themes share one tab, switched like System's views. */
+.cz { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 16px; }
+.cz-note { min-width: 0; font-size: 12.5px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cz-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 
 /* payloads: one list, rows like search results */
 .pl { flex: 1; min-height: 0; display: flex; flex-direction: column; }
@@ -1075,6 +1089,8 @@ body.booting .app > * { opacity: 0; }
 .kl-line.panic .kl-text { color: #ffb4b6; }
 .kl-line.error .kl-text { color: var(--fail-ink); }
 .kl-line.warning .kl-text { color: var(--warn-ink); }
+.kl-line.is-focus { background: rgba(var(--accent-rgb), .1); box-shadow: inset 3px 0 0 var(--accent); animation: klFocus 1.8s ease-out; }
+@keyframes klFocus { 0%, 30% { background: rgba(var(--accent-rgb), .28); } }
 .kl-empty { padding: 18px; text-align: center; font-family: var(--font); font-size: 13px; color: var(--faint); }
 .kl-skeleton { flex: 1; min-height: 200px; border-radius: 10px; }
 
@@ -1447,6 +1463,8 @@ body.booting .app > * { opacity: 0; }
 .imk-side input[type="color"] { width: 30px; height: 26px; padding: 0; border: 1px solid var(--line-2); border-radius: 6px; background: none; cursor: pointer; }
 .imk-side input[type="range"] { width: 130px; }
 .imk-presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 4px; }
+.imk-side > .btn { width: 100%; }
+.imk-side > .btn.primary { margin-top: 6px; }
 .imk-run { display: grid; gap: 6px; padding: 10px 12px; border: 1px solid var(--line-2); border-radius: 10px; font-size: 12.5px; color: var(--ink-2); }
 .imk-run.good { border-color: rgba(70,167,88,.45); }
 .imk-run.warn { border-color: rgba(214,163,58,.45); }

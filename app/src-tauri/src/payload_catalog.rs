@@ -18,6 +18,7 @@ pub(super) struct CatalogPayload {
     description: String,
     version: String,
     category: String,
+    last_update: String,
     checksum: String,
     installed: bool,
 }
@@ -124,8 +125,9 @@ mod tests {
     use super::*;
     #[test]
     fn upstream_array_and_documented_object_catalogs_work() {
-        let entry = r#"{"name":"FTP Server","filename":"ftpsrv.elf","url":"https://example.test/ftpsrv.elf","version":"v1"}"#;
+        let entry = r#"{"name":"FTP Server","filename":"ftpsrv.elf","url":"https://example.test/ftpsrv.elf","version":"v1","last_update":"2026-10-01","category":"Networking & Servers"}"#;
         assert_eq!(parse_catalog(format!("[{entry}]").as_bytes()).unwrap()[0].version, "v1");
+        assert_eq!(parse_catalog(format!("[{entry}]").as_bytes()).unwrap()[0].last_update, "2026-10-01");
         assert_eq!(parse_catalog(format!("{{\"name\":\"repo\",\"payloads\":[{entry}]}}").as_bytes()).unwrap().len(), 1);
     }
     #[test]

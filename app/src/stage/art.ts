@@ -1,3 +1,4 @@
+import { platformOf as consolePlatform } from "@/lib/consoles"
 /* =====================================================================
    Case artwork for the stage: the PS4/PS5 case shell composited over a
    title's cover, a blurred wash for download cards, the PS4 backdrop
@@ -13,7 +14,7 @@ import { PATTERN_STRENGTH, patternIndex } from "@/lib/appearance"
 export const CASE_ASPECT = 1379 / 1080
 
 export type Platform = "ps4" | "ps5"
-export const platformFor = (titleId?: string): Platform => (/^CUSA/i.test(titleId || "") ? "ps4" : "ps5")
+export const platformFor = (titleId?: string): Platform => (consolePlatform(titleId) ?? "ps5")
 
 export function makeCanvas(width: number, height: number) {
   const canvas = document.createElement("canvas")
@@ -176,11 +177,17 @@ export function caseThumb(spec: CoverSpec): Promise<string> {
 
 const blurCache = new Map<string, Promise<HTMLCanvasElement>>()
 /** A soft, wide crop of the cover for the open download card's surface. */
-export function blurredArt(spec: CoverSpec): Promise<HTMLCanvasElement> {
-  const key = `${spec.cover || ""}|${spec.title}`
+export function blurredArt(spec: CoverSpec, poster = false): Promise<HTMLCanvasElement> {
+  const key = `${spec.cover || ""}|${spec.title}|${poster}`
   let request = blurCache.get(key)
   if (!request) {
-    request = coverImage(spec).then(({ image }) => {
+    request = coverImage(spec).then(async ({ image, rendered }) => {
+      if (poster) {
+        if (rendered) image = await loadImage(await cropBoxedCover(image.src))
+        const canvas = makeCanvas(1280, 720)
+        drawCover(canvas.getContext("2d")!, image, 0, 0, canvas.width, canvas.height)
+        return canvas
+      }
       const canvas = makeCanvas(640, 360), ctx = canvas.getContext("2d")!
       ctx.filter = "blur(18px) saturate(1.2)"
       const iw = image.naturalWidth, ih = image.naturalHeight
@@ -264,6 +271,15 @@ export function patternPreview(id: string, accentHex: string, canvas: HTMLCanvas
       const dx = u - 0.82, dy = v - 0.78, glow = 0.075 * Math.exp(-(dx * dx + dy * dy) * 5)
       const k = (glow + mask[Math.floor(v * 360) * 640 + Math.floor(u * 640)]) * PATTERN_STRENGTH
       r = 9 + red * k; g = 9 + green * k; b = 11 + blue * k
+    } else if (pattern === 9) {
+      let light = 0
+      for (let i = 0; i < 5; i++) {
+        const ridge = .18 + i * .16 + .11 * Math.sin(u * 4.2 + i * .65)
+        const dist = v - ridge
+        light += .06 * Math.exp(-dist * dist * 180) + .07 * Math.exp(-dist * dist * 4200)
+      }
+      const k = light * (.5 + .5 * u) * PATTERN_STRENGTH
+      r = 11 + red * k; g = 11 + green * k; b = 12 + blue * k
     } else if (pattern > 0) {
       const X = u * 640, Y = v * 360, dx = u - 0.82, dy = (v - 0.85) * 0.7, radius = Math.sqrt(dx * dx + dy * dy)
       const glow = Math.exp(-radius * radius * 5.5)

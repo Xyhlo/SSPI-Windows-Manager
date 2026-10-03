@@ -1,3 +1,5 @@
+import ps4Console from "@/assets/console-ps4.png"
+import ps5Console from "@/assets/console-ps5.png"
 /* Stroke icons drawn for the SSPI Windows interface (24 × 24, 1.7 stroke). */
 export const ICONS = {
   search: '<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/>',
@@ -56,6 +58,9 @@ export const ICONS = {
   sparkle: '<path d="M12 4.5c.4 3.6 2.9 6.1 6.5 6.5-3.6.4-6.1 2.9-6.5 6.5-.4-3.6-2.9-6.1-6.5-6.5 3.6-.4 6.1-2.9 6.5-6.5z"/><path d="M18.5 16.5c.1 1 .9 1.8 2 2-1.1.2-1.9 1-2 2-.2-1-1-1.8-2-2 1-.2 1.8-1 2-2z"/>',
   eye: '<path d="M3 12s3.3-6 9-6 9 6 9 6-3.3 6-9 6-9-6-9-6z"/><circle cx="12" cy="12" r="2.6"/>',
   copy: '<rect x="8.5" y="8.5" width="11" height="11" rx="1.8"/><path d="M15.5 8.5V6a1.5 1.5 0 0 0-1.5-1.5H6A1.5 1.5 0 0 0 4.5 6v8A1.5 1.5 0 0 0 6 15.5h2.5"/>',
+  more: '<path d="M6 12h.01M12 12h.01M18 12h.01" stroke-width="2.6"/>',
+  grip: '<path d="M9.5 6.5h.01M14.5 6.5h.01M9.5 12h.01M14.5 12h.01M9.5 17.5h.01M14.5 17.5h.01" stroke-width="2.4"/>',
+  bolt: '<path d="M13 3.5 5.5 13.2h6l-1 7.3 7.5-9.7h-6z"/>',
 } as const
 
 export type IconName = keyof typeof ICONS
@@ -66,27 +71,9 @@ export function Icon({ name, className = "" }: { name: IconName; className?: str
   return <svg className={`i ${className}`} viewBox="0 0 24 24" aria-hidden="true" dangerouslySetInnerHTML={{ __html: ICONS[name] }} />
 }
 
-/** The consoles themselves in two colours: the PS5 standing, tall and slim, its white panels curving out
-    at the top either side of the dark core, and the PS4 as its slanted slab, split top and groove.
-    The light parts use the text colour. */
+/** Console silhouettes adapted from the supplied references. */
 export function ConsoleGlyph({ kind, className = "" }: { kind: "ps4" | "ps5"; className?: string }) {
-  return kind === "ps5" ? (
-    <svg className={`console-glyph ${className}`} viewBox="0 0 24 24" aria-hidden="true">
-      <path className="lt" d="M10.75 4.3C9.75 3.35 8.55 2.8 7 2.55c.35 6.45 1.5 12.75 2.85 18.9h.9z" />
-      <path className="lt" d="M13.25 4.3c1-.95 2.2-1.5 3.75-1.75-.35 6.45-1.5 12.75-2.85 18.9h-.9z" />
-      <rect className="dk" x="10.75" y="3.6" width="2.5" height="17.85" rx=".6" strokeWidth=".9" />
-    </svg>
-  ) : (
-    <svg className={`console-glyph ${className}`} viewBox="0 0 24 24" aria-hidden="true">
-      <g transform="translate(0 .8)">
-        <path className="dk" d="M7.6 6.8h14l-4.8 4.4H2.6z" />
-        <path className="lt" d="M7.6 6.8h4.6l-4.8 4.4H2.6z" />
-        <path className="dk" d="M2.6 11.2h14.2l.9 4.6H3.5z" />
-        <path d="m16.8 11.2 4.8-4.4.8 4.3-4.7 4.7" />
-        <path d="M3.05 13.5h14.2" />
-      </g>
-    </svg>
-  )
+  return <img className={`console-glyph console-glyph-image ${className}`} src={kind === "ps4" ? ps4Console : ps5Console} alt="" aria-hidden="true" draggable={false} />
 }
 
 /** A check that draws itself when it appears. */

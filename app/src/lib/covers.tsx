@@ -1,3 +1,4 @@
+import { platformOf as consolePlatform } from "./consoles"
 import { invoke } from "@tauri-apps/api/core"
 import { useEffect, useState } from "react"
 
@@ -152,7 +153,7 @@ export function CoverImage({ source, title, className }: { source?: string; titl
 }
 
 export function platformOf(titleId?: string) {
-  if (titleId?.startsWith("CUSA")) return "ps4" as const
+  if (consolePlatform(titleId) === "ps4") return "ps4" as const
   return "ps5" as const
 }
 

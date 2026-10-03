@@ -13,6 +13,7 @@ export type UpdateStatus = {
   currentVersion: string; currentBuild: number; channel: string; available: UpdateManifest | null
   downloaded: number; total: number; message: string; lastChecked: number
 }
+export type UpdateCommand = "check_for_updates" | "download_update" | "install_update"
 export const CHECK_INTERVAL = 10 * 60 * 1000
 const initial: UpdateStatus = { stage: "idle", currentVersion: "", currentBuild: 0, channel: "development", available: null, downloaded: 0, total: 0, message: "", lastChecked: 0 }
 let status = initial
@@ -27,10 +28,52 @@ export const updaterHasUserError = () => userError
 export const updaterSupported = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window
 export const updateBusy = (s: UpdateStatus) => ["checking", "downloading", "verifying", "installing"].includes(s.stage)
 function setStatus(next: UpdateStatus) { status = next; subscribers.forEach(callback => callback()) }
-export function useUpdater() {
-  return useSyncExternalStore(callback => { subscribers.add(callback); return () => subscribers.delete(callback) }, () => status, () => initial)
+
+/* ---------------------------------------------------------------- offline preview */
+// The offline preview plays the whole flow with a made-up release; nothing is downloaded or installed.
+let preview: UpdateStatus = { ...initial, stage: "current", currentVersion: "2.24.0", currentBuild: 20261002180000, message: "SSPI is up to date.", lastChecked: Date.now() - 4 * 60_000 }
+const previewSubscribers = new Set<() => void>()
+let previewBusy = false
+function setPreview(next: UpdateStatus) { preview = next; previewSubscribers.forEach(callback => callback()) }
+const previewRelease: UpdateManifest = {
+  schema: 1, product: "windows", channel: "development", version: "2.24.1", build: 20261004120000, publishedAt: new Date().toISOString(),
+  notes: "Faster archive extraction and smaller fixes across Downloads and Tools. This release only exists in the offline preview.",
+  restart: "SSPI closes and reopens to finish.", package: { url: "", size: 128_400_000, sha256: "", format: "zip" }, files: [],
 }
-export function runUpdateAction(command: "check_for_updates" | "download_update" | "install_update", background = false) {
+const wait = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms))
+async function runPreview(command: UpdateCommand) {
+  if (previewBusy) return
+  previewBusy = true
+  try {
+    if (command === "check_for_updates") {
+      setPreview({ ...preview, stage: "checking", message: "Checking for updates…" })
+      await wait(1100)
+      setPreview({ ...preview, stage: "available", available: previewRelease, total: previewRelease.package.size, downloaded: 0, lastChecked: Date.now(), message: `SSPI ${previewRelease.version} is available.` })
+    } else if (command === "download_update") {
+      const total = previewRelease.package.size
+      for (let done = 0; done < total; done = Math.min(total, done + total / 36)) {
+        setPreview({ ...preview, stage: "downloading", downloaded: done, total, message: "Downloading the update…" })
+        await wait(110)
+      }
+      setPreview({ ...preview, stage: "verifying", downloaded: total, total, message: "Checking every file…" })
+      await wait(1200)
+      setPreview({ ...preview, stage: "ready", message: "The update is ready to install." })
+    } else {
+      setPreview({ ...preview, stage: "installing", message: "Restarting SSPI…" })
+      await wait(1600)
+      setPreview({ ...preview, stage: "current", available: null, downloaded: 0, total: 0, lastChecked: Date.now(), message: "Offline preview: nothing was installed." })
+    }
+  } finally { previewBusy = false }
+}
+
+export function useUpdater(demo = false) {
+  return useSyncExternalStore(
+    callback => { const set = demo ? previewSubscribers : subscribers; set.add(callback); return () => { set.delete(callback) } },
+    () => demo ? preview : status, () => initial,
+  )
+}
+export function runUpdateAction(command: UpdateCommand, background = false, demo = false) {
+  if (demo) return runPreview(command)
   if (!updaterSupported() || action) return action ?? Promise.resolve()
   action = (async () => {
     userError = false

@@ -1,17 +1,18 @@
 #include "pkg.h"
 #include "sha256.h"
+#include "../payload/console_files.h"
 #include <string.h>
 #include <stdio.h>
 static uint32_t be32(const uint8_t *p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
 bool valid_title_id(const char *s) {
-    if (!s || strlen(s)!=9 || (memcmp(s,"CUSA",4)&&memcmp(s,"PPSA",4))) return false;
+    if (!s || strlen(s)!=9 || (!ct_ps4_title_id(s)&&memcmp(s,"PPSA",4))) return false;
     for (int i=4;i<9;i++) if (s[i]<'0'||s[i]>'9') return false;
     return true;
 }
 bool valid_content_id(const char *s) {
     if (!s || strlen(s)!=36 || s[6]!='-' || s[16]!='_' || s[19]!='-') return false;
     char tid[10]; memcpy(tid,s+7,9); tid[9]=0;
-    if (!valid_title_id(tid) || memcmp(tid,"CUSA",4)) return false;
+    if (!ct_ps4_title_id(tid)) return false;
     for (unsigned i=0;i<36;i++) {
         if (i==6||i==16||i==19) continue;
         if (!((s[i]>='A'&&s[i]<='Z')||(s[i]>='0'&&s[i]<='9')||s[i]=='_')) return false;

@@ -1,9 +1,13 @@
 import type { ConsoleKind, DeliveryJob, Ps4Transport, Settings } from "../types"
 
 export function platformOf(titleId?: string): ConsoleKind | undefined {
-  if (/^CUSA/i.test(titleId || "")) return "ps4"
+  if (/^(?:CUSA|SLUS|SLES|SCUS|SCES|SLPS|SLPM|SCPS|SCAJ|SLAJ|SLKA|SLKS|SCKA)\d{5}$/i.test(titleId || "")) return "ps4"
   if (/^PPSA/i.test(titleId || "")) return "ps5"
   return undefined
+}
+
+export function packageTitle(settings: Pick<Settings, "packageDumps">, titleId: string): boolean {
+  return settings.packageDumps && platformOf(titleId) === "ps5"
 }
 
 export function jobTarget(job: Pick<DeliveryJob, "target">): ConsoleKind {

@@ -191,6 +191,62 @@ export function crashTimelineExport(timeline: CrashTimeline, capture: Pick<Timel
   ].join("\r\n")
 }
 
+/* ---------------------------------------------------------------- presentation */
+/** One line in the timeline: a record, or a run of near-identical records (numbers aside) from one source. */
+export type TimelineRow = { key: string; event: TimelineEvent; count: number; lines: [number, number] | null }
+export type TimelineSection = { key: string; title: string; subtitle: string; rows: TimelineRow[] }
+export type TimelineCounts = { panics: number; crashes: number; errors: number; warnings: number; reports: number; restarts: number }
+
+const ISSUES = new Set<TimelineEvent["kind"]>(["panic", "crash", "error", "report"])
+export const isTimelineIssue = (event: TimelineEvent) => ISSUES.has(event.kind)
+/** Counters, ids and addresses differ between repeats of the same message; the text around them doesn't. */
+const shape = (event: TimelineEvent) => `${event.source}\u0000${event.kind}\u0000${event.excerpt.replace(/0x[\da-f]+|\d+/gi, "#")}`
+
+function mergeRows(events: TimelineEvent[]): TimelineRow[] {
+  const rows = new Map<string, TimelineRow & { latest: number }>()
+  events.forEach((event, index) => {
+    const key = shape(event)
+    const row = rows.get(key)
+    const line = event.line
+    if (!row) { rows.set(key, { key: event.id, event, count: 1, lines: line ? [line, line] : null, latest: index }); return }
+    row.count++
+    row.event = event
+    row.latest = index
+    if (line) row.lines = row.lines ? [Math.min(row.lines[0], line), Math.max(row.lines[1], line)] : [line, line]
+  })
+  // Newest first: each merged row sits where its latest record is.
+  return [...rows.values()].sort((a, b) => b.latest - a.latest).map(({ latest: _latest, ...row }) => row)
+}
+
+const dayTitle = (timestamp: number, now: number) => {
+  const day = new Date(timestamp), today = new Date(now)
+  const yesterday = new Date(now - 86_400_000)
+  if (day.toDateString() === today.toDateString()) return "Today"
+  if (day.toDateString() === yesterday.toDateString()) return "Yesterday"
+  return day.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric", year: day.getFullYear() === today.getFullYear() ? undefined : "numeric" })
+}
+
+/** Dated records by local day, newest first; then each source without timestamps, in its own order. */
+export function timelineSections(timeline: CrashTimeline, matches: (event: TimelineEvent) => boolean, now = Date.now()): TimelineSection[] {
+  const sections: TimelineSection[] = []
+  const days = new Map<string, TimelineEvent[]>()
+  for (const event of timeline.dated.filter(matches)) {
+    const title = dayTitle(event.timestamp!, now)
+    days.set(title, [...(days.get(title) || []), event])
+  }
+  for (const [title, events] of [...days].reverse()) sections.push({ key: `day:${title}`, title, subtitle: "Your local time", rows: mergeRows(events) })
+  for (const group of timeline.undated) {
+    const events = group.events.filter(matches)
+    if (events.length) sections.push({ key: `source:${group.source}`, title: fileName(group.source) || group.source, subtitle: group.source === "Kernel log" ? "No timestamps · newest first" : `${group.source} · no timestamps`, rows: mergeRows(events) })
+  }
+  return sections
+}
+
+export function timelineCounts(events: TimelineEvent[]): TimelineCounts {
+  const count = (kind: TimelineEvent["kind"]) => events.filter(event => event.kind === kind).length
+  return { panics: count("panic"), crashes: count("crash"), errors: count("error"), warnings: count("warning"), reports: count("report"), restarts: count("restart") }
+}
+
 export function timelineEndpoint(target: string, host: string, port: number, demo: boolean) {
   return `${demo ? "preview" : "console"}:${target}:${host.trim().toLowerCase()}:${port}`
 }

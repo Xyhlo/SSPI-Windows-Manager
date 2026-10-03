@@ -1,3 +1,4 @@
+import { platformOf } from "@/lib/consoles"
 /* =====================================================================
    Search — the SSPI PS4 search screen: the search field over the results
    list, which is the one list on this page that scrolls. Before typing,
@@ -82,7 +83,7 @@ export function SearchPage(props: Props) {
         <Icon name="search" />
         <input
           ref={inputRef} type="search" autoComplete="off" spellCheck={false} value={query}
-          placeholder="Search games or a CUSA or PPSA ID" aria-label="Search titles"
+          placeholder="Search games or a title ID (CUSA, PPSA, SLUS…)" aria-label="Search titles"
           onChange={event => type(event.target.value)}
           onKeyDown={event => {
             if (event.key === "ArrowDown") {
@@ -139,7 +140,7 @@ function Idle(props: Props) {
       <div className={`si-hint ${recent.length ? "" : "alone"}`}>
         <Icon name="search" />
         <h3>Search your package sources</h3>
-        <p>Type a game's name or its CUSA or PPSA title ID. Results show every region and source, and the packages each one offers.</p>
+        <p>Type a game's name or its PS4, PS5, or PS2 classic title ID. Results show every region and source, and the packages each one offers.</p>
         <p className="si-sources">{demo ? "Offline preview catalog" : enabled.length ? `Searching ${enabled.map(source => `${displayText(source.name)} ${source.version}`).join(", ")}` : "No package source is enabled yet."}</p>
         <div className="row">
           {noSources && <button type="button" className="btn primary sm" onClick={() => onOptions("sources")}><Icon name="plus" />Add a package source</button>}
@@ -204,7 +205,7 @@ function Results(props: Props & { focusFirst: MutableRefObject<boolean> }) {
         {shown.map((game, n) => {
           const inLibrary = owned.get(game.titleId.toUpperCase())
           const variants = game.variants?.length || 1
-          const platform = /^CUSA/i.test(game.titleId) ? "PS4" : "PS5"
+          const platform = platformOf(game.titleId) === "ps4" ? "PS4" : "PS5"
           const info = inLibrary ? `In your library, ${installedVersion(inLibrary) || "installed"}` : variants > 1 ? `${variants} region or source versions` : game.packages?.length ? plural(game.packages.length, "package") : game.sourceName ? `${displayText(game.sourceName)}${game.sourceVersion ? ` ${game.sourceVersion}` : ""}` : ""
           const regionLabel = region !== "All regions" ? region : game.region || (game.variants || []).map(v => v.region).find(Boolean) || "—"
           const pick = region === "All regions" ? game : { ...((game.variants || [game]).find(v => v.region === region) || game), variants: game.variants }
@@ -222,7 +223,7 @@ function Results(props: Props & { focusFirst: MutableRefObject<boolean> }) {
             </button>
           )
         })}
-        {searchState === "success" && !shown.length && <p className="empty-note">No titles match “{searchedFor}”{region !== "All regions" ? ` in ${region}` : ""}. Try a shorter name or the exact CUSA or PPSA ID.</p>}
+        {searchState === "success" && !shown.length && <p className="empty-note">No titles match “{searchedFor}”{region !== "All regions" ? ` in ${region}` : ""}. Try a shorter name or the exact title ID.</p>}
       </div>
     </>
   )

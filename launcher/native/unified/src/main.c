@@ -244,6 +244,15 @@ int main(void) {
     printf("[autoloader] ps5-autoloader v" AUTOLOADER_VERSION " (" __DATE__ " " __TIME__ ") starting\n");
     fflush(stdout);
 
+    /* Reopening SSPI must not replay either autoload list or kill the browser
+     * when a live SSPI Manager can already serve it. No saved status is trusted. */
+    if (sspi_probe_manager()) {
+        sspi_activate_manager();
+        printf("[autoloader] Reusing the live SSPI Payload Manager.\n");
+        fflush(stdout);
+        return 0;
+    }
+
     /* Step 1: handle WebKit browser if running (navigate to Home) */
     handle_browser_app();
 

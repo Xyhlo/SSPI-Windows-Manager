@@ -19,7 +19,6 @@ const Toggle = ({ label, value, onChange }) => <button className="sspi-switch" t
 const SettingsView = ({ config, onSaveConfig, setShowLogs, onNavigate }) => {
   const { t, i18n } = useTranslation()
   const autoOpen = config.AUTO_BROWSER_OPEN !== false
-  const autoInstall = config.AUTO_INSTALL_APP !== false
   const autoloadDelay = config.AUTOLOAD_DELAY || 5
   const multiSources = config.MULTI_SOURCES_ENABLED === true
   const [followBrowserLanguage, setFollowBrowserLanguage] = useState(isFollowingBrowserLanguage)
@@ -64,7 +63,7 @@ const SettingsView = ({ config, onSaveConfig, setShowLogs, onNavigate }) => {
           <select className="sspi-select" value={selectedLanguage} onChange={handleLanguageChange} aria-label={t('settings.language_title', 'Language')}><option value={FOLLOW_BROWSER_LANGUAGE}>{t('settings.language_system_default', 'System Default')}</option>{Object.keys(i18n.store.data).map(lang => <option key={lang} value={lang}>{getLanguageDisplayName(lang)}</option>)}</select>
         </SettingRow>
         <SettingRow title={t('settings.auto_open_title', 'Auto-open Browser')} description={t('settings.auto_open_desc', 'Automatically launch the browser when Payload Manager payload is executed.')}><Toggle label={t('settings.auto_open_title', 'Auto-open Browser')} value={autoOpen} onChange={() => onSaveConfig({ AUTO_BROWSER_OPEN: !autoOpen })} /></SettingRow>
-        <SettingRow title={t('settings.auto_install_title', 'Auto-install App Launcher')} description={t('settings.auto_install_desc', 'Automatically install the Payload Manager app to the PS5 home screen.')}><Toggle label={t('settings.auto_install_title', 'Auto-install App Launcher')} value={autoInstall} onChange={() => onSaveConfig({ AUTO_INSTALL_APP: !autoInstall })} /></SettingRow>
+        <SettingRow title={t('sspi.home_entry', 'Home-screen entry')} description={t('sspi.home_entry_description', 'SSPI setup installs one entry. Reopen it to continue in Payload Manager when this console session is ready.')}><span className="sspi-muted">SSPI</span></SettingRow>
         <SettingRow title={t('settings.kill_disc_title', 'Kill Disc Player')} description={t('settings.kill_disc_desc', 'Automatically terminate the Disc Player application on startup (for BD-JB users).')}><Toggle label={t('settings.kill_disc_title', 'Kill Disc Player')} value={config.KILL_DISC_PLAYER_ON_STARTUP !== false} onChange={() => onSaveConfig({ KILL_DISC_PLAYER_ON_STARTUP: !config.KILL_DISC_PLAYER_ON_STARTUP })} /></SettingRow>
         <SettingRow title={t('settings.scan_usb_title', 'Scan USB Payloads')} description={t('settings.scan_usb_desc', 'Enable scanning for .elf and .bin files in the root directory of USB drives (/mnt/usb0-7).')}><Toggle label={t('settings.scan_usb_title', 'Scan USB Payloads')} value={config.SCAN_USB_PAYLOADS} onChange={() => onSaveConfig({ SCAN_USB_PAYLOADS: !config.SCAN_USB_PAYLOADS })} /></SettingRow>
         <SettingRow title={t('settings.autoload_delay_title', 'Autoload Delay')} description={t('settings.autoload_delay_desc', 'Wait time before the autoload sequence begins.')}><div className="sspi-segments">{[3, 5, 10].map(seconds => <button key={seconds} className={autoloadDelay === seconds ? 'selected' : ''} aria-pressed={autoloadDelay === seconds} onClick={() => onSaveConfig({ AUTOLOAD_DELAY: seconds })}>{seconds}s</button>)}</div></SettingRow>

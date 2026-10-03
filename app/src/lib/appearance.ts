@@ -22,6 +22,7 @@ export const PATTERNS = [
   { id: "obsidian", name: "Obsidian" },
   { id: "slate", name: "Slate glow" },
   { id: "flowers", name: "ASCII Flowers" },
+  { id: "silk", name: "Silk" },
 ] as const
 
 export const patternIndex = (id: string) => Math.max(0, PATTERNS.findIndex(pattern => pattern.id === id))
@@ -29,7 +30,7 @@ export const patternIndex = (id: string) => Math.max(0, PATTERNS.findIndex(patte
 /** The backdrop pattern is drawn at reduced strength so it stays behind the interface. */
 export const PATTERN_STRENGTH = 0.58
 
-export type CardStyle = "art" | "plain"
+export type CardStyle = "art" | "poster" | "plain"
 export type CardSize = "large" | "compact"
 
 /** Look-and-feel preferences. They only affect this PC's window, so they live in the WebView's storage. */
@@ -39,16 +40,18 @@ export const DEFAULT_APPEARANCE: Appearance = { accent: "#E4E4E1", pattern: "rip
 
 const KEY = "sspi.appearance.v1"
 
+export const accentColor = (value: unknown): string | null => typeof value === "string" && /^#[\da-f]{6}$/i.test(value.trim()) ? value.trim().toUpperCase() : null
+
 export function loadAppearance(): Appearance {
   try {
     const saved = JSON.parse(window.localStorage.getItem(KEY) || "null") as Partial<Appearance> | null
     if (!saved || typeof saved !== "object") return { ...DEFAULT_APPEARANCE }
     return {
-      accent: ACCENTS.some(a => a.hex === saved.accent) ? saved.accent! : DEFAULT_APPEARANCE.accent,
+      accent: accentColor(saved.accent) || DEFAULT_APPEARANCE.accent,
       pattern: PATTERNS.some(p => p.id === saved.pattern) ? saved.pattern! : DEFAULT_APPEARANCE.pattern,
       gameTint: typeof saved.gameTint === "boolean" ? saved.gameTint : DEFAULT_APPEARANCE.gameTint,
       statsForNerds: typeof saved.statsForNerds === "boolean" ? saved.statsForNerds : DEFAULT_APPEARANCE.statsForNerds,
-      cardStyle: saved.cardStyle === "plain" || saved.cardStyle === "art" ? saved.cardStyle : DEFAULT_APPEARANCE.cardStyle,
+      cardStyle: saved.cardStyle === "plain" || saved.cardStyle === "art" || saved.cardStyle === "poster" ? saved.cardStyle : DEFAULT_APPEARANCE.cardStyle,
       cardSize: saved.cardSize === "compact" || saved.cardSize === "large" ? saved.cardSize : DEFAULT_APPEARANCE.cardSize,
     }
   } catch {

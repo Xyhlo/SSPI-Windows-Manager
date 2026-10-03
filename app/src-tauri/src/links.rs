@@ -78,8 +78,7 @@ pub(super) fn identity(name: &str) -> (String, String) {
     let upper = name.to_ascii_uppercase();
     let bytes = upper.as_bytes();
     for i in 0..bytes.len().saturating_sub(8) {
-        let prefix = &upper[i..i + 4];
-        if (prefix == "CUSA" || prefix == "PPSA") && bytes[i + 4..i + 9].iter().all(u8::is_ascii_digit)
+        if upper.get(i..i + 9).is_some_and(super::title_id)
             && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
             && (i + 9 == bytes.len() || !bytes[i + 9].is_ascii_digit())
         {
@@ -181,10 +180,10 @@ pub(super) fn requests(items: &[LinkItem], as_set: bool, active: &str) -> Result
     for item in items {
         let url = reqwest::Url::parse(&item.url).map_err(|_| format!("Invalid link: {}", item.url))?;
         if !matches!(url.scheme(), "http" | "https") { return Err(format!("Only http and https links can be downloaded: {}", item.url)); }
-        if !item.title_id.is_empty() && !super::title_id(&item.title_id) { return Err(format!("{} is not a CUSA or PPSA title ID", item.title_id)); }
+        if !item.title_id.is_empty() && !super::title_id(&item.title_id) { return Err(format!("{} is not a supported PS4, PS5, or PS2 classic title ID", item.title_id)); }
     }
     let target = |id: &str| -> Option<String> {
-        if id.starts_with("PPSA") { Some("ps5".into()) } else if id.starts_with("CUSA") { Some("ps4".into()) } else { Some(active.to_string()) }
+        if id.starts_with("PPSA") { Some("ps5".into()) } else if super::ps4_title_id(id) { Some("ps4".into()) } else { Some(active.to_string()) }
     };
     let title_of = |item: &LinkItem| if item.title.is_empty() { item.name.clone() } else { item.title.clone() };
     let provider_of = |item: &LinkItem| (!item.provider.is_empty()).then(|| item.provider.clone());

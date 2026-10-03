@@ -157,11 +157,6 @@ int main(int argc, char *argv[]) {
     PldmgrConfig cfg;
     config_read(&cfg);
 
-    /* Install app if requested */
-    if (cfg.auto_install_app) {
-        pldmgr_install_app_if_needed();
-    }
-
     /* Kill Disc Player if running (BD-JB host) and enabled in config */
     if (cfg.kill_disc_player) {
         ps5_kill_disc_player();
@@ -184,6 +179,10 @@ int main(int argc, char *argv[]) {
     }
 
     pldmgr_log("[PLDMGR] Server is running. Visit /shutdown to exit.\n");
+
+    /* Retire a verified duplicate only once this Manager is serving. The
+     * cache-complete WebKit installer owns WKAL00001; preferences stay put. */
+    pldmgr_install_app_if_needed();
 
     /* Try cache refresh */
     repository_ensure_fresh(0);

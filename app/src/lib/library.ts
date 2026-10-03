@@ -28,6 +28,17 @@ export type LibraryEntry = {
 }
 
 export type CachedSnapshot = { entries: LibraryTitle[]; syncedAt: number }
+
+/** Keep small libraries centered; large ones keep readable cases and scroll by a case. */
+export function shelfLayout(width: number, height: number, count: number, aspect: number) {
+  const gap = Math.max(20, Math.min(36, width * .014))
+  const preferred = Math.max(176, Math.min(400, height * .56 / aspect))
+  const fit = (width - gap * Math.max(0, count - 1)) / Math.max(1, count)
+  const caseW = Math.max(64, Math.min(width, (height - 76) / aspect, Math.max(preferred * .78, Math.min(preferred, fit))))
+  const cols = Math.max(1, Math.floor((width + gap) / (caseW + gap)))
+  const total = count * caseW + Math.max(0, count - 1) * gap
+  return { gap, caseW, cols, offset: Math.max(0, (width - total) / 2), overflow: Math.max(0, total - width) }
+}
 /** Kept for the 2.20.2 PS4 cache format. */
 export type CachedPs4Snapshot = CachedSnapshot
 type Store = {

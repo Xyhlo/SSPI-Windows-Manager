@@ -1,9 +1,32 @@
 <!doctype html>
-<!-- Based on WebKit Autoloader by PLK. Original LICENSE retained in distribution. -->
-<html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /><link rel="stylesheet" href="style.css" /><link rel="icon" type="image/png" href="sspi-logo.png" /><title>SSPI Web Launcher</title></head>
-<body><header class="sspi-header"><div class="sspi-brand"><img class="sspi-logo" src="sspi-logo.png" alt="SSPI" /><span>Web Launcher</span></div><span class="sspi-header-note">PlayStation 5</span></header>
-<iframe id="exploit" title="exploit"></iframe>
-<main id="loader"><div class="sspi-eyebrow">Web Launcher</div><h1>Starting your console.</h1><p class="sspi-description">Progress and activity from this launch.</p>
-<div id="progressContainer"><div id="progressBar"></div><div id="progressLabel" role="status" aria-live="polite">Preparing launcher…</div></div>
-<section class="sspi-log-panel" aria-label="Launch activity"><h2 class="sspi-section-label">Activity</h2><div id="logWrapper" tabindex="0" aria-label="Launch activity log"><div id="logContainer"></div></div></section>
-</main><script src="app.js"></script></body></html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="style.css" />
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+  <title>WebKit Autoloader v[[VERSION_PLACEHOLDER]] by PLK (built [[BUILD_TIME_PLACEHOLDER]])</title>
+</head>
+
+<body>
+  <iframe id="exploit" title="exploit"></iframe>
+
+
+  <main id="loader">
+    <div id="logWrapper">
+      <div id="logContainer"></div>
+    </div>
+
+    <div id="progressContainer">
+      <div id="progressBar"></div>
+      <div id="progressLabel">Loading...</div>
+    </div>
+  </main>
+
+  <footer id="footer">WebKit Autoloader v[[VERSION_PLACEHOLDER]] by PLK (built [[BUILD_TIME_PLACEHOLDER]])<br />This project is free and open source: github.com/itsPLK/ps5-webkit-autoloader</footer>
+
+  <script src="entry.js"></script>
+</body>
+
+</html>

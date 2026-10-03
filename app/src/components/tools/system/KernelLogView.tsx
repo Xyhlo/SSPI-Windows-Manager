@@ -5,7 +5,7 @@
    ===================================================================== */
 import { useEffect, useMemo, useRef, useState } from "react"
 import { Icon } from "../../Icon"
-import { ActionBubbleMenu } from "../../ActionBubbleMenu"
+import { ActionMenu } from "../../ActionMenu"
 import { consoleKernelLog, onKlogStream, probeDebugServices, startKlogStream, stopKlogStream } from "@/lib/console-api"
 import type { DebugService, KernelLog } from "@/lib/console-types"
 import { analyzeKernelLog, exportName, textLogExport, type LogFinding } from "@/lib/diagnostics"
@@ -16,9 +16,11 @@ import type { ConsoleKind } from "@/types"
 const TEXT_LIMIT = 1_000_000
 const SHOWN_LINES = 3000
 
-type Props = { target: ConsoleKind; host: string; port: number; demo: boolean }
+/** A record to find in the log, from the crash timeline: its text, and its line when it was read. */
+export type KernelLogFocus = { text: string; line: number | null; at: number }
+type Props = { target: ConsoleKind; host: string; port: number; demo: boolean; focus?: KernelLogFocus | null }
 
-export function KernelLogView({ target, host, port, demo }: Props) {
+export function KernelLogView({ target, host, port, demo, focus }: Props) {
   const [snapshot, setSnapshot] = useState<KernelLog | null>(null)
   const [text, setText] = useState("")
   const [error, setError] = useState("")
@@ -30,6 +32,8 @@ export function KernelLogView({ target, host, port, demo }: Props) {
   const [issuesOnly, setIssuesOnly] = useState(false)
   const [follow, setFollow] = useState(true)
   const [copied, setCopied] = useState(false)
+  const [focused, setFocused] = useState<number | null>(null)
+  const applied = useRef(0)
   const body = useRef<HTMLDivElement>(null)
   const liveRef = useRef<number | null>(null)
 
@@ -95,10 +99,24 @@ export function KernelLogView({ target, host, port, demo }: Props) {
     if (follow && body.current) body.current.scrollTop = body.current.scrollHeight
   }, [visible, follow])
 
-  const jump = (finding: LogFinding) => {
-    setFilter(""); setIssuesOnly(false); setFollow(false)
-    requestAnimationFrame(() => body.current?.querySelector<HTMLElement>(`[data-line="${finding.line}"]`)?.scrollIntoView({ block: "center" }))
+  const reveal = (line: number) => {
+    setFilter(""); setIssuesOnly(false); setFollow(false); setFocused(line)
+    requestAnimationFrame(() => requestAnimationFrame(() => body.current?.querySelector<HTMLElement>(`[data-line="${line}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" })))
   }
+  const jump = (finding: LogFinding) => reveal(finding.line)
+
+  // Opened from the crash timeline: find that record in this snapshot (line numbers can shift between reads).
+  useEffect(() => {
+    if (!focus || applied.current === focus.at || !analysis.lines.length) return
+    applied.current = focus.at
+    const needle = focus.text.replace(/…$/, "").trim()
+    let index = -1
+    for (let i = analysis.lines.length - 1; i >= 0 && needle; i--) if (analysis.lines[i].includes(needle)) { index = i; break }
+    if (index < 0 && focus.line && focus.line <= analysis.lines.length) index = focus.line - 1
+    if (index >= 0) reveal(index)
+    else setLiveNote("That record isn't in the current kernel log snapshot. The console may have restarted since it was read.")
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focus, analysis])
   const copy = async () => {
     try { await navigator.clipboard.writeText(text); setCopied(true); window.setTimeout(() => setCopied(false), 1400) } catch { setError("Copying to the clipboard failed.") }
   }
@@ -121,7 +139,7 @@ export function KernelLogView({ target, host, port, demo }: Props) {
           {live && <button type="button" className="btn sm ok" onClick={() => void stopLive()}><Icon name="pause" />Stop live</button>}
           <button type="button" className="btn sm icon" title="Take a new snapshot" aria-label="Take a new snapshot" disabled={loading || !!live} onClick={() => void loadSnapshot()}><Icon name="refresh" /></button>
           <ExportMenu name={exportName(target, "kernel-log", "txt").replace(/\.txt$/, "")} demo={demo} disabled={!text} build={format => textLogExport(text, format)} />
-          <ActionBubbleMenu label="Kernel log actions" actions={[
+          <ActionMenu label="Kernel log view" trigger={{ icon: "sliders", text: "View" }} actions={[
             { id: "issues", label: "Show issues only", icon: "alert", checked: issuesOnly, onSelect: () => setIssuesOnly(value => !value) },
             { id: "follow", label: "Follow new lines", icon: "chevD", checked: follow, onSelect: () => setFollow(value => !value) },
             ...(!live ? klogServers.map(service => ({ id: `live-${service.port}`, label: `Live: ${service.name}`, icon: "signal" as const, onSelect: () => goLive(service) })) : []),
@@ -157,7 +175,7 @@ export function KernelLogView({ target, host, port, demo }: Props) {
           )}
           <div className="kl-body" ref={body} onWheel={() => setFollow(false)}>
             {visible.rows.length
-              ? visible.rows.map(row => <div key={row.index} data-line={row.index} className={`kl-line ${row.severity}`}><span className="kl-no">{row.index + 1}</span><span className="kl-text">{row.text || " "}</span></div>)
+              ? visible.rows.map(row => <div key={row.index} data-line={row.index} className={`kl-line ${row.severity} ${row.index === focused ? "is-focus" : ""}`}><span className="kl-no">{row.index + 1}</span><span className="kl-text">{row.text || " "}</span></div>)
               : <p className="kl-empty">No lines match.</p>}
           </div>
         </>

@@ -96,7 +96,7 @@ static const char *state_name(char state) {
     return state>0 && state<8 ? names[(int)state] : names[0];
 }
 static bool game_title(const char *id) {
-    return (!memcmp(id,"CUSA",4) || !memcmp(id,"PPSA",4)) && ct_valid_id(id);
+    return (ct_ps4_title_id(id) || !memcmp(id,"PPSA",4)) && ct_valid_id(id);
 }
 static void *process_table(size_t *size) {
     int mib[4]={CTL_KERN,KERN_PROC,KERN_PROC_PROC,0};

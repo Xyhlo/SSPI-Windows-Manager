@@ -27,6 +27,7 @@
 #include "ps5_launcher.h"
 #include "sspi_contract.h"
 #include "sspi_loader_status.h"
+#include "sspi_session_contract.h"
 
 #include "assets_index_html.h"
 #include "assets_cache_appcache.h"
@@ -139,6 +140,32 @@ enum MHD_Result http_on_request(void *cls, struct MHD_Connection *conn,
                                 const char *url, const char *method,
                                 const char *version, const char *upload_data,
                                 size_t *upload_data_size, void **con_cls) {
+
+    if (strcmp(url, "/sspi/session") == 0) {
+        struct kinfo_proc process;
+        int live = sspi_loader_process(getpid(), &process);
+        char body[384];
+        int length = sspi_session_json(body, sizeof(body), live && http_keep_running,
+            (unsigned long)getuid(), (unsigned long)geteuid(),
+            live ? (long)process.ki_pid : 0,
+            live ? (long long)process.ki_start.tv_sec : 0,
+            live ? (long)process.ki_start.tv_usec : 0);
+        unsigned int code = MHD_HTTP_OK;
+        if (strcmp(method, "GET") != 0) {
+            code = MHD_HTTP_METHOD_NOT_ALLOWED;
+            length = snprintf(body, sizeof(body), "{\"error\":\"Method not allowed\"}");
+        }
+        if (length < 0) return MHD_NO;
+        struct MHD_Response *response = MHD_create_response_from_buffer(
+            (size_t)length, body, MHD_RESPMEM_MUST_COPY);
+        if (!response) return MHD_NO;
+        MHD_add_response_header(response, "Content-Type", "application/json");
+        MHD_add_response_header(response, "Cache-Control", "no-store");
+        add_cors_headers(response);
+        enum MHD_Result result = MHD_queue_response(conn, code, response);
+        MHD_destroy_response(response);
+        return result;
+    }
 
     if (strcmp(url, "/sspi/loader-status") == 0) {
         int status = sspi_read_loader_status();

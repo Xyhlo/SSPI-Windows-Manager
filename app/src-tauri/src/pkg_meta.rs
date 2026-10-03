@@ -367,7 +367,7 @@ fn title_id_from_content_id(content_id: &str) -> Option<String> {
         return None;
     }
     let title_id = &content_id[7..16];
-    if !title_id[..4].eq_ignore_ascii_case("CUSA") || !title_id[4..].bytes().all(|byte| byte.is_ascii_digit()) {
+    if !super::ps4_title_id(&title_id.to_ascii_uppercase()) {
         return None;
     }
     Some(title_id.to_string())
@@ -509,6 +509,21 @@ mod tests {
         let digest = Sha256::digest(&pkg[..0xfe0]);
         pkg[0xfe0..0x1000].copy_from_slice(&digest);
         pkg
+    }
+
+    #[test]
+    fn reads_ps2_classic_packages_without_repackaging() {
+        for id in ["SLUS20062", "SLES50044", "SCUS97124", "SLPM65001"] {
+            let mut bytes = package(true);
+            bytes[0x47..0x50].copy_from_slice(id.as_bytes());
+            let digest = Sha256::digest(&bytes[..0xfe0]);
+            bytes[0xfe0..0x1000].copy_from_slice(&digest);
+            let path = temp_pkg(&bytes);
+            let result = read(&path).unwrap();
+            let _ = fs::remove_file(path);
+            assert_eq!(result.title_id, id);
+            assert_eq!(result.kind, "base");
+        }
     }
 
     #[test]

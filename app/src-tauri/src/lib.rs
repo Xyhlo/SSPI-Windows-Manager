@@ -64,8 +64,8 @@ use url::Url;
 use uuid::Uuid;
 
 const CONFIG_NAME: &str = "settings.json";
-const RECEIVER_VERSION: &str = "1.0.12";
-const PS4_RECEIVER_VERSION: &str = "1.0.11";
+const RECEIVER_VERSION: &str = "1.0.13";
+const PS4_RECEIVER_VERSION: &str = "1.0.12";
 
 #[derive(Debug, Clone)]
 struct ReceiverEndpoint {
@@ -341,6 +341,7 @@ struct Progress {
     stage_history: Vec<String>,
     paused: bool,
     packaging: Option<PackagingInfo>,
+    provider_preparation: Option<debrid::PreparationProgress>,
     retryable: bool,
     space: Option<storage::SpacePlan>,
 }
@@ -371,6 +372,7 @@ impl Default for Progress {
             stage_history: Vec::new(),
             paused: false,
             packaging: None,
+            provider_preparation: None,
             retryable: false,
             space: None,
         }
@@ -654,6 +656,17 @@ fn delivery_target(target: Option<&str>) -> Result<&str, String> {
     }
 }
 fn ps4_transport(request: &DeliveryRequest) -> &str { request.transport.as_deref().unwrap_or("inbox") }
+fn delivery_can_package(request: &DeliveryRequest) -> bool {
+    !ps4_title_id(&request.title_id.as_deref().unwrap_or("").to_ascii_uppercase())
+        && !request.package.expected_content_id.to_ascii_uppercase()
+            .split(|c: char| !c.is_ascii_alphanumeric()).any(ps4_title_id)
+}
+fn delivery_packages(request: &DeliveryRequest, settings: &Settings) -> bool {
+    delivery_can_package(request) && request.package_dumps.unwrap_or(settings.package_dumps)
+}
+fn delivery_package_only(request: &DeliveryRequest, settings: &Settings) -> bool {
+    delivery_packages(request, settings) && settings.download_package_only
+}
 fn snapshot_transport(request: &mut DeliveryRequest, settings: &Settings, retry: bool) -> Result<(), String> {
     if request.target.as_deref() == Some("ps4") {
         if !retry { request.transport = Some(settings.ps4_transport.clone()); }
@@ -765,8 +778,16 @@ fn direct_package(url: &str) -> bool {
 }
 fn title_id(s: &str) -> bool {
     s.len() == 9
-        && (s.starts_with("CUSA") || s.starts_with("PPSA"))
-        && s[4..].bytes().all(|b| b.is_ascii_digit())
+        && (ps4_title_id(s) || s.starts_with("PPSA"))
+        && s.as_bytes()[4..].iter().all(u8::is_ascii_digit)
+}
+
+// Legacy IDs identify PS2 classics packaged for PS4, using the same PKG transport.
+fn ps4_title_id(s: &str) -> bool {
+    s.len() == 9
+        && ["CUSA", "SLUS", "SLES", "SCUS", "SCES", "SLPS", "SLPM", "SCPS", "SCAJ", "SLAJ", "SLKA", "SLKS", "SCKA"]
+            .iter().any(|prefix| s.starts_with(prefix))
+        && s.as_bytes()[4..].iter().all(u8::is_ascii_digit)
 }
 
 async fn patch_site_search(http: &Client, base: &str, query: &str) -> Vec<Game> {
@@ -2280,6 +2301,37 @@ mod console_target_tests {
             title_id: Some("CUSA12345".into()), title_name: None, icon: None, archive_parts: vec![], backport: None, provider: None, package_dumps: None }
     }
     #[test]
+    fn ps4_packages_bypass_ps5_packaging_settings_for_both_targets() {
+        let settings = Settings { package_dumps: true, download_package_only: true, ..Default::default() };
+        for target in ["ps4", "ps5"] {
+            let mut request = request(Some(target));
+            request.package.url = "https://example.test/game.pkg?download=1".into();
+            for explicit in [None, Some(true), Some(false)] {
+                request.package_dumps = explicit;
+                assert!(!delivery_packages(&request, &settings));
+                assert!(!delivery_package_only(&request, &settings));
+                assert_eq!(validate_delivery_target(&request, delivery_package_only(&request, &settings), false).unwrap(), target);
+            }
+        }
+        let mut request = request(Some("ps5"));
+        for id in ["SLUS20062", "SLES50044", "SCUS97124", "SLPM65001"] {
+            request.title_id = Some(id.into());
+            assert!(title_id(id));
+            assert!(!delivery_package_only(&request, &settings));
+            assert_eq!(title_from_path(Path::new(&format!("Example-{id}.pkg"))).as_deref(), Some(id));
+        }
+        request.title_id = None;
+        request.package.expected_content_id = "UP0000-CUSA12345_00-GAME000000000000".into();
+        assert!(!delivery_package_only(&request, &settings));
+        request.package.expected_content_id.clear();
+        request.title_id = Some("PPSA12345".into());
+        assert!(delivery_package_only(&request, &settings));
+        request.target = Some("ps4".into());
+        assert!(delivery_package_only(&request, &settings), "PS5 dump packaging on the PC remains independent of selected console");
+        request.package_dumps = Some(false);
+        assert!(!delivery_package_only(&request, &settings));
+    }
+    #[test]
     fn ps4_rejects_ps5_titles_backports_and_folders() {
         let mut request = request(Some("ps4")); request.title_id = Some("PPSA12345".into());
         assert_eq!(validate_delivery_target(&request, false, false).unwrap_err(), "PS5 games can't be installed on a PS4.");
@@ -2472,6 +2524,16 @@ fn export_receiver_payload() -> Result<String, String> {
 #[tauri::command]
 fn list_package_sources(app: AppHandle) -> Result<Vec<package_sources::SourceSummary>, String> {
     package_sources::list(&app)
+}
+
+#[tauri::command]
+async fn list_community_sources(app: AppHandle) -> Result<package_sources::community::CommunityListing, String> {
+    package_sources::community::list(&app).await
+}
+
+#[tauri::command]
+async fn install_community_source(app: AppHandle, id: String) -> Result<Vec<package_sources::SourceSummary>, String> {
+    package_sources::community::install(&app, id.trim()).await
 }
 
 #[tauri::command]
@@ -2696,7 +2758,7 @@ async fn load_catalog(
     state: State<'_, AppState>,
     refresh: Option<bool>,
 ) -> Result<GameCatalog, String> {
-    let cache_path = cache_root(&app).ok().map(|root| root.join("catalog-v4.json"));
+    let cache_path = cache_root(&app).ok().map(|root| root.join("catalog-v5.json"));
     if !refresh.unwrap_or(false) {
         if let Some(path) = cache_path.as_ref() {
             if let Some(mut catalog) = read_cache_json::<GameCatalog>(path, 30 * 60) {
@@ -2727,7 +2789,7 @@ async fn load_catalog(
                     sections: [ ("ps4", "PS4 catalog", "CUSA"), ("ps5", "PS5 catalog", "PPSA") ]
                         .into_iter().map(|(id, title, prefix)| CatalogSection {
                             id: id.into(), title: title.into(), games: games.iter()
-                                .filter(|g| g.title_id.starts_with(prefix)).cloned().collect(),
+                                .filter(|g| if prefix == "CUSA" { ps4_title_id(&g.title_id) } else { g.title_id.starts_with(prefix) }).cloned().collect(),
                         }).collect(),
                     cached: false,
                     source: "Package Sources".into(),
@@ -3007,7 +3069,7 @@ async fn resolve_packages(
     game_region: Option<String>,
 ) -> Result<Vec<Package>, String> {
     if !title_id(&game_title_id) {
-        return Err("Only CUSA and PPSA title IDs are supported".into());
+        return Err("Enter a valid PS4, PS5, or PS2 classic title ID (for example CUSA12345, PPSA12345, or SLUS12345)".into());
     }
     let cache_path = cache_root(&app)
         .ok()
@@ -4936,8 +4998,17 @@ async fn download_delivery_inputs(app2: &AppHandle, s: &Settings, http: &Client,
                             ..Default::default()
                         },
                     );
+                    let provider_progress = |preparation: Option<debrid::PreparationProgress>| {
+                        let message = preparation.as_ref().map(|p| format!("{} · file {}/{}", p.state, index + 1, parts.len()))
+                            .unwrap_or_else(|| format!("Unlocking hoster link {}/{}", index + 1, parts.len()));
+                        emit(&app2, Progress {
+                            job_id: job2.clone(), stage: "unlocking".into(), message,
+                            provider_preparation: preparation,
+                            title: job_title.clone(), icon: job_icon.clone(), ..Default::default()
+                        });
+                    };
                     let unrestricted = tokio::select! {
-                        result = debrid::resolve(http, s, &url, request.provider.as_deref()) => result?,
+                        result = debrid::resolve(http, s, &url, request.provider.as_deref(), &provider_progress) => result?,
                         _ = rx.changed() => return Err("cancelled".into()),
                     };
                     url = unrestricted.0;
@@ -5068,7 +5139,7 @@ async fn start_delivery(
     request: DeliveryRequest,
 ) -> Result<String, String> {
     let settings = state.settings.lock().unwrap().clone();
-    validate_delivery_target(&request, settings.package_dumps && settings.download_package_only, false)?;
+    validate_delivery_target(&request, delivery_package_only(&request, &settings), false)?;
     if let Some((id, resume)) = job_store::reuse_for_pair(&app, &request)? {
         if !resume { return Ok(id); }
         let request = job_store::record(&app, &id).and_then(|record| record.request).ok_or("Retained transfer request is missing")?;
@@ -5085,8 +5156,9 @@ async fn queue_delivery(app: AppHandle, state: &AppState, mut request: DeliveryR
     let receiver = request.target.as_deref() == Some("ps4") && ps4_transport(&request) == "receiver";
     // An existing record (a local import, Send to PS5 or Retry) keeps its own choice; the
     // "Download and package only" setting decides for new downloads only.
-    let package_only = resume.as_ref().map(|r| r.package_only).unwrap_or(s.package_dumps && s.download_package_only);
-    if let Some(pack) = request.package_dumps { s.package_dumps = pack; }
+    let package_only = delivery_can_package(&request)
+        && resume.as_ref().map(|r| r.package_only).unwrap_or_else(|| delivery_package_only(&request, &s));
+    s.package_dumps = delivery_packages(&request, &s);
     let target = validate_delivery_target(&request, package_only, false)?.to_string();
     if target == "ps4" && !receiver {
         if let Some(saved) = resume.as_ref().and_then(|record| record.ps4_delivery.as_ref()) { ps4_inbox::validate_delivery(saved)?; }
@@ -5674,7 +5746,7 @@ pub fn run() {
             let launch_args: Vec<String> = std::env::args().collect();
             for pair in launch_args.windows(2).filter(|pair| pair[0] == "--import-source") {
                 package_sources::install_from_path(&handle, &pair[1]).map_err(std::io::Error::other)?;
-                if let Ok(root) = cache_root(&handle) { let _ = std::fs::remove_file(root.join("catalog-v4.json")); }
+                if let Ok(root) = cache_root(&handle) { let _ = std::fs::remove_file(root.join("catalog-v5.json")); }
             }
             let settings: Settings = std::fs::read(config_path(&handle)?)
                 .ok()
@@ -5703,6 +5775,8 @@ pub fn run() {
             payload_catalog::download_catalog_payload,
             payload_autostart::get_payload_autostart,
             payload_autostart::set_payload_autostart,
+            payload_autostart::run_payload_autostart,
+            payload_autostart::stop_payload_autostart,
             web_launcher::get_web_launcher,
             web_launcher::start_web_launcher,
             web_launcher::stop_web_launcher,
@@ -5739,6 +5813,8 @@ pub fn run() {
             inspect_package_dump,
             export_receiver_payload,
             list_package_sources,
+            list_community_sources,
+            install_community_source,
             install_package_source,
             install_package_source_from_path,
             set_package_source_enabled,

@@ -7,7 +7,7 @@
 import { useEffect, useRef, useState } from "react"
 import { Seg } from "../Controls"
 import { Icon } from "../Icon"
-import { KernelLogView } from "./system/KernelLogView"
+import { KernelLogView, type KernelLogFocus } from "./system/KernelLogView"
 import { CrashTimelineView } from "./system/CrashTimelineView"
 import { LogsView } from "./system/LogsView"
 import { ProcessesView } from "./system/ProcessesView"
@@ -36,6 +36,7 @@ const VIEWS: Array<[View, string]> = [["overview", "Overview"], ["timeline", "Cr
 export function SystemPanel({ target, settings, demo, probe, onLoadReceiver }: Props) {
   const name = target.toUpperCase()
   const [view, setView] = useState<View>("overview")
+  const [klogFocus, setKlogFocus] = useState<KernelLogFocus | null>(null)
   const receiver = probe?.receiver.state
   const unreachable = !demo && (!probe || receiver === "offline" || receiver === "unconfigured" || receiver === "error")
   const unsupported = !demo && !unreachable && (receiver === "outdated" || !hasCapability(probe, "system-info-v1"))
@@ -64,8 +65,9 @@ export function SystemPanel({ target, settings, demo, probe, onLoadReceiver }: P
       </div>
       <div className="sysx-body swap-fade" key={view}>
         {view === "overview" && <Overview target={target} host={host} port={port} demo={demo} probe={probe} />}
-        {view === "timeline" && <CrashTimelineView key={`${target}:${host}:${port}:${demo}`} target={target} host={host} port={port} demo={demo} available={!unreachable && !unsupported && diagnostics} />}
-        {view === "klog" && <KernelLogView target={target} host={host} port={port} demo={demo} />}
+        {view === "timeline" && <CrashTimelineView key={`${target}:${host}:${port}:${demo}`} target={target} host={host} port={port} demo={demo} available={!unreachable && !unsupported && diagnostics}
+          onShowInKernelLog={event => { setKlogFocus({ text: event.excerpt, line: event.line, at: Date.now() }); setView("klog") }} />}
+        {view === "klog" && <KernelLogView target={target} host={host} port={port} demo={demo} focus={klogFocus} />}
         {view === "processes" && <ProcessesView target={target} host={host} port={port} demo={demo} />}
         {view === "logs" && <LogsView target={target} host={host} port={port} demo={demo} />}
       </div>

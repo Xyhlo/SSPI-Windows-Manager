@@ -120,8 +120,9 @@ pub(super) fn archive_size(path: &Path, kind: ArtifactKind, password: Option<&st
 
 #[tauri::command]
 pub(super) fn delivery_space(state: State<'_, AppState>, request: DeliveryRequest) -> Result<SpacePlan, String> {
-    let settings = state.settings.lock().unwrap().clone();
-    validate_delivery_target(&request, settings.package_dumps && settings.download_package_only, false)?;
+    let mut settings = state.settings.lock().unwrap().clone();
+    settings.package_dumps = delivery_packages(&request, &settings);
+    validate_delivery_target(&request, delivery_package_only(&request, &settings), false)?;
     backport::validate_request(&request)?;
     let parts = delivery_parts(&request)?;
     let bytes = parts.iter().filter_map(|p| p.expected_size).fold(0u64, u64::saturating_add).saturating_add(request.backport.as_ref().map(|b| if b.parts.is_empty() { b.package.expected_size.unwrap_or(0) } else { b.parts.iter().filter_map(|p| p.expected_size).sum() }).unwrap_or(0));

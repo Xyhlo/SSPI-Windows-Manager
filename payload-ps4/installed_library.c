@@ -72,12 +72,12 @@ static int find_base_package(const char *title_id, PkgInfo *package) {
 }
 int installed_library_title_present(const char *title_id) {
     PkgInfo package;
-    return ct_valid_id(title_id) && !memcmp(title_id,"CUSA",4) && !find_base_package(title_id,&package);
+    return ct_ps4_title_id(title_id) && !find_base_package(title_id,&package);
 }
 
 static int remember_candidate(const char *name, void *context) {
     LibraryScan *scan = context;
-    if (!valid_title_id(name) || memcmp(name, "CUSA", 4)) return 0;
+    if (!ct_ps4_title_id(name)) return 0;
     if (already_listed(scan, name)) return 0;
     if (scan->count >= INSTALLED_LIBRARY_MAX_TITLES) { scan->truncated = true; return 1; }
     PkgInfo package;
@@ -290,7 +290,7 @@ static int read_icon(const char *title_id, uint8_t *out, size_t capacity, size_t
 }
 
 int installed_library_metadata(const char *title_id, uint8_t *out, size_t capacity, size_t *written) {
-    if (!valid_title_id(title_id) || memcmp(title_id, "CUSA", 4) || !out || !written) return -1;
+    if (!ct_ps4_title_id(title_id) || !out || !written) return -1;
     if (capacity < INSTALLED_LIBRARY_MAX_METADATA) return -1;
     PkgInfo base_package;
     if (find_base_package(title_id, &base_package)) return -1;

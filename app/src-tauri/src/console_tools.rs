@@ -263,7 +263,7 @@ fn sfo_value<'a>(data: &'a [u8], wanted: &str) -> Option<(u16,&'a [u8])> {
 }
 fn decode_metadata(id: &str, bytes: &[u8]) -> Result<Metadata,String> {
     if bytes.is_empty() { return Ok(Metadata::default()); }
-    if id.starts_with("CUSA") {
+    if super::ps4_title_id(id) {
         let (_,name,version,actual)=pkg_meta::parse_sfo(bytes).ok_or("param.sfo is malformed.")?;
         if actual.as_deref().is_some_and(|a| a!=id) { return Err("param.sfo belongs to another title.".into()); }
         let firmware=sfo_value(bytes,"SYSTEM_VER").and_then(|(kind,raw)| if kind==0x0404 && raw.len()==4 { firmware_version(u32::from_le_bytes(raw.try_into().unwrap()) as u64) } else { None });
@@ -344,11 +344,11 @@ pub(super) async fn list_console_library(target: String, host: String, port: u16
     let mut snapshot=ConsoleLibrarySnapshot { target:target.clone(),entries:Vec::new(),complete,truncated:truncated||ids.len()>2048,errors,metadata_warnings:Vec::new(),diagnostics };
     let mut seen=HashSet::new(); let mut connection_ok=true;
     for value in ids.iter().take(2048) {
-        let Some(id)=value.as_str().filter(|id| title_id(id) && (target=="ps5" || id.starts_with("CUSA"))) else {
+        let Some(id)=value.as_str().filter(|id| title_id(id) && (target=="ps5" || super::ps4_title_id(id))) else {
             snapshot.complete=false; snapshot.errors.push("The library contained an invalid title ID.".into()); continue;
         };
         if !seen.insert(id) { snapshot.complete=false; snapshot.errors.push("The library contained a duplicate title ID.".into()); continue; }
-        let mut entry=LibraryTitle { title_id:id.into(),name:id.into(),version:None,base_version:None,update_version:None,icon:None,custom_icon:custom.contains(id),required_firmware:None,content_id:None,platform:if id.starts_with("CUSA") {"ps4"} else {"ps5"}.into(),sources:sources.get(id).cloned().unwrap_or_default() };
+        let mut entry=LibraryTitle { title_id:id.into(),name:id.into(),version:None,base_version:None,update_version:None,icon:None,custom_icon:custom.contains(id),required_firmware:None,content_id:None,platform:if super::ps4_title_id(id) {"ps4"} else {"ps5"}.into(),sources:sources.get(id).cloned().unwrap_or_default() };
         if connection_ok {
             let bytes=exchange(&mut socket,0x5f,&id_request(id)?,12+2*MAX_META+MAX_PNG).await;
             match bytes {

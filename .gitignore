@@ -26,6 +26,7 @@
 !/app/src-tauri/src/main.rs
 !/app/src-tauri/src/package_sources.rs
 !/app/src-tauri/src/package_sources/local_recipe.rs
+!/app/src-tauri/src/package_sources/community.rs
 !/app/src-tauri/tauri.conf.json
 !/app/src/App.tsx
 !/app/src/components/JobActions.tsx
@@ -202,8 +203,8 @@
 !/payload-ps4/system_ps4.h
 
 # SSPI Windows 2.23 production interface and diagnostics
-!/app/src/components/ActionBubbleMenu.tsx
-!/app/src/components/action-bubble-menu.css
+!/app/src/components/ActionMenu.tsx
+!/app/src/components/action-menu.css
 !/app/src/components/tools/system/CrashTimelineView.tsx
 !/app/src/components/tools/system/crash-timeline.css
 !/app/src/lib/crash-timeline.ts
@@ -211,14 +212,22 @@
 !/app/src-tauri/src/web_launcher.rs
 !/app/src-tauri/src/payload_catalog.rs
 !/app/src/lib/launcher-api.ts
+!/app/src/lib/community-sources.ts
 !/app/src/components/tools/WebLauncherPanel.tsx
-!/app/src/components/tools/WebLauncherPanel.css
+!/app/src/components/tools/web-launcher.css
+!/app/src/components/tools/payloads/AutostartCard.tsx
+!/app/src/components/tools/payloads/AutostartDialog.tsx
+!/app/src/components/tools/payloads/CatalogDialog.tsx
+!/app/src/components/tools/payloads/payloads.css
 !/app/src-tauri/src/updater.rs
 !/app/src/lib/updater.ts
 !/app/src/components/Updater.tsx
 !/app/src/components/updater.css
 
 # SSPI console launcher production source; runtime artwork stays local.
+!/launcher/native/payload-manager/src/app_installer.c
+!/launcher/native/payload-manager/src/sspi_shortcut_contract.h
+!/launcher/native/payload-manager/src/sspi_session_contract.h
 !/launcher/native/elfldr/socksrv.c
 !/launcher/native/elfldr/sspi_loader_contract.h
 !/launcher/native/elfldr/sspi_loader_status.h
@@ -251,9 +260,12 @@
 !/launcher/ui/payload-manager/frontend/src/components/views/StorageHub.jsx
 !/launcher/ui/payload-manager/frontend/src/sspi.css
 !/launcher/ui/payload-manager/frontend/src/utils/controllerFocus.js
+!/launcher/ui/payload-manager/frontend/src/utils/payloadLibrary.js
 !/launcher/ui/payload-manager/frontend/src/utils/serviceStatus.js
 !/launcher/ui/payload-manager/frontend/tailwind.config.js
 !/launcher/ui/webkit/frontend/autoloader/app.js
+!/launcher/ui/webkit/frontend/autoloader/entry.js
+!/launcher/ui/webkit/assets/param.json.template
 !/launcher/ui/webkit/frontend/autoloader/index.html
 !/launcher/ui/webkit/frontend/autoloader/style.css
 !/launcher/ui/webkit/frontend/installer-page/index.html

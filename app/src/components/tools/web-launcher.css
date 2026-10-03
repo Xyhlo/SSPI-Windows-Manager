@@ -1,0 +1,106 @@
+/* Local host controls and a terminal, using the shared SSPI surfaces. */
+.wl { flex: 1; min-height: 0; padding: 2px 6px 18px 2px; margin-right: -6px; }
+.wl-wrap { display: grid; gap: 16px; max-width: 1280px; margin: 0 auto; }
+.wl-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px 24px; padding: 4px 0 15px; border-bottom: 1px solid var(--line); }
+.wl-title { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.wl-title h2 { font-size: 18px; font-weight: 500; letter-spacing: -.02em; }
+.wl-state { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--faint); }
+.wl-state i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+.wl-state.on { color: var(--good-ink); }
+.wl-state.fail { color: var(--fail-ink); }
+.wl-preview { padding-left: 12px; border-left: 1px solid var(--line-2); font-size: 11px; color: var(--faint); }
+.wl-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.wl-controls > .btn { min-width: 116px; }
+.wl-address { display: flex; align-items: center; gap: 9px; font-size: 12px; color: var(--faint); }
+.wl-address .field { width: 192px; }
+.wl-address input { font-family: var(--mono); font-size: 12px; }
+.wl-address input[readonly] { color: var(--muted); }
+.wl-error { display: flex; align-items: flex-start; gap: 8px; padding: 10px 12px; border: 1px solid rgba(229, 72, 77, .28); border-radius: 8px; background: rgba(229, 72, 77, .04); color: var(--fail-ink); font-size: 12.5px; line-height: 1.5; overflow-wrap: anywhere; }
+.wl-error .i { flex: none; width: 15px; height: 15px; margin-top: 2px; }
+.wl-grid { display: grid; grid-template-columns: minmax(250px, 300px) minmax(0, 1fr); gap: 24px; align-items: start; }
+.wl-setup { padding: 3px 0; }
+.wl-setup h3 { margin-bottom: 5px; font-size: 14px; font-weight: 500; }
+.wl-setup > p { font-size: 12.5px; line-height: 1.55; color: var(--muted); }
+.wl-dns { display: grid; gap: 0; margin-top: 14px; border: 1px solid var(--line-2); border-radius: 9px; overflow: hidden; }
+.wl-dns-value { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 10px; padding: 10px 12px; text-align: left; border: 0; border-radius: 0; background: var(--glass); color: var(--ink-2); transition: background 140ms; }
+.wl-dns-value + .wl-dns-value { border-top: 1px solid var(--line); }
+.wl-dns-value > span { font-size: 11.5px; color: var(--faint); }
+.wl-dns-value > strong { grid-row: 2; font: 14px/1.4 var(--mono); }
+.wl-dns-value > .i { grid-column: 2; grid-row: 1 / 3; align-self: center; width: 14px; height: 14px; color: var(--faint); }
+.wl-dns-value:hover:not(:disabled) { background: var(--surface-2); }
+.wl-dns-value:hover:not(:disabled) > .i { color: var(--ink); }
+.wl-dns-value:disabled { opacity: .5; cursor: default; }
+.wl-instructions { counter-reset: setup; display: grid; gap: 17px; margin: 20px 0 18px; padding: 0; list-style: none; }
+.wl-instructions li { position: relative; padding-left: 25px; counter-increment: setup; }
+.wl-instructions li::before { content: counter(setup) "."; position: absolute; left: 0; top: 0; font: 12px/1.65 var(--mono); color: var(--faint); }
+.wl-instructions strong { display: block; margin-bottom: 5px; font-size: 13px; font-weight: 500; color: var(--ink-2); }
+.wl-instructions p { font-size: 12px; line-height: 1.65; color: var(--muted); }
+.wl-instructions p + p { margin-top: 4px; }
+.wl-setup > .wl-setup-note { padding-top: 13px; border-top: 1px solid var(--line); font-size: 12px; color: var(--faint); }
+.wl-preview-link { display: inline-flex; align-items: center; gap: 7px; margin-top: 13px; font-size: 12px; color: var(--ink-2); text-decoration: none; }
+.wl-preview-link:hover { color: var(--ink); }
+.wl-preview-link .i { width: 14px; height: 14px; color: var(--faint); }
+.wl-preview-link .i:last-child { width: 12px; height: 12px; }
+.wl-session { min-width: 0; display: grid; gap: 14px; }
+.wl-connection { border: 1px solid var(--line); border-radius: 10px; background: var(--glass); overflow: hidden; }
+.wl-console { display: flex; align-items: center; gap: 12px; padding: 13px 14px; }
+.wl-console > .i { flex: none; width: 23px; height: 23px; color: var(--muted); }
+.wl-console > div:not(.wl-counts) { flex: 1; min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; gap: 2px 10px; }
+.wl-console > div > span { font-size: 12px; color: var(--faint); }
+.wl-console strong { font-size: 14px; font-weight: 500; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.wl-console p { grid-column: 1 / -1; font-size: 11.5px; color: var(--faint); }
+.wl-counts { display: flex; gap: 14px; padding-left: 14px; border-left: 1px solid var(--line-2); white-space: nowrap; }
+.wl-counts b { margin-right: 3px; font: 13px/1.4 var(--mono); color: var(--ink-2); }
+.wl-traffic { margin: 0; border-top: 1px solid var(--line); }
+.wl-traffic > div { display: grid; grid-template-columns: 100px minmax(0, 1fr) auto; gap: 10px; align-items: baseline; padding: 9px 14px; }
+.wl-traffic > div + div { border-top: 1px solid var(--line); }
+.wl-traffic dt { font-size: 11.5px; color: var(--faint); }
+.wl-traffic dd { min-width: 0; display: flex; flex-wrap: wrap; gap: 2px 10px; margin: 0; }
+.wl-traffic dd strong { font: 11.5px/1.5 var(--mono); color: var(--ink-2); }
+.wl-traffic dd .wl-ready { color: var(--good-ink); }
+.wl-traffic dd span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--faint); }
+.wl-traffic .wl-when { justify-content: flex-end; font-size: 11px; color: var(--faint); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.wl-terminal { min-width: 0; border: 1px solid var(--line-2); border-radius: 10px; background: #0a0a0b; overflow: hidden; }
+.wl-terminal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 10px 7px 14px; border-bottom: 1px solid var(--line); }
+.wl-terminal-head h3 { font-size: 12px; font-weight: 500; color: var(--ink-2); }
+.wl-terminal-head > div { display: flex; align-items: center; gap: 5px; }
+.wl-terminal-head .btn { height: 27px; font-size: 11px; }
+.wl-terminal-head .btn .i { width: 13px; height: 13px; }
+.wl-follow.is-on { color: var(--ink); border-color: var(--line-2); background: rgba(255, 255, 255, .05); }
+.wl-feed { height: clamp(240px, 34vh, 380px); min-width: 0; padding: 9px 0 13px; color: var(--muted); user-select: text; }
+.wl-feed:focus-visible { outline: 1px solid var(--line-3); outline-offset: -2px; }
+.wl-log-line { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 10px; padding: 2px 14px 2px 8px; font: 11.5px/1.65 var(--mono); }
+.wl-log-line > span { text-align: right; color: var(--ghost); user-select: none; }
+.wl-log-line code { font: inherit; color: inherit; white-space: pre-wrap; overflow-wrap: anywhere; }
+.wl-log-line.fail code { color: var(--fail-ink); }
+.wl-feed-empty { padding: 8px 14px; color: var(--faint); font: 11.5px/1.7 var(--mono); }
+.wl-log-note { margin: 0; padding: 8px 14px; border-top: 1px solid var(--line); font-size: 11px; line-height: 1.5; color: var(--faint); }
+.wl-details { margin-top: 0; }
+.wl-details .tech-body p { max-width: 105ch; }
+@container app (max-width: 1100px) {
+  .wl-grid { grid-template-columns: minmax(220px, 260px) minmax(0, 1fr); gap: 16px; }
+  .wl-console { flex-wrap: wrap; }
+  .wl-counts { width: 100%; padding: 8px 0 0 35px; border: 0; }
+  .wl-traffic > div { grid-template-columns: 100px minmax(0, 1fr); gap: 3px 8px; }
+  .wl-traffic .wl-when { grid-column: 2; justify-content: flex-start; }
+}
+@container app (max-width: 850px) {
+  .wl-grid { grid-template-columns: minmax(0, 1fr); }
+  .wl-setup { padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+  .wl-dns { grid-template-columns: 1fr 1fr; }
+  .wl-dns-value + .wl-dns-value { border-top: 0; border-left: 1px solid var(--line); }
+  .wl-instructions { grid-template-columns: 1fr 1fr; gap: 16px; }
+  .wl-counts { width: auto; padding: 0 0 0 14px; border-left: 1px solid var(--line-2); }
+  .wl-traffic > div { grid-template-columns: 100px minmax(0, 1fr) auto; }
+  .wl-traffic .wl-when { grid-column: auto; justify-content: flex-end; }
+}
+@container app (max-width: 560px) {
+  .wl-controls { width: 100%; }
+  .wl-address { flex: 1; flex-wrap: wrap; gap: 5px; }
+  .wl-address .field { width: 100%; min-width: 150px; }
+  .wl-controls > .btn { align-self: flex-end; }
+  .wl-instructions { grid-template-columns: 1fr; }
+  .wl-counts { width: 100%; padding: 8px 0 0 35px; border: 0; }
+  .wl-traffic > div { grid-template-columns: 100px minmax(0, 1fr); }
+  .wl-traffic .wl-when { grid-column: 2; justify-content: flex-start; }
+}

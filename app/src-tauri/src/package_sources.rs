@@ -1,4 +1,5 @@
 mod local_recipe;
+pub mod community;
 use crate::static_catalog;
 use local_recipe::{scoped_titles, scoped_packages, source_link, utf8_window};
 use regex::Regex;
@@ -533,6 +534,14 @@ fn install_archive(
     bytes: Vec<u8>,
     install_url: &str,
 ) -> Result<Vec<SourceSummary>, String> {
+    let (archive_hash, descriptor, files) = validate_archive(bytes)?;
+    install_validated_archive(app, archive_hash, descriptor, files, install_url)
+}
+
+fn validate_archive(bytes: Vec<u8>) -> Result<(String, Descriptor, HashMap<String, Vec<u8>>), String> {
+    if bytes.len() > MAX_ARCHIVE {
+        return Err("Package Source exceeds the 8 MiB limit".into());
+    }
     let archive_hash = sha256(&bytes);
     let mut zip = ZipArchive::new(Cursor::new(bytes)).map_err(|_| "Package Source is not a ZIP")?;
     if zip.len() == 0 || zip.len() > MAX_ENTRIES {
@@ -625,8 +634,19 @@ fn install_archive(
         let value: Value = serde_json::from_slice(recipe).map_err(|_| "Recipe JSON is invalid")?;
         validate_recipe(&descriptor.engine.engine_type, &value)?;
     }
+    Ok((archive_hash, descriptor, files))
+}
+
+fn install_validated_archive(
+    app: &AppHandle,
+    archive_hash: String,
+    descriptor: Descriptor,
+    files: HashMap<String, Vec<u8>>,
+    install_url: &str,
+) -> Result<Vec<SourceSummary>, String> {
     let destination = source_dir(app, &descriptor.id, &descriptor.version)?;
     let mut registry = load_registry(app)?;
+    let enabled = enabled_after_install(&registry, &descriptor.id);
     if let Some(existing) = registry
         .sources
         .iter_mut()
@@ -635,7 +655,6 @@ fn install_archive(
         if existing.archive_sha256 != archive_hash {
             return Err("This source id/version is already installed with different bytes".into());
         }
-        existing.enabled = true;
         existing.install_url = install_url.to_owned();
         save_registry(app, &registry)?;
         return Ok(registry.sources.iter().map(summary).collect());
@@ -679,13 +698,18 @@ fn install_archive(
         description: descriptor.description,
         version: descriptor.version,
         engine_type: descriptor.engine.engine_type,
-        enabled: true,
+        enabled,
         trust: "unsigned-dev".into(),
         install_url: install_url.to_owned(),
         archive_sha256: archive_hash,
     });
     save_registry(app, &registry)?;
     Ok(registry.sources.iter().map(summary).collect())
+}
+
+fn enabled_after_install(registry: &Registry, source_id: &str) -> bool {
+    registry.sources.iter().find(|source| source.id == source_id)
+        .map(|source| source.enabled).unwrap_or(true)
 }
 
 pub fn set_enabled(app: &AppHandle, id: &str, enabled: bool) -> Result<Vec<SourceSummary>, String> {
@@ -2980,7 +3004,17 @@ mod supplied_catalog_tests {
         let declared: Vec<_> = descriptor.files.iter().map(|f| (f.path.clone(), f.size, f.sha256.clone())).collect();
         let counts = static_catalog::validate_installed(&root, &declared).unwrap();
         let catalog = static_catalog::cached(&root).unwrap();
-        let titles = catalog.search("", "", 60000);
+        let mut titles = catalog.search("", "", 60000);
+        // Resolve by shard so this full-catalog test does not repeatedly evict the small runtime cache.
+        let manifest: Value = serde_json::from_slice(&fs::read(root.join("catalog.json")).unwrap()).unwrap();
+        let mut shards = std::collections::HashMap::<String, String>::new();
+        for file in manifest["indexFiles"].as_array().unwrap() {
+            let index: Value = serde_json::from_slice(&fs::read(root.join(file.as_str().unwrap())).unwrap()).unwrap();
+            for row in index["titles"].as_array().unwrap() {
+                shards.insert(row["titleId"].as_str().unwrap().into(), row["packagesFile"].as_str().unwrap().into());
+            }
+        }
+        titles.sort_by_key(|t| shards.get(&t.title_id).cloned().unwrap_or_default());
         assert_eq!(titles.len() as u64, counts.ready_titles);
         // PS4 titles plus PS2 classics packaged for PS4 (SLUS, SLES, SCUS, ...).
         assert!(titles.iter().all(|t| t.title_id.starts_with("CUSA") || t.title_id.starts_with('S')));
