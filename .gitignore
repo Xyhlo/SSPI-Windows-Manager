@@ -206,6 +206,7 @@
 !/app/src/components/tools/system/crash-timeline.css
 !/app/src/lib/crash-timeline.ts
 !/app/src-tauri/src/payload_autostart.rs
+!/app/src-tauri/src/payload_wake.rs
 !/app/src-tauri/src/web_launcher.rs
 !/app/src-tauri/src/payload_catalog.rs
 !/app/src/lib/launcher-api.ts
@@ -215,6 +216,7 @@
 !/app/src/components/tools/payloads/AutostartCard.tsx
 !/app/src/components/tools/payloads/AutostartDialog.tsx
 !/app/src/components/tools/payloads/CatalogDialog.tsx
+!/app/src/components/tools/payloads/RunningPayloads.tsx
 !/app/src/components/tools/payloads/payloads.css
 !/app/src-tauri/src/updater.rs
 !/app/src/lib/updater.ts

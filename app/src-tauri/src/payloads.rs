@@ -264,10 +264,47 @@ fn index_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
-pub(super) async fn send_configured(app: &AppHandle, settings: &Settings, id: &str, target: &str) -> Result<PayloadSendResult, String> {
+pub(super) async fn send_autostart(app: &AppHandle, settings: &Settings, id: &str, target: &str, process_name: &str, generation: u64, automatic: bool) -> Result<(bool, String), String> {
     let _send = send_lock().try_lock().map_err(|_| "Another payload is being sent. Wait for it to finish.".to_string())?;
-    let (host, port) = if target == "ps4" { (&settings.ps4_host, settings.ps4_loader_port) } else { (&settings.ps5_host, settings.ps5_loader_port) };
-    send_payload_at(&store_root(app)?, id, target, host, port.into(), settings, DEFAULT_PS5_TIMING).await
+    send_autostart_at(&store_root(app)?,settings,id,target,process_name,automatic,|| crate::payload_autostart::is_current(app,target,generation)).await
+}
+
+async fn send_autostart_at(root: &Path, settings: &Settings, id: &str, target: &str, process_name: &str, automatic: bool, current: impl Fn() -> bool) -> Result<(bool, String), String> {
+    let (host, port, receiver_port) = if target == "ps4" { (&settings.ps4_host, settings.ps4_loader_port, settings.ps4_receiver_port) } else { (&settings.ps5_host, settings.ps5_loader_port, settings.ps5_port) };
+    // The receiver has its own live handshake and can bootstrap a manual run.
+    if is_builtin(id) {
+        if !current() { return Err("The order or console address changed.".into()); }
+        match crate::console_diagnostics::running_process_names(target,host,receiver_port).await {
+            Ok(_) => return Ok((true,"Receiver already running. Skipped sending.".into())),
+            Err(error) if automatic => return Err(format!("Receiver state is unknown; automatic launch stopped. {error}")),
+            Err(_) => {},
+        }
+        if !current() { return Err("The order or console address changed.".into()); }
+        return send_payload_at(root, id, target, host, port.into(), settings, DEFAULT_PS5_TIMING).await.and_then(|r| if r.verified { Ok((true,r.message)) } else { Err("Receiver sent but not verified. The order stopped without resending.".into()) });
+    }
+    if process_name.is_empty() {
+        if automatic { return Err("Set this payload's exact process name in Edit order, or use Run now. Automatic launch was blocked because its running state is unknown.".into()); }
+        if !current() { return Err("The order or console address changed.".into()); }
+        return send_payload_at(root,id,target,host,port.into(),settings,DEFAULT_PS5_TIMING).await.map(|r| (r.verified,format!("Manual send: {} Running process was not verified.",r.message)));
+    }
+    let names = crate::console_diagnostics::running_process_names(target, host, receiver_port).await
+        .map_err(|e| format!("Running state is unknown; nothing was sent. {e}"))?;
+    if names.iter().any(|name| name.eq_ignore_ascii_case(process_name)) {
+        return Ok((true, format!("Already running: {process_name}. Skipped sending.")));
+    }
+    if !current() { return Err("The order or console address changed.".into()); }
+    send_payload_at(root, id, target, host, port.into(), settings, DEFAULT_PS5_TIMING).await?;
+    let verified = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            sleep(Duration::from_millis(500)).await;
+            let names = crate::console_diagnostics::running_process_names(target, host, receiver_port).await?;
+            if names.iter().any(|name| name.eq_ignore_ascii_case(process_name)) { return Ok::<(), String>(()); }
+        }
+    }).await;
+    match verified {
+        Ok(Ok(())) => Ok((true, format!("Running process verified: {process_name}."))),
+        _ => Err(format!("Sent, but {process_name} could not be verified. The order stopped without resending.")),
+    }
 }
 
 fn store_root(app: &AppHandle) -> Result<PathBuf, String> {
@@ -995,6 +1032,81 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let task = tokio::spawn(serve_receiver(listener, config));
         (port, task)
+    }
+
+    async fn process_receiver(target: &str, running: std::sync::Arc<std::sync::atomic::AtomicBool>, truncated: bool) -> (u16, JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST,0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let target = target.to_string();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket,_) = listener.accept().await.unwrap();
+                let mut header = [0u8;5];
+                socket.read_exact(&mut header).await.unwrap();
+                assert_eq!(header[0],0x53);
+                reply(&mut socket,3,&serde_json::to_vec(&json!({"platform":target,"version":"1.0.14","capabilities":["diagnostics-v1"]})).unwrap()).await;
+                socket.read_exact(&mut header).await.unwrap();
+                assert_eq!(header[0],0x6a);
+                let name = if running.load(std::sync::atomic::Ordering::SeqCst) { "service.elf" } else { "System" };
+                reply(&mut socket,3,&serde_json::to_vec(&json!({"truncated":truncated,"processes":[{
+                    "pid":200,"ppid":1,"name":name,"state":"sleeping","uid":0,"titleId":null,"appType":null,"authId":null,
+                    "rssBytes":1,"vmBytes":1,"threads":1,"startedAt":1,"cpuMs":1,"control":"payload"
+                }]})).unwrap()).await;
+            }
+        });
+        (port,task)
+    }
+
+    #[tokio::test]
+    async fn autostart_skips_live_processes_and_refuses_unknown_incomplete_or_cancelled_runs() {
+        for target in ["ps4","ps5"] {
+            for (running,truncated,name,current) in [(true,false,"service.elf",true),(false,true,"service.elf",true),(false,false,"",true),(false,false,"service.elf",false)] {
+                let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(running));
+                let (receiver_port,receiver) = process_receiver(target,flag,truncated).await;
+                let loader = TcpListener::bind((Ipv4Addr::LOCALHOST,0)).await.unwrap();
+                let loader_port = loader.local_addr().unwrap().port();
+                let settings = Settings { ps5_host:"127.0.0.1".into(),ps4_host:"127.0.0.1".into(),ps5_port:receiver_port,ps4_receiver_port:receiver_port,ps5_loader_port:loader_port,ps4_loader_port:loader_port,..Settings::default() };
+                let result = send_autostart_at(&temp_root(),&settings,"test",target,name,true,|| current).await;
+                if running { assert!(result.unwrap().1.contains("Already running")); } else { assert!(result.is_err()); }
+                if truncated {
+                    let id = if target == "ps4" { BUILTIN_PS4 } else { BUILTIN_PS5 };
+                    assert!(send_autostart_at(&temp_root(),&settings,id,target,"",true,|| true).await.unwrap_err().contains("Receiver state is unknown"));
+                }
+                assert!(timeout(Duration::from_millis(30),loader.accept()).await.is_err(),"Must not touch the loader");
+                receiver.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn autostart_sends_only_absent_payload_and_verifies_its_process() {
+        for target in ["ps4","ps5"] {
+          for (automatic,process_name) in [(true,"service.elf"),(false,"")] {
+            let root = temp_root(); fs::create_dir_all(&root).unwrap();
+            let input = root.join("service.bin"); fs::write(&input,b"test service payload").unwrap();
+            let entries = add_payloads_at(&root,&[input.to_string_lossy().into_owned()],target).unwrap();
+            let id = entries.iter().find(|p| !p.builtin).unwrap().id.clone();
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (receiver_port,receiver) = process_receiver(target,flag.clone(),false).await;
+            let loader = TcpListener::bind((Ipv4Addr::LOCALHOST,0)).await.unwrap();
+            let loader_port = loader.local_addr().unwrap().port();
+            let sent = tokio::spawn(async move {
+                let (mut socket,_) = loader.accept().await.unwrap();
+                let mut bytes = Vec::new(); socket.read_to_end(&mut bytes).await.unwrap();
+                assert_eq!(bytes,b"test service payload");
+                flag.store(true,std::sync::atomic::Ordering::SeqCst);
+                assert!(timeout(Duration::from_millis(800),loader.accept()).await.is_err());
+            });
+            let settings = Settings { ps5_host:"127.0.0.1".into(),ps4_host:"127.0.0.1".into(),ps5_port:receiver_port,ps4_receiver_port:receiver_port,ps5_loader_port:loader_port,ps4_loader_port:loader_port,..Settings::default() };
+            let result = send_autostart_at(&root,&settings,&id,target,process_name,automatic,|| true).await.unwrap();
+            if automatic {
+                assert!(result.0 && result.1.contains("verified"));
+                let second = send_autostart_at(&root,&settings,&id,target,process_name,true,|| true).await.unwrap();
+                assert!(second.1.contains("Already running"));
+            } else { assert!(!result.0 && result.1.contains("Manual send")); }
+            sent.await.unwrap(); receiver.abort();
+          }
+        }
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 /* =====================================================================
-   Autostart order — the payloads SSPI sends when it starts, top to
+   Autostart order — the payloads SSPI starts manually or on a verified wake, top to
    bottom, each after its own wait. Drag rows to reorder, drag from the
    library to add, drag back to the library to remove. Alt+↑/↓ moves the
    focused payload, Delete removes it.
@@ -15,7 +15,7 @@ import { AUTOSTART_MAX_DELAY_MS, AUTOSTART_MAX_STEPS, type AutostartOrder, type 
 import { SPRINGS, clamp, motionOK } from "@/lib/motion"
 import type { ConsoleKind } from "@/types"
 
-type Item = { payloadId: string; delayMs: number }
+type Item = { payloadId: string; delayMs: number; processName?: string }
 type Drag = { from: "seq" | "lib"; id: string; x: number; y: number; dx: number; dy: number; w: number; over: number | null; overLib: boolean; origin: number }
 type Props = {
   open: boolean; target: ConsoleKind; loader: string; payloads: PayloadEntry[]; status?: AutostartStatus
@@ -42,7 +42,7 @@ export function AutostartDialog({ open, target, loader, payloads, status, adding
 
   useEffect(() => {
     if (!open) return
-    const saved = (status?.steps || []).map(step => ({ payloadId: step.payloadId, delayMs: step.delayMs }))
+    const saved = (status?.steps || []).map(step => ({ payloadId: step.payloadId, delayMs: step.delayMs, processName: step.processName || "" }))
     const next = adding && !saved.some(item => item.payloadId === adding) ? [...saved, { payloadId: adding, delayMs: saved.length ? DEFAULT_DELAY : 0 }] : saved
     setOrder(next); setEnabled(status?.enabled || !saved.length || !!adding); setSearch(""); setError(""); setDrag(null); setFresh(adding || "")
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -138,7 +138,7 @@ export function AutostartDialog({ open, target, loader, payloads, status, adding
           <header className="as-head">
             <div>
               <RD.Title asChild><h2>Autostart order</h2></RD.Title>
-              <p className="lede">Sent to the {loader} on your {name}, top to bottom, each time SSPI starts.</p>
+              <p className="lede">Run now, or after SSPI observes your {name} wake from rest mode. Each process is checked before sending to the {loader}. Use the exact name shown in Running payloads; unnamed steps run only when you press Run now.</p>
             </div>
             <label className="as-enable"><span>{enabled ? "On" : "Off"}</span><Switch label="Autostart on" checked={enabled} onChange={setEnabled} /></label>
           </header>
@@ -154,7 +154,7 @@ export function AutostartDialog({ open, target, loader, payloads, status, adding
                   ? <li key="gap" data-flip="gap" className="as-gap" aria-hidden />
                   : <SeqRow key={item.payloadId} item={item} index={position++} entry={byId.get(item.payloadId)} fresh={fresh === item.payloadId}
                       onPointerDown={event => pointer(event, "seq", item.payloadId)} onKeyDown={event => keyRow(event, item.payloadId, order.indexOf(item))}
-                      onDelay={ms => setDelay(item.payloadId, ms)} onRemove={() => remove(item.payloadId)} />)}
+                      onDelay={ms => setDelay(item.payloadId, ms)} onProcessName={processName => setOrder(old => old.map(row => row.payloadId === item.payloadId ? { ...row, processName } : row))} onRemove={() => remove(item.payloadId)} />)}
                 {!shown.length && <li className="as-empty"><Icon name="grip" /><strong>Drag payloads here</strong><span>or press + in the library. They'll be sent in this order.</span></li>}
               </ol>
             </section>
@@ -197,10 +197,10 @@ export function AutostartDialog({ open, target, loader, payloads, status, adding
   )
 }
 
-function SeqRow({ item, index, entry, fresh, onPointerDown, onKeyDown, onDelay, onRemove }: {
+function SeqRow({ item, index, entry, fresh, onPointerDown, onKeyDown, onDelay, onProcessName, onRemove }: {
   item: Item; index: number; entry?: PayloadEntry; fresh: boolean
   onPointerDown: (event: ReactPointerEvent<HTMLElement>) => void; onKeyDown: (event: ReactKeyboardEvent) => void
-  onDelay: (ms: number) => void; onRemove: () => void
+  onDelay: (ms: number) => void; onProcessName: (value: string) => void; onRemove: () => void
 }) {
   return (
     <li data-row={item.payloadId} data-flip={item.payloadId} tabIndex={0} className={`as-row ${fresh ? "is-fresh" : ""} ${entry ? "" : "is-missing"}`}
@@ -208,7 +208,9 @@ function SeqRow({ item, index, entry, fresh, onPointerDown, onKeyDown, onDelay, 
       <span className="as-grip" aria-hidden><Icon name="grip" /></span>
       <span className="as-num">{index + 1}</span>
       {entry ? <Glyph entry={entry} /> : <span className="pl-glyph sm"><Icon name="alert" /></span>}
-      <span className="as-name"><strong>{entry?.name || "Missing payload"}</strong><span>{entry ? entry.fileName : "Removed from the library"}</span></span>
+      <span className="as-name"><strong>{entry?.name || "Missing payload"}</strong><span>{entry ? entry.fileName : "Removed from the library"}</span>
+        {!entry?.builtin && <input className="as-process-name" aria-label={`Process name for ${entry?.name || "payload"}`} placeholder="Exact process name" maxLength={39} value={item.processName || ""} onChange={event => onProcessName(event.target.value)} onKeyDown={event => event.stopPropagation()} />}
+      </span>
       <Delay ms={item.delayMs} label={index === 0 ? "after start" : "after previous"} onChange={onDelay} />
       <button type="button" className="btn sm icon ghost as-x" aria-label={`Remove ${entry?.name || "payload"} from the order`} onClick={onRemove}><Icon name="x" /></button>
     </li>

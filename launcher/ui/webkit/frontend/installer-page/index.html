@@ -379,6 +379,7 @@
       var progressBar = document.getElementById('progressBar');
       var progressPct = document.getElementById('progressPct');
       var completed = false;
+      var cacheReady = false;
       var isDownloading = false;
       var isRetry = false;
       var currentUid = '';
@@ -448,6 +449,14 @@
         var p = new URLSearchParams(window.location.search);
         p.set('exploit', choice);
         window.location.replace(window.location.pathname + '?' + p.toString());
+      }
+
+      // The native server strips the manifest until it receives the selection.
+      // Choosing only in JavaScript cannot start AppCache on that first page.
+      if (!needsChoice && !isUnsupported && chosenExploit &&
+          !document.documentElement.getAttribute('manifest')) {
+        chooseExploit(chosenExploit);
+        return;
       }
 
       if (btnPoops) {
@@ -603,6 +612,7 @@
               if (hdrUid) currentUid = hdrUid;
               probeOk = true;
               setCaching();
+              if (cacheReady) maybeInstall();
             } else {
               goToAutoloader();
             }
@@ -640,7 +650,7 @@
       }
 
       function maybeInstall() {
-        if (completed) {
+        if (completed || !cacheReady || !probeOk) {
           return;
         }
         completed = true;
@@ -802,6 +812,12 @@
           } catch (e) { }
         }
 
+        if (!window.applicationCache) {
+          progressWrap.hidden = true;
+          statusEl.textContent = 'Offline cache unavailable';
+          detailEl.textContent = 'This browser did not provide its offline cache. Close the page and reopen setup from the console browser.';
+          return;
+        }
         probeServer();
 
         /* The shortcut is created only once the AppCache is current, so the
@@ -813,13 +829,6 @@
             return;
           }
           if (!probeOk) {
-            clearInterval(waitTimer);
-            goToAutoloader();
-            return;
-          }
-          if (!window.applicationCache) {
-            clearInterval(waitTimer);
-            maybeInstall();
             return;
           }
           if (window.applicationCache.status === window.applicationCache.UPDATEREADY) {
@@ -827,6 +836,7 @@
             try {
               window.applicationCache.swapCache();
             } catch (e) { }
+            cacheReady = true;
             maybeInstall();
             return;
           }
@@ -871,16 +881,19 @@
         });
         window.applicationCache.addEventListener('cached', function() {
           isDownloading = false;
+          cacheReady = true;
           appendLog("[AppCache] Caching complete.");
           maybeInstall();
         });
         window.applicationCache.addEventListener('noupdate', function() {
           isDownloading = false;
+          cacheReady = true;
           appendLog("[AppCache] No update needed.");
           maybeInstall();
         });
         window.applicationCache.addEventListener('updateready', function () {
           isDownloading = false;
+          cacheReady = true;
           if (window.applicationCache.status === window.applicationCache.UPDATEREADY) {
             try {
               window.applicationCache.swapCache();

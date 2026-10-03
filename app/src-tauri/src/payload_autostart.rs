@@ -1,5 +1,5 @@
 //! Opt-in payload autostart: the chosen payloads go to the console's loader in their saved order,
-//! each after its own delay, once per SSPI launch or when asked to run now. Bounded, never repeated.
+//! each after its own delay, on Run now or a confirmed console wake. Never on app startup.
 use serde::{Deserialize, Serialize};
 use std::{collections::{BTreeMap, BTreeSet}, fs, path::PathBuf, sync::{Mutex, OnceLock}, time::{SystemTime, UNIX_EPOCH}};
 use tauri::{AppHandle, Manager};
@@ -23,6 +23,8 @@ pub(super) struct Step {
     payload_id: String,
     #[serde(default)]
     delay_ms: u64,
+    #[serde(default)]
+    process_name: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -48,7 +50,7 @@ impl Config {
     fn sequence(&self, target: &str) -> Sequence {
         if let Some(sequence) = self.sequences.get(target) { return sequence.clone(); }
         match self.payloads.get(target) {
-            Some(id) => Sequence { enabled: true, steps: vec![Step { payload_id: id.clone(), delay_ms: 0 }] },
+            Some(id) => Sequence { enabled: true, steps: vec![Step { payload_id: id.clone(), delay_ms: 0, process_name: String::new() }] },
             None => Sequence::default(),
         }
     }
@@ -59,6 +61,7 @@ impl Config {
 pub(super) struct StepStatus {
     payload_id: String,
     delay_ms: u64,
+    process_name: String,
     /// pending · waiting · sending · sent · verified · failed · skipped
     state: String,
     message: String,
@@ -84,6 +87,8 @@ struct Run {
     generation: u64,
     status: Status,
     stop_after_current: bool,
+    endpoint: Option<String>,
+    automatic: bool,
 }
 
 fn runs() -> &'static Mutex<BTreeMap<String, Run>> {
@@ -106,11 +111,11 @@ fn read_config(app: &AppHandle) -> Result<Config, String> {
 /// The configured order for this session, not yet scheduled.
 fn idle(target: &str, sequence: &Sequence, generation: u64) -> Run {
     let on = sequence.enabled && !sequence.steps.is_empty();
-    Run { generation, stop_after_current: false, status: Status {
+    Run { generation, stop_after_current: false, endpoint: None, automatic: false, status: Status {
         target: target.into(), enabled: sequence.enabled,
-        steps: sequence.steps.iter().map(|step| StepStatus { payload_id: step.payload_id.clone(), delay_ms: step.delay_ms, state: "pending".into(), message: String::new() }).collect(),
+        steps: sequence.steps.iter().map(|step| StepStatus { payload_id: step.payload_id.clone(), delay_ms: step.delay_ms, process_name: step.process_name.clone(), state: "pending".into(), message: String::new() }).collect(),
         phase: if on { "ready" } else { "off" }.into(),
-        message: if on { "Runs the next time SSPI starts." } else { "Autostart is off." }.into(),
+        message: if on { "Ready for Run now or a confirmed console wake with a fresh process list." } else { "Autostart is off." }.into(),
         current: None, attempts: 0, last_attempt_at: None, next_attempt_at: None,
     } }
 }
@@ -127,22 +132,15 @@ fn schedule(run: &mut Run, at: u64, grace: u64) {
 
 fn armed(target: &str, sequence: &Sequence, generation: u64, at: u64) -> Run {
     let mut run = idle(target, sequence, generation);
+    run.automatic = true;
     if run.status.phase == "ready" { schedule(&mut run, at, START_GRACE_MS); }
     run
 }
 
-/// Whether this session's run already put bytes on the wire (or may have).
-fn touched(status: &Status) -> bool {
-    status.steps.iter().any(|step| matches!(step.state.as_str(), "sending" | "sent" | "verified" | "failed"))
-}
-
-/// A saved order replaces an untouched run and schedules it; after a send it waits for the next launch.
-fn replace(previous: Option<&Run>, target: &str, sequence: &Sequence, at: u64) -> Run {
+/// Saving or enabling an order never sends anything.
+fn replace(previous: Option<&Run>, target: &str, sequence: &Sequence) -> Run {
     let generation = previous.map_or(1, |run| run.generation + 1);
-    match previous {
-        Some(run) if touched(&run.status) => idle(target, sequence, generation),
-        _ => armed(target, sequence, generation, at),
-    }
+    idle(target, sequence, generation)
 }
 
 fn validate(steps: &[Step]) -> Result<(), String> {
@@ -151,6 +149,9 @@ fn validate(steps: &[Step]) -> Result<(), String> {
     for step in steps {
         if step.payload_id.is_empty() || !seen.insert(step.payload_id.as_str()) { return Err("Each payload can appear once in the autostart order.".into()); }
         if step.delay_ms > MAX_DELAY_MS { return Err(format!("Delays can be up to {} seconds.", MAX_DELAY_MS / 1000)); }
+        if step.process_name.len() >= 40 || !step.process_name.bytes().all(|c| (0x20..0x7f).contains(&c)) || step.process_name.trim() != step.process_name {
+            return Err("Use the exact process name from Running payloads (up to 39 printable characters).".into());
+        }
     }
     Ok(())
 }
@@ -185,7 +186,7 @@ pub(super) fn set_payload_autostart(app: AppHandle, target: String, enabled: boo
     let temp = path.with_extension("json.tmp");
     fs::write(&temp, serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?).map_err(|e| format!("Could not save autostart: {e}"))?;
     fs::rename(&temp, path).map_err(|e| format!("Could not save autostart: {e}"))?;
-    let run = replace(map.get(&target), &target, &sequence, now());
+    let run = replace(map.get(&target), &target, &sequence);
     map.insert(target, run);
     drop(map);
     Ok(get_payload_autostart())
@@ -198,7 +199,7 @@ pub(super) fn run_payload_autostart(target: String) -> Result<Vec<Status>, Strin
         let run = map.get_mut(&target).ok_or("Autostart isn't set up for this console.")?;
         if !run.status.enabled || run.status.steps.is_empty() { return Err("Turn on autostart and add payloads first.".into()); }
         if matches!(run.status.phase.as_str(), "waiting" | "unavailable" | "sending") { return Err("Autostart is already running.".into()); }
-        let steps = run.status.steps.iter().map(|step| Step { payload_id: step.payload_id.clone(), delay_ms: step.delay_ms }).collect();
+        let steps = saved_steps(run);
         let mut next = idle(&target, &Sequence { enabled: true, steps }, run.generation + 1);
         schedule(&mut next, now(), 0);
         *run = next;
@@ -266,9 +267,8 @@ fn complete(run: &mut Run, index: usize, verified: bool, message: String, at: u6
         status.current = Some(next);
         status.next_attempt_at = Some(at + status.steps[next].delay_ms);
     } else {
-        let sent = status.steps.len();
         status.phase = "done".into();
-        status.message = format!("Sent {sent} payload{}.", if sent == 1 { "" } else { "s" });
+        status.message = "Order complete. Already-running processes were kept running.".into();
         status.current = None;
         status.next_attempt_at = None;
     }
@@ -334,9 +334,8 @@ pub(super) fn record_manual(target: &str, id: &str, result: &Result<payloads::Pa
 pub(super) fn start(app: AppHandle) {
     {
         let mut map = runs().lock().unwrap_or_else(|p| p.into_inner());
-        let at = now();
         match read_config(&app) {
-            Ok(config) => for target in ["ps5", "ps4"] { map.insert(target.into(), armed(target, &config.sequence(target), 1, at)); },
+            Ok(config) => for target in ["ps5", "ps4"] { map.insert(target.into(), idle(target, &config.sequence(target), 1)); },
             Err(error) => for target in ["ps5", "ps4"] {
                 let mut run = idle(target, &Sequence::default(), 1);
                 run.status.phase = "failed".into();
@@ -345,6 +344,7 @@ pub(super) fn start(app: AppHandle) {
             },
         }
     }
+    watch_wakes(app.clone());
     tauri::async_runtime::spawn(async move {
         loop {
             // Short ticks keep each payload's delay close to what the user set.
@@ -353,17 +353,86 @@ pub(super) fn start(app: AppHandle) {
                 let claimed = { claim(&mut runs().lock().unwrap_or_else(|p| p.into_inner()), target, now()) };
                 let Some((generation, id)) = claimed else { continue; };
                 let settings = app.state::<AppState>().settings.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                let outcome = payloads::send_configured(&app, &settings, &id, target).await.map(|result| (result.verified, result.message));
+                let endpoint = endpoint(&settings, target);
+                let (process_name, automatic) = {
+                    let mut map = runs().lock().unwrap_or_else(|p| p.into_inner());
+                    let Some(run) = map.get_mut(target).filter(|run| run.generation == generation) else { continue; };
+                    if run.endpoint.as_ref().is_some_and(|old| old != &endpoint) {
+                        let index = run.status.current.unwrap();
+                        halt(run, index, "Console address changed. Use Run now after checking the new console.".into());
+                        continue;
+                    }
+                    run.endpoint = Some(endpoint);
+                    (run.status.steps[run.status.current.unwrap()].process_name.clone(), run.automatic)
+                };
+                let outcome = payloads::send_autostart(&app, &settings, &id, target, &process_name, generation, automatic).await;
                 finish(&mut runs().lock().unwrap_or_else(|p| p.into_inner()), target, generation, outcome, now());
             }
         }
     });
 }
 
+fn saved_steps(run: &Run) -> Vec<Step> {
+    run.status.steps.iter().map(|step| Step { payload_id: step.payload_id.clone(), delay_ms: step.delay_ms, process_name: step.process_name.clone() }).collect()
+}
+
+fn endpoint(settings: &crate::Settings, target: &str) -> String {
+    if target == "ps4" { format!("{}:{}:{}",settings.ps4_host,settings.ps4_receiver_port,settings.ps4_loader_port) }
+    else { format!("{}:{}:{}",settings.ps5_host,settings.ps5_port,settings.ps5_loader_port) }
+}
+
+pub(super) fn is_current(app: &AppHandle, target: &str, generation: u64) -> bool {
+    let settings = app.state::<AppState>().settings.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let key = endpoint(&settings,target);
+    runs().lock().unwrap_or_else(|p| p.into_inner()).get(target).is_some_and(|run| run.generation == generation && !run.stop_after_current && run.endpoint.as_deref() == Some(key.as_str()))
+}
+
+fn watch_wakes(app: AppHandle) {
+    for target in ["ps5", "ps4"] {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut watch = crate::payload_wake::Watch::default();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let run = runs().lock().unwrap_or_else(|p| p.into_inner()).get(target).cloned();
+                let Some(run) = run.filter(|r| r.status.enabled && !r.status.steps.is_empty()) else { watch = Default::default(); continue; };
+                let settings = app.state::<AppState>().settings.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                let key = endpoint(&settings,target);
+                let (host,port) = if target == "ps4" { (&settings.ps4_host,settings.ps4_receiver_port) } else { (&settings.ps5_host,settings.ps5_port) };
+                let power = crate::payload_wake::observe(target,host).await;
+                if !watch.update(&format!("{key}:{}",run.generation),power) {
+                    if !watch.pending() && run.status.message.starts_with("Console woke;") {
+                        if let Some(current) = runs().lock().unwrap_or_else(|p| p.into_inner()).get_mut(target).filter(|r| r.generation==run.generation) {
+                            current.status.message = "Wake check ended without a known process state. Use Run now when ready.".into();
+                        }
+                    }
+                    continue;
+                }
+                if matches!(run.status.phase.as_str(),"waiting"|"unavailable"|"sending") { watch.consume(); continue; }
+                if let Err(error) = crate::console_diagnostics::running_process_names(target,host,port).await {
+                    if let Some(current) = runs().lock().unwrap_or_else(|p| p.into_inner()).get_mut(target).filter(|r| r.generation==run.generation) {
+                        current.status.message = format!("Console woke; waiting for a complete process list. {error}");
+                    }
+                    continue;
+                }
+                let current_settings = app.state::<AppState>().settings.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                if endpoint(&current_settings,target) != key { continue; }
+                let mut map = runs().lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(current) = map.get_mut(target).filter(|r| r.generation==run.generation && !matches!(r.status.phase.as_str(),"waiting"|"unavailable"|"sending")) {
+                    *current = armed(target,&Sequence { enabled:true, steps:saved_steps(&run) },run.generation+1,now());
+                    current.endpoint = Some(key);
+                    current.status.message = "Console wake confirmed; checking each payload before starting it.".into();
+                }
+                watch.consume();
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn steps(list: &[(&str, u64)]) -> Vec<Step> { list.iter().map(|(id, delay)| Step { payload_id: (*id).into(), delay_ms: *delay }).collect() }
+    fn steps(list: &[(&str, u64)]) -> Vec<Step> { list.iter().map(|(id, delay)| Step { payload_id: (*id).into(), delay_ms: *delay, process_name: String::new() }).collect() }
     fn sequence(list: &[(&str, u64)]) -> Sequence { Sequence { enabled: true, steps: steps(list) } }
     fn setup(list: &[(&str, u64)]) -> BTreeMap<String, Run> { BTreeMap::from([("ps5".into(), armed("ps5", &sequence(list), 1, 0))]) }
     fn states(map: &BTreeMap<String, Run>) -> Vec<&str> { map["ps5"].status.steps.iter().map(|step| step.state.as_str()).collect() }
@@ -445,13 +514,15 @@ mod tests {
     }
 
     #[test]
-    fn saving_after_a_send_waits_for_the_next_launch() {
+    fn startup_and_saving_never_schedule_a_send() {
+        let mut startup = BTreeMap::from([("ps5".into(), idle("ps5",&sequence(&[("a",0)]),1))]);
+        assert!(claim(&mut startup,"ps5",u64::MAX).is_none());
         let mut map = setup(&[("a", 0), ("b", 0)]);
-        let untouched = replace(map.get("ps5"), "ps5", &sequence(&[("b", 0), ("a", 0)]), 100);
-        assert_eq!(untouched.status.phase, "waiting");
+        let untouched = replace(map.get("ps5"), "ps5", &sequence(&[("b", 0), ("a", 0)]));
+        assert_eq!(untouched.status.phase, "ready");
         claim(&mut map, "ps5", START_GRACE_MS);
         finish(&mut map, "ps5", 1, Ok((false, "Sent".into())), START_GRACE_MS);
-        let later = replace(map.get("ps5"), "ps5", &sequence(&[("b", 0), ("a", 0)]), 100);
+        let later = replace(map.get("ps5"), "ps5", &sequence(&[("b", 0), ("a", 0)]));
         assert_eq!(later.status.phase, "ready");
         assert_eq!(later.generation, 2);
         map.insert("ps5".into(), later);
@@ -480,7 +551,7 @@ mod tests {
         assert!(validate(&steps(&[("a", 0), ("a", 0)])).is_err());
         assert!(validate(&steps(&[("a", MAX_DELAY_MS + 1)])).is_err());
         let many: Vec<(String, u64)> = (0..=MAX_STEPS).map(|n| (n.to_string(), 0)).collect();
-        assert!(validate(&many.iter().map(|(id, delay)| Step { payload_id: id.clone(), delay_ms: *delay }).collect::<Vec<_>>()).is_err());
+        assert!(validate(&many.iter().map(|(id, delay)| Step { payload_id: id.clone(), delay_ms: *delay, process_name: String::new() }).collect::<Vec<_>>()).is_err());
     }
 
     #[test]

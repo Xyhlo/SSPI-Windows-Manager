@@ -1,7 +1,7 @@
 #ifndef SSPI_PS5_CONSOLE_TOOLS_H
 #define SSPI_PS5_CONSOLE_TOOLS_H
 #include "console_files.h"
-#define PS5_RECEIVER_VERSION "1.0.13"
+#define PS5_RECEIVER_VERSION "1.0.14"
 #define PS5_LIBRARY_CAP (256u * 1024u)
 #define PS5_SYSTEM_INFO_CAP (96u * 1024u)
 #define PS5_PROCESSES_CAP (256u * 1024u)

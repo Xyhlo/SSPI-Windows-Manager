@@ -1,7 +1,7 @@
 #ifndef SSPI_PROTO_H
 #define SSPI_PROTO_H
 #include "platform.h"
-#define VERSION "1.0.12"
+#define VERSION "1.0.13"
 #define DEFAULT_PORT 9114
 #define MAX_FRAME (8u * 1024u * 1024u)
 #define MAX_PATH_BYTES 2048

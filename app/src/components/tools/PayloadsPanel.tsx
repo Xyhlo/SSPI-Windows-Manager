@@ -21,6 +21,7 @@ import { autostartRunning, getAutostart, launcherAvailable, runAutostart, setAut
 import { AutostartCard } from "./payloads/AutostartCard"
 import { AutostartDialog, Glyph } from "./payloads/AutostartDialog"
 import { CatalogDialog } from "./payloads/CatalogDialog"
+import { RunningPayloads } from "./payloads/RunningPayloads"
 import "./payloads/payloads.css"
 
 type Props = { target: ConsoleKind; settings: Settings; demo: boolean; onReceiverLoaded: (target: ConsoleKind) => void }
@@ -55,6 +56,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
   const [autoBusy, setAutoBusy] = useState(false)
   const [ordering, setOrdering] = useState<{ adding?: string } | null>(null)
   const [catalogOpen, setCatalogOpen] = useState(false)
+  const [processRevision, setProcessRevision] = useState(0)
   const autoGeneration = useRef(0)
   const fileRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
@@ -89,7 +91,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
     .sort((a, b) => Number(b.builtin) - Number(a.builtin) || a.name.localeCompare(b.name)), [payloads, target])
   const current = shown.find(payload => payload.id === selected) || shown[0]
   const auto = autostart.find(item => item.target === target)
-  const order = (status?: AutostartStatus): AutostartOrder => (status?.steps || []).map(step => ({ payloadId: step.payloadId, delayMs: step.delayMs }))
+  const order = (status?: AutostartStatus): AutostartOrder => (status?.steps || []).map(step => ({ payloadId: step.payloadId, delayMs: step.delayMs, processName: step.processName || "" }))
   const autoAction = async (action: () => Promise<AutostartStatus[]>, failure: string) => {
     autoGeneration.current += 1; setAutoBusy(true)
     try { setAutostartState(await action()) }
@@ -138,7 +140,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
       setPayloads(old => old.map(item => item.id === entry.id ? { ...item, lastSentAt: Date.now(), lastResult: message } : item))
       setHistory(old => [{ id: `${entry.id}-${Date.now()}`, name: entry.name, at: Date.now(), result: message, ok: false }, ...old].slice(0, 20))
       toast({ tone: "error", title: `${entry.name} wasn't sent`, text: `${message} Check that ${loader} is running on your ${name}.` })
-    } finally { setBusy("") }
+    } finally { setBusy(""); setProcessRevision(value => value + 1) }
   }
   const save = async (entry: PayloadEntry, draft: { name: string; target: PayloadTarget; notes: string }) => {
     setBusy(entry.id)
@@ -188,6 +190,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
         <input ref={fileRef} type="file" accept=".elf,.bin" multiple hidden onChange={(event: ChangeEvent<HTMLInputElement>) => { const files = Array.from(event.currentTarget.files || []); event.currentTarget.value = ""; void addPaths(files.map(file => `preview/${file.name}`)) }} />
       </div>
       {error && <p className="pl-error" role="alert">{error}</p>}
+      <RunningPayloads key={`${target}:${endpoint.host}`} target={target} settings={settings} demo={demo} revision={processRevision} />
       <AutostartCard status={auto} payloads={shown} loader={loader} busy={autoBusy || loading} available={launcherAvailable(demo)}
         onToggle={toggleAutostart} onEdit={() => setOrdering({})}
         onRun={() => void autoAction(() => runAutostart(target, demo), "Autostart didn't start").catch(() => undefined)}
@@ -216,7 +219,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
                   <span className="pl-tools" onClick={event => event.stopPropagation()}>
                     <ActionMenu label={`Actions for ${entry.name}`} trigger={{ icon: "more", title: "More actions" }} actions={[
                       autostartPlace(entry.id) > 0
-                        ? { id: "autostart", label: "Edit autostart order", description: `Sent ${ordinal(autostartPlace(entry.id))} when SSPI starts`, icon: "bolt", disabled: autoBusy, onSelect: () => setOrdering({}) }
+                        ? { id: "autostart", label: "Edit autostart order", description: `Sent ${ordinal(autostartPlace(entry.id))} after a confirmed console wake`, icon: "bolt", disabled: autoBusy, onSelect: () => setOrdering({}) }
                         : { id: "autostart", label: "Add to autostart", description: "Choose where it goes in the order", icon: "bolt", disabled: autoBusy || !launcherAvailable(demo), onSelect: () => setOrdering({ adding: entry.id }) },
                       ...(!entry.builtin ? [
                         { id: "rename", label: "Rename", description: "Name, console and notes", icon: "pencil" as const, disabled: !!busy, onSelect: () => { setRemoving(""); setEditing(editing === entry.id ? "" : entry.id) } },
@@ -226,7 +229,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
                   </span>
                 )}
                 <button type="button" className={`btn sm ${isCurrent ? "primary" : ""} pl-send`} disabled={!endpoint.host || !!busy} onClick={event => { event.stopPropagation(); setSelected(entry.id); void send(entry) }}>
-                  {busy === entry.id ? <span className="spinner" /> : <Icon name="send" />}{busy === entry.id ? "Sending" : "Send"}
+                  {busy === entry.id ? <span className="spinner" /> : <Icon name="play" />}{busy === entry.id ? "Starting" : "Start"}
                 </button>
               </div>
               <Collapse open={editing === entry.id} className="pl-drawer">

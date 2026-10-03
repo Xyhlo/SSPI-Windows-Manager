@@ -205,8 +205,8 @@ static bool record_valid(const uint8_t *table, size_t length, size_t offset) {
     return offset+KINFO_SIZE<=length && i32(table+offset)==KINFO_SIZE;
 }
 
-/* The process table as the stop rules see it. The PS4 list has no auth IDs, so only
-   apps qualify there (payloads are recognised by their elfldr.elf parent on the PS5). */
+/* PS4 has no auth IDs. Shared rules recognize loader descendants and a small
+   set of independent homebrew services; GoldHEN's hosting process stays protected. */
 static PcProcess *control_table(const uint8_t *table, size_t length, size_t *count) {
     size_t capacity=length/KINFO_SIZE+1, n=0;
     PcProcess *items=calloc(capacity,sizeof(PcProcess)); if (!items) return NULL;

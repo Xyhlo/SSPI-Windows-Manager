@@ -32,14 +32,14 @@ export function AutostartCard({ status, payloads, loader, busy, available, onTog
   const wait = status?.nextAttemptAt ? Math.max(0, Math.ceil((status.nextAttemptAt - now) / 1000)) : 0
   const sent = steps.filter(step => step.state === "sent" || step.state === "verified").length
 
-  const summary = !status || !available ? "Send payloads in your chosen order whenever SSPI starts."
-    : !steps.length ? "Send payloads in your chosen order whenever SSPI starts."
+  const summary = !status || !available ? "Run manually or after a confirmed console wake. Running payloads are skipped."
+    : !steps.length ? "Run manually or after a confirmed console wake. Running payloads are skipped."
     : !status.enabled ? `${steps.length} payload${steps.length === 1 ? "" : "s"} saved · off`
-    : status.phase === "ready" ? `${steps.length} payload${steps.length === 1 ? "" : "s"} · runs when SSPI starts`
+    : status.phase === "ready" ? status.message
     : status.phase === "waiting" ? (sent === 0 && status.attempts === 0 ? `Starting in ${wait} s` : `${nameOf(current)} in ${wait} s`)
     : status.phase === "unavailable" ? `Waiting for the ${loader} · retry ${status.attempts + 1} of 3 in ${wait} s`
-    : status.phase === "sending" ? `Sending ${nameOf(current)} · ${(status.current ?? 0) + 1} of ${steps.length}`
-    : status.phase === "done" ? `All ${steps.length} sent${status.lastAttemptAt ? ` at ${new Date(status.lastAttemptAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : ""}`
+    : status.phase === "sending" ? `Checking / starting ${nameOf(current)} · ${(status.current ?? 0) + 1} of ${steps.length}`
+    : status.phase === "done" ? "Order complete · running payloads kept running"
     : status.phase === "stopped" ? `Stopped after ${sent} of ${steps.length}`
     : status.phase === "failed" ? `Stopped at ${nameOf(steps.find(step => step.state === "failed"))}` : ""
 

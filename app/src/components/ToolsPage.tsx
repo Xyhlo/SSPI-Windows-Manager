@@ -15,13 +15,12 @@ import { ConsoleSwitch, Seg } from "./Controls"
 import { PayloadsPanel } from "./tools/PayloadsPanel"
 import { WebLauncherPanel } from "./tools/WebLauncherPanel"
 import { SystemPanel } from "./tools/SystemPanel"
-import { ThemesPanel } from "./tools/ThemesPanel"
 import { IconMaskPanel } from "./tools/IconMaskPanel"
 
 export type ToolsTab = "payloads" | "web" | "system" | "customize"
 type CustomizeView = "icons" | "themes"
 const TOOLS: Array<{ id: ToolsTab; label: string; detail: string }> = [
-  { id: "payloads", label: "Payloads", detail: "Send payloads to your console's loader, and choose what starts with SSPI." },
+  { id: "payloads", label: "Payloads", detail: "Send payloads to your console's loader, and manage what starts after your console wakes." },
   { id: "web", label: "Web launcher", detail: "Host the SSPI console launcher for your PS5 from this PC." },
   { id: "system", label: "System", detail: "What the receiver reads about your console, its logs and crashes." },
   { id: "customize", label: "Customize", detail: "Game icon shapes, and PS4 system themes." },
@@ -82,11 +81,17 @@ export function ToolsPage({ tab, setTab, target, settings, demo, probes, onConso
           <div className="cz">
             <div className="sysx-bar">
               <Seg<CustomizeView> label="Customize" value={view} options={[["icons", "Game icons"], ["themes", "PS4 themes"]]} onChange={setView} />
-              <span className="cz-note">{view === "icons" ? "Shape, border and glow for every game's icon on your console." : "Wallpaper, colours and system icons for the PS4 home screen. Experimental."}</span>
+              <span className="cz-note">{view === "icons" ? "Shape, border and glow for every game's icon on your console." : "PS4 themes are coming soon."}</span>
             </div>
             <div className="cz-body swap-fade" key={view}>
               {view === "icons" && <IconMaskPanel target={target} settings={toolSettings} demo={demo} probe={probes[target]} />}
-              {view === "themes" && <ThemesPanel settings={toolSettings} demo={demo} probe={probes.ps4} />}
+              {view === "themes" && <section className="themes-coming-soon" aria-label="PS4 themes">
+                <div className="themes-coming-soon-preview" aria-hidden="true">
+                  <div className="themes-coming-soon-wallpaper" />
+                  <div className="themes-coming-soon-options">{["Wallpaper", "Colours", "System icons"].map(label => <div key={label}><span>{label}</span><i /></div>)}</div>
+                </div>
+                <div className="themes-coming-soon-message"><strong>Coming soon</strong><p>PS4 themes are being worked on.</p></div>
+              </section>}
             </div>
           </div>
         )}

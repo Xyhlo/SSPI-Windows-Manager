@@ -4,7 +4,7 @@
 
 SSPI Windows Manager is the desktop side of SSPI. It finds packages, downloads and extracts them on your PC, turns extracted PS5 dumps into installable packages, and installs the result on a PS5 or PS4 through a small receiver payload. It also looks after the console itself: installed titles and covers, payloads, system information, kernel logs, processes and game icons.
 
-**Version 2.24.4 · Windows 10 and 11 (x64) · Tauri 2, React and Rust**
+**Version 2.24.5 · Windows 10 and 11 (x64) · Tauri 2, React and Rust**
 
 This is a private development repository with a selected source export. Starting with 2.24.4, the only uploaded release asset is the Windows installer on the [Releases](../../releases) page.
 
@@ -37,7 +37,7 @@ This is a private development repository with a selected source export. Starting
 - **Payloads:** sends ELF and BIN payloads to the console's loader, including the built-in receivers.
 - **System:** shows firmware, model, temperatures, storage and mounts, and reads the kernel log with panic detection plus a live relay from a klog server. It also lists processes with Stop and End, and lists payload logs and crash reports. Everything exports to `.txt` or `.csv`.
 - **Game icons:** masks every game's icon to a shape with an optional border, glow or glass, the way Icon Mask does. The originals are kept, and the new icons appear after a restart.
-- **Themes (PS4, experimental):** builds a system theme with a wallpaper and replacement system icons.
+- **Themes (PS4):** temporarily disabled behind a blurred Coming soon preview.
 
 ## Requirements
 
@@ -73,7 +73,7 @@ Want to look around first? Choose **Try the offline preview** on the welcome scr
 
 This is development software, tested by a small group. A host build that passes its tests doesn't prove compatibility with every firmware, loader or package.
 
-- PS4 themes install, but the console currently reports themes built by SSPI as corrupted. Leave them alone for now.
+- PS4 theme creation and installation controls are disabled while compatibility is being fixed.
 - Game icon masks, PS4 kernel log access and the install confirmation after a receiver restart are new in this build and are still being verified on consoles.
 - PS5 package installs depend on the console's firmware and loader. When AppInst rejects a package, SSPI shows its error code.
 

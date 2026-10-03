@@ -21,6 +21,7 @@ mod discovery;
 mod payloads;
 mod payload_catalog;
 mod payload_autostart;
+mod payload_wake;
 mod web_launcher;
 mod updater;
 mod ps4_theme;
@@ -64,8 +65,8 @@ use url::Url;
 use uuid::Uuid;
 
 const CONFIG_NAME: &str = "settings.json";
-const RECEIVER_VERSION: &str = "1.0.13";
-const PS4_RECEIVER_VERSION: &str = "1.0.12";
+const RECEIVER_VERSION: &str = "1.0.14";
+const PS4_RECEIVER_VERSION: &str = "1.0.13";
 
 #[derive(Debug, Clone)]
 struct ReceiverEndpoint {
