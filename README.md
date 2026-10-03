@@ -4,11 +4,9 @@
 
 SSPI Windows Manager is the desktop side of SSPI. It finds packages, downloads and extracts them on your PC, turns extracted PS5 dumps into installable packages, and installs the result on a PS5 or PS4 through a small receiver payload. It also looks after the console itself: installed titles and covers, payloads, system information, kernel logs, processes and game icons.
 
-![Packaging a PS5 dump, then reading the console's kernel log, processes and payload logs](docs/demo-packaging-and-diagnostics.gif)
+**Version 2.24.4 · Windows 10 and 11 (x64) · Tauri 2, React and Rust**
 
-**Version 2.22.1 · Windows 10 and 11 (x64) · Tauri 2, React and Rust**
-
-This is a private development repository. Test builds are published on the [Releases](../../releases) page as a Windows installer and a portable zip.
+This is a private development repository with a selected source export. Starting with 2.24.4, the only uploaded release asset is the Windows installer on the [Releases](../../releases) page.
 
 ## What it does
 
@@ -51,7 +49,7 @@ This is a private development repository. Test builds are published on the [Rele
 
 ## Getting started
 
-1. Download the installer (`-setup.exe`) from the latest release and run it. It installs for your Windows user, without an administrator prompt. If you'd rather not install, extract the portable zip and run `SSPI.exe` from that folder.
+1. Download the installer (`-setup.exe`) from the latest release and run it. It installs for your Windows user, without an administrator prompt.
 2. Open **Options → Consoles**, then use **Find consoles** or enter your console's IP address.
 3. Load the receiver. Open **Tools → Payloads**, pick your console, and press **Send** next to the SSPI receiver. Load it again after a console restart and after updating SSPI.
 4. Install a package source in **Options → Sources**. If your links need it, add a debrid API key in **Options → Debrid**.
@@ -80,16 +78,17 @@ This is development software, tested by a small group. A host build that passes 
 
 ## Releases and updates
 
-Each release has two downloads, and both contain everything the app needs: the packaging engines, the Lizard runtime, the PS4 theme packager and the .NET runtime they run on.
+The Windows installer contains the application, packaging engines, Lizard runtime, PS4 theme packager and the .NET runtime they run on. It installs for your Windows user and adds SSPI to the Start menu. Settings and jobs are kept when you install a newer version over it.
 
-- **Installer:** installs SSPI for your Windows user and adds it to the Start menu. Settings and jobs are kept when you install a newer version over it.
-- **Portable zip:** the same files in a folder. Keep `SSPI.exe` next to its `resources` folder.
+Starting with 2.24.4, releases upload only the `-setup.exe`: no portable archive, updater archive or console application packages. GitHub's automatically generated source archives contain only the selected source export and are not installation packages.
 
-Automatic updates from this repository are planned next.
+The in-app updater uses the Amptis development feed. GitHub installers and the in-app update feed are published separately.
 
 ## Building from source
 
-**A plain clone is not a complete build.** This repository holds the application's production source, manifests, lockfiles and license notices. Build scripts, SDKs, the packaging engine, runtime artwork and tests are kept locally and supplied separately.
+**A plain clone is not a complete build.** This repository holds selected production source, manifests, lockfiles and license notices. The complete build environment is maintained locally by the project owner.
+
+The Tauri build entry point (`app/src-tauri/build.rs`) and Vite build configuration (`app/vite.config.ts`) are excluded from the current export and kept in the local workspace. Internal build scripts, SDKs, packaging-engine inputs, runtime artwork and tests are also local-only. GitHub's source archives cannot reproduce the distributed installer without these inputs. Removing files from the current export does not remove them from older Git history.
 
 The full build environment needs:
 

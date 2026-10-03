@@ -12,7 +12,6 @@
 !/app/package.json
 !/app/src-tauri/Cargo.lock
 !/app/src-tauri/Cargo.toml
-!/app/src-tauri/build.rs
 !/app/src-tauri/capabilities/default.json
 !/app/src-tauri/src/archives.rs
 !/app/src-tauri/src/fpkg.rs
@@ -50,7 +49,6 @@
 !/app/src/vite-env.d.ts
 !/app/tsconfig.json
 !/app/tsconfig.node.json
-!/app/vite.config.ts
 !/docs/banner.png
 !/payload/main.c
 !/product.json
@@ -176,7 +174,6 @@
 
 
 # SSPI Windows 2.22: links, debrid files, ShadowMount images, diagnostics and the README demo
-!/docs/demo-packaging-and-diagnostics.gif
 !/app/src-tauri/src/cloud.rs
 !/app/src-tauri/src/links.rs
 !/app/src-tauri/src/shadow_image.rs
