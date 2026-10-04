@@ -38,7 +38,7 @@ pub(super) struct WebStatus {
     logs: Vec<String>,
 }
 impl Default for WebStatus {
-    fn default() -> Self { Self { running: false, phase: "idle".into(), version: String::new(), available_version: None, address: String::new(), url: String::new(), message: "Ready to host SSPI Web Launcher.".into(), requests: 0, last_client: None, last_request_at: None, dns_requests: 0, last_dns_client: None, last_dns_at: None, last_dns_name: None, console_client: None, console_last_seen_at: None, manager_ready: false, manager_session: None, manager_checked_at: None, logs: Vec::new() } }
+    fn default() -> Self { Self { running: false, phase: "idle".into(), version: String::new(), available_version: None, address: String::new(), url: String::new(), message: "Ready to host WebKit Autoloader.".into(), requests: 0, last_client: None, last_request_at: None, dns_requests: 0, last_dns_client: None, last_dns_at: None, last_dns_name: None, console_client: None, console_last_seen_at: None, manager_ready: false, manager_session: None, manager_checked_at: None, logs: Vec::new() } }
 }
 struct Assets {
     version: String,
@@ -130,7 +130,7 @@ fn parse_assets(bytes: &[u8]) -> Result<Assets, String> {
 fn ensure_assets(_app: &AppHandle) -> Result<Arc<Assets>, String> {
     let mut svc = service().lock().unwrap_or_else(|p| p.into_inner());
     if let Some(assets) = &svc.assets { return Ok(assets.clone()); }
-    // Older versions downloaded stock hosts here. Always use the SSPI edition
+    // Older versions downloaded stock hosts here. Always use the bundled launcher
     // that was verified and installed together with this Windows application.
     let assets = parse_assets(BUNDLED_HOST)?;
     svc.status.version = assets.version.clone();
@@ -189,7 +189,7 @@ async fn bind_host(ip: Ipv4Addr, assets: Arc<Assets>) -> Result<WebStatus, Strin
     svc.status.console_client = None; svc.status.console_last_seen_at = None; svc.status.logs.clear();
     svc.status.manager_ready = false; svc.status.manager_session = None; svc.status.manager_checked_at = None;
     svc.status.message = "DNS and HTTPS are ready. Open User's Guide on your PS5.".into();
-    log(&mut svc.status, format!("Hosting SSPI {} on DNS 53 / HTTPS 443 at {ip}.", assets.version));
+    log(&mut svc.status, format!("Hosting WebKit Autoloader {} on DNS 53 / HTTPS 443 at {ip}.", assets.version));
     svc.tasks.push(tokio::spawn(dns_loop(dns, ip, receiver.clone(), generation)));
     svc.tasks.push(tokio::spawn(manager_loop(receiver.clone(), generation)));
     svc.tasks.push(tokio::spawn(http_loop(https, Some(TlsAcceptor::from(assets.tls.clone())), assets.clone(), receiver.clone(), generation)));
@@ -480,19 +480,25 @@ mod tests {
         assert_eq!(route("/launch/app.js", &assets).2.as_ref(), assets.files["app.js"].as_ref());
         assert_eq!(route("/app/payloads/payload.elf", &assets).2.as_ref(), assets.files["payloads/payload.elf"].as_ref());
         assert_eq!(route("/document/en/ps5/index.html", &assets).0, 200);
-        assert!(assets.version.contains("-sspi-"));
+        assert!(assets.version.contains("-elfldr-"));
         assert_eq!(route("/", &assets).2.as_ref(), assets.files["index.html"].as_ref());
         assert_eq!(route("/document/en/ps5/style.css", &assets).2.as_ref(), assets.files["style.css"].as_ref());
-        assert_eq!(route("/document/en/ps5/sspi-logo.png", &assets).2.as_ref(), assets.files["sspi-logo.png"].as_ref());
+        assert_eq!(route("/document/en/ps5/logo.svg", &assets).2.as_ref(), assets.files["logo.svg"].as_ref());
+        assert!(!assets.files.contains_key("sspi-logo.png"));
+        assert!(!assets.files.contains_key("entry.js"));
         let page = String::from_utf8_lossy(&assets.files["index.html"]);
-        assert!(page.contains("WebKit Autoloader") && page.contains("src=\"entry.js\""));
+        assert!(page.contains("WebKit Autoloader") && page.contains("src=\"app.js\""));
         assert!(!page.contains("sspi-header"));
         let build: serde_json::Value = serde_json::from_slice(&assets.files["sspi-build.json"]).unwrap();
-        assert_eq!(build["edition"], "sspi");
+        assert_eq!(build["edition"], "webkit-autoloader-elfldr");
+        assert!(build["payloads"].get("pldmgr.elf").is_none());
+        assert!(build["payloads"].get("autoloader.elf").is_none());
         assert_eq!(build["version"], assets.version);
         assert_eq!(build["payloads"]["installer.elf"], crate::sha256_hex(&assets.files["payloads/payload.elf"]));
         assert_eq!(build["payloads"]["elfldr-ps5.elf"], crate::sha256_hex(&assets.files["shared/elfldr-ps5.elf"]));
         assert_eq!(build["sourcesSha256"], crate::sha256_hex(&assets.files["sspi-launcher-sources.zip"]));
+        let sources = zip::ZipArchive::new(Cursor::new(&assets.files["sspi-launcher-sources.zip"])).unwrap();
+        assert!(!sources.file_names().any(|name| name.contains("payload-manager/") || name.contains("unified/")));
     }
     #[test]
     fn traversal_and_ambiguous_paths_cannot_access_files() {

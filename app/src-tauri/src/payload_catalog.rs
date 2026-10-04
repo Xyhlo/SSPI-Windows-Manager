@@ -3,11 +3,10 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf, sync::OnceLock, time::{Duration, SystemTime, UNIX_EPOCH}};
 use tauri::{AppHandle, Manager};
-use crate::payloads::{self, PayloadEntry};
+use crate::payloads::{self, PayloadEntry, MAX_PAYLOAD_SIZE};
 
 const CATALOG: &str = "https://itsplk.github.io/ps5-payloads-mirror/payloads.json";
 const DAY_MS: u64 = 86_400_000;
-const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct CatalogPayload {
@@ -99,7 +98,7 @@ pub(super) async fn download_catalog_payload(app: AppHandle, filename: String) -
     let catalog = catalog_at(&app, false).await?;
     let entry = catalog.entries.iter().find(|e| e.filename == filename).ok_or("That payload is not in the current catalog. Refresh and try again.")?;
     if !valid_filename(&entry.filename) || !valid_url(&entry.url) { return Err("The catalog entry is invalid.".into()); }
-    let bytes = download(&client()?, &entry.url, MAX_PAYLOAD).await?;
+    let bytes = download(&client()?, &entry.url, MAX_PAYLOAD_SIZE).await?;
     if bytes.is_empty() || (filename.to_ascii_lowercase().ends_with(".elf") && !bytes.starts_with(b"\x7fELF")) { return Err("The repository returned an invalid payload file.".into()); }
     let hash = crate::sha256_hex(&bytes);
     if !entry.checksum.is_empty() && !hash.eq_ignore_ascii_case(&entry.checksum) { return Err("The payload SHA-256 did not match the catalog. Nothing was imported.".into()); }
@@ -142,9 +141,9 @@ fn homebrew_elf(bytes: Vec<u8>, request: &HomebrewPayload) -> Result<Vec<u8>, St
     use std::io::Read;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|_| "The payload archive could not be read.".to_string())?;
     let mut entry = archive.by_name(member).map_err(|_| "The payload archive does not contain the listed payload.".to_string())?;
-    if entry.size() > MAX_PAYLOAD as u64 { return Err("The payload exceeds its size limit.".into()); }
+    if entry.size() > MAX_PAYLOAD_SIZE as u64 { return Err("The payload exceeds its size limit.".into()); }
     let mut elf = Vec::with_capacity(entry.size() as usize);
-    (&mut entry).take(MAX_PAYLOAD as u64 + 1).read_to_end(&mut elf).map_err(|e| e.to_string())?;
+    (&mut entry).take(MAX_PAYLOAD_SIZE as u64 + 1).read_to_end(&mut elf).map_err(|e| e.to_string())?;
     if !sha_matches(&elf, &request.homebrew.member_sha256) { return Err("The payload did not match the catalog checksum. Nothing was imported.".into()); }
     Ok(elf)
 }
@@ -154,7 +153,7 @@ pub(super) async fn add_homebrew_payload(app: AppHandle, request: HomebrewPayloa
     let filename = request.homebrew.payload_name.clone();
     if request.homebrew.format != "payload" || !valid_filename(&filename) || !github_url(&request.url) { return Err("This homebrew entry is not a payload SSPI can import.".into()); }
     let target = if request.homebrew.platform == "ps4" { "ps4" } else { "ps5" };
-    let download = download(&client()?, &request.url, MAX_PAYLOAD).await?;
+    let download = download(&client()?, &request.url, MAX_PAYLOAD_SIZE).await?;
     let bytes = homebrew_elf(download, &request)?;
     if bytes.is_empty() || (filename.to_ascii_lowercase().ends_with(".elf") && !bytes.starts_with(b"\x7fELF")) { return Err("The download is not a valid payload file.".into()); }
     let hash = crate::sha256_hex(&bytes);
@@ -178,6 +177,50 @@ pub(super) async fn add_homebrew_payload(app: AppHandle, request: HomebrewPayloa
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn large_payload_download_works_with_and_without_content_length() {
+        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
+        let size = 64 * 1024 * 1024 + 1;
+        for known_length in [true, false] {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                socket.read(&mut request).await.unwrap();
+                let length = if known_length { format!("Content-Length: {size}\r\n") } else { String::new() };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\n{length}Connection: close\r\n\r\n").as_bytes()).await.unwrap();
+                let block = vec![0x5a; 1024 * 1024];
+                let mut remaining = size;
+                while remaining > 0 {
+                    let count = remaining.min(block.len());
+                    socket.write_all(&block[..count]).await.unwrap();
+                    remaining -= count;
+                }
+                socket.shutdown().await.unwrap();
+            });
+            let bytes = download(&reqwest::Client::new(), &format!("http://{address}/large.elf"), MAX_PAYLOAD_SIZE).await.unwrap();
+            assert_eq!(bytes.len(), size);
+            assert!(bytes.iter().all(|byte| *byte == 0x5a));
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn zipped_homebrew_accepts_an_elf_larger_than_64_mib() {
+        use std::io::Write;
+        let size = 64 * 1024 * 1024 + 1;
+        let mut elf = vec![0; size];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("sspi.elf", zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)).unwrap();
+        zip.write_all(&elf).unwrap();
+        let archive = zip.finish().unwrap().into_inner();
+        let request = HomebrewPayload { url: String::new(), name: "SSPI".into(), version: String::new(), sha256: crate::sha256_hex(&archive),
+            homebrew: crate::static_catalog::HomebrewPackage { archive_member: "sspi.elf".into(), member_sha256: crate::sha256_hex(&elf), ..Default::default() } };
+        assert_eq!(homebrew_elf(archive, &request).unwrap(), elf);
+    }
+
     #[test]
     fn homebrew_payloads_come_from_github_and_match_their_checksums() {
         use std::io::Write;

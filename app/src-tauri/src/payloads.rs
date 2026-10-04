@@ -18,7 +18,7 @@ use crate::{AppState, Settings, PS4_RECEIVER_ELF, RECEIVER_ELF, RECEIVER_VERSION
 
 const INDEX_NAME: &str = "payloads.json";
 const MIN_PAYLOAD_SIZE: usize = 1;
-const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
+pub(super) const MAX_PAYLOAD_SIZE: usize = 256 * 1024 * 1024;
 const MAX_RESPONSE: usize = 1024 * 1024;
 const BUILTIN_PS5: &str = "builtin:ps5-receiver";
 const BUILTIN_PS4: &str = "builtin:ps4-receiver";
@@ -362,12 +362,12 @@ fn add_payloads_at(
             return Err("Payload files must use the .elf or .bin extension.".into());
         }
         if metadata.len() < MIN_PAYLOAD_SIZE as u64 || metadata.len() > MAX_PAYLOAD_SIZE as u64 {
-            return Err("Payload files must be between 1 byte and 64 MiB.".into());
+            return Err(format!("Payload files must be between 1 byte and {} MiB.", MAX_PAYLOAD_SIZE / (1024 * 1024)));
         }
         let bytes = fs::read(&source)
             .map_err(|_| "Could not read one of the selected payload files.".to_string())?;
         if bytes.len() < MIN_PAYLOAD_SIZE || bytes.len() > MAX_PAYLOAD_SIZE {
-            return Err("Payload files must be between 1 byte and 64 MiB.".into());
+            return Err(format!("Payload files must be between 1 byte and {} MiB.", MAX_PAYLOAD_SIZE / (1024 * 1024)));
         }
         if extension == "elf" && !bytes.starts_with(b"\x7fELF") {
             return Err("ELF payload files must start with the ELF signature.".into());
@@ -976,6 +976,56 @@ mod tests {
 
     fn temp_root() -> PathBuf {
         std::env::temp_dir().join(format!("sspi-payloads-test-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn payload_import_accepts_above_64_mib_and_rejects_above_shared_limit() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("large.elf");
+        let mut file = fs::File::create(&source).unwrap();
+        file.write_all(&RECEIVER_ELF[..256]).unwrap();
+        let size = 64 * 1024 * 1024 + 1;
+        file.set_len(size).unwrap();
+        drop(file);
+        let entries = add_payloads_at(&root, &[source.to_string_lossy().into_owned()], "ps5").unwrap();
+        let entry = entries.iter().find(|entry| !entry.builtin).unwrap();
+        assert_eq!(entry.size, size as usize);
+        assert_eq!(fs::metadata(&entry.path).unwrap().len(), size);
+        fs::File::create(&source).unwrap().set_len(MAX_PAYLOAD_SIZE as u64 + 1).unwrap();
+        assert!(add_payloads_at(&root, &[source.to_string_lossy().into_owned()], "ps5").unwrap_err().contains("256 MiB"));
+        assert_eq!(list_payloads_at(&root).unwrap().len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SSPI_TEST_LARGE_ELF; sends only to a local test socket"]
+    async fn large_local_elf_import_and_send_preserves_every_byte() {
+        let source = std::env::var("SSPI_TEST_LARGE_ELF").expect("set SSPI_TEST_LARGE_ELF");
+        let bytes = fs::read(&source).unwrap();
+        assert!(bytes.len() > 64 * 1024 * 1024 && bytes.len() <= MAX_PAYLOAD_SIZE);
+        assert_eq!(parse_elf(&bytes).unwrap().machine, "x86-64");
+        let expected_hash = crate::sha256_hex(&bytes);
+        let expected_size = bytes.len();
+        drop(bytes);
+        let root = temp_root();
+        let entries = add_payloads_at(&root, &[source.clone()], "ps5").unwrap();
+        let entry = entries.iter().find(|entry| !entry.builtin).unwrap();
+        assert_eq!(entry.sha256, expected_hash);
+        let loader = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = loader.local_addr().unwrap().port();
+        let received = tokio::spawn(async move {
+            let (mut socket, _) = loader.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            socket.read_to_end(&mut bytes).await.unwrap();
+            (bytes.len(), crate::sha256_hex(&bytes))
+        });
+        let sent = send_payload_at(&root, &entry.id, "ps5", "127.0.0.1", port.into(), &Settings::default(), test_timing()).await.unwrap();
+        assert_eq!(sent.bytes, expected_size);
+        assert!(!sent.verified, "transport success does not prove console execution");
+        assert_eq!(received.await.unwrap(), (expected_size, expected_hash.clone()));
+        assert_eq!(crate::sha256_hex(&fs::read(source).unwrap()), expected_hash);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn test_timing() -> Ps5Timing {

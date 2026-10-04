@@ -189,7 +189,7 @@ export function WebLauncherPanel({ demo }: { demo: boolean }) {
                 </div>
                 <div>
                   <dt>Payload Manager</dt>
-                  <dd><strong className={managerReady ? "wl-ready" : ""}>{managerReady ? "Ready" : running ? "Waiting" : "Not checked"}</strong><span>{managerReady ? "Current session confirmed" : managerChecked ? "No current session confirmed" : "Checked after console contact"}</span></dd>
+                  <dd><strong className={managerReady ? "wl-ready" : ""}>{managerReady ? "Ready" : "Manual start"}</strong><span>{managerReady ? "Current session confirmed" : "The launcher starts only the ELF loader"}</span></dd>
                   <dd className="wl-when">{managerChecked ? `Checked ${ago(managerChecked, now).toLowerCase()}` : "—"}</dd>
                 </div>
               </dl>
@@ -217,7 +217,7 @@ export function WebLauncherPanel({ demo }: { demo: boolean }) {
           <summary>Ports, runtime and updates</summary>
           <div className="tech-body">
             <p>Console runtime {status?.version || "—"}. DNS uses UDP 53, HTTPS uses TCP 443, and HTTP uses TCP 80 for the browser preview. Allow SSPI on private networks if Windows Firewall asks. A busy port is reported in the log.</p>
-            <p>The launcher checks firmware and selects the matching chain. The ELF loader accepts payloads on port 9021. Saved autoload.txt entries run in their order and SSPI’s Payload Manager starts once.</p>
+            <p>WebKit Autoloader uses its original interface and starts the ELF loader on port 9021. Payload Manager and saved autoload.txt entries do not run automatically.</p>
             <p>Launcher updates arrive with SSPI updates. Host again and rerun setup on the PS5 to refresh its cached interface. Saved payloads and autoload.txt are kept.</p>
           </div>
         </details>
