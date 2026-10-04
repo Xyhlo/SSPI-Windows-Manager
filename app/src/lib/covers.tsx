@@ -201,7 +201,7 @@ export function CaseCover({ source, title, titleId, className }: { source?: stri
       <div className="case-window" style={{ inset: ps4 ? "14.5% 4.3% 3.7% 2.15%" : "14.85% 4.3% 3.7% 2.15%" }}>
         <img src={art} alt={`${title} cover`} className={cn("case-art", className)} draggable={false} />
       </div>
-      <img src={shell} alt="" aria-hidden="true" className="case-shell" draggable={false} />
+      <img src={shell} alt="" aria-hidden="true" className="case-shell" draggable={false} onError={event => { event.currentTarget.style.visibility = "hidden" }} />
     </>
   )
 }

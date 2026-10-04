@@ -142,14 +142,14 @@ pub(super) async fn run(app: &AppHandle, settings: &Settings, http: &Client, job
         let app_event = app.clone(); let job_event = job.clone(); let worker_cancel = cancel.clone();
         emit(app, Progress { job_id: job.clone(), stage: "extracting".into(), work_paths: vec![destination.clone()], message: format!("Preparing {label} extraction"), ..Default::default() });
         let result = tokio::task::spawn_blocking(move || {
-            let control = || job_store::blocking_checkpoint(&app_event, &job_event, &worker_cancel);
+            let control = || { scheduler::yield_point(&job_event); job_store::blocking_checkpoint(&app_event, &job_event, &worker_cancel) };
             let progress_app = app_event.clone(); let progress_job = job_event.clone();
             let progress = Arc::new(move |done: u64, total: u64, speed: f64| emit(&progress_app, Progress {
                 job_id: progress_job.clone(), stage: "extracting".into(), bytes_done: done, bytes_total: total, speed_bps: speed,
                 progress: if total > 0 { done as f64 / total as f64 } else { 0. },
                 message: format!("Extracting {label}: {:.2} / {:.2} GiB", done as f64 / 1_073_741_824., total as f64 / 1_073_741_824.), ..Default::default() }));
-            archives::with_extraction_slot(&output, &control, &|| emit(&app_event, Progress {
-                job_id: job_event.clone(), stage: "extracting".into(), message: "Waiting for another extraction on this drive".into(), ..Default::default()
+            scheduler::extraction_slot(&job_event, &control, &|ahead| emit(&app_event, Progress {
+                job_id: job_event.clone(), stage: "extracting".into(), message: archives::extraction_wait_message(ahead), ..Default::default()
             }), || {
             if output.exists() { fpkg::cleanup_extracted(&output, &download_root)?; }
             std::fs::create_dir_all(&output).map_err(redact)?;
@@ -160,7 +160,7 @@ pub(super) async fn run(app: &AppHandle, settings: &Settings, http: &Client, job
             storage::publish(&app_event, &job_event, storage::plan(&output, "extraction", packed, unpacked.unwrap_or(packed), 0, false, packed, unpacked.is_none()))?;
             let app_control = app_event.clone(); let job_control = job_event.clone(); let control_cancel = worker_cancel.clone();
             extract_tree(&source, &output, archive.kind, password.as_deref(), progress,
-                Arc::new(move || job_store::blocking_checkpoint(&app_control, &job_control, &control_cancel)), 0)?;
+                Arc::new(move || { scheduler::yield_point(&job_control); job_store::blocking_checkpoint(&app_control, &job_control, &control_cancel) }), 0)?;
             discover(&output, is_overlay, &control)
             })
         }).await.map_err(redact)?;

@@ -19,49 +19,66 @@
 .pl-inspect .pl-sheet { margin: 0 0 6px; animation: swapIn 280ms var(--spring-soft); }
 
 /* ---------------------------------------------------------------- autostart card */
-.as-card { flex: none; margin-bottom: 12px; padding: 12px 14px 12px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--glass); transition: border-color 240ms, background 240ms; }
+.as-card { flex: none; margin-bottom: 12px; padding: 14px 16px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--glass); transition: border-color 240ms, background 240ms; }
 .as-card.is-on { border-color: var(--line-2); }
-.as-card-top { display: flex; align-items: center; gap: 14px; }
-.as-card-ico { position: relative; flex: none; display: grid; place-items: center; width: 44px; height: 44px; border-radius: 10px; background: rgba(255, 255, 255, .04); color: var(--faint); transition: color 240ms, background 240ms; }
-.as-card.is-on .as-card-ico { background: rgba(255, 255, 255, .08); color: var(--ink); }
-.as-card-ico .i { width: 19px; height: 19px; }
-.as-card-pulse { position: absolute; inset: -1px; border-radius: 11px; border: 1.5px solid rgba(var(--accent-rgb), .55); animation: asPulse 1.6s cubic-bezier(.2, .8, .2, 1) infinite; }
+.as-card-top { display: flex; align-items: center; gap: 12px; }
+.as-card-ico { position: relative; flex: none; display: grid; place-items: center; width: 36px; height: 36px; border-radius: 9px; background: rgba(255, 255, 255, .04); color: var(--faint); transition: color 240ms, background 240ms; }
+.as-card.is-on .as-card-ico { background: rgba(var(--accent-rgb), .12); color: var(--accent); }
+.as-card-ico .i { width: 17px; height: 17px; }
+.as-card-pulse { position: absolute; inset: -1px; border-radius: 10px; border: 1.5px solid rgba(var(--accent-rgb), .55); animation: asPulse 1.6s cubic-bezier(.2, .8, .2, 1) infinite; }
 @keyframes asPulse { from { opacity: .9; transform: scale(1); } to { opacity: 0; transform: scale(1.35); } }
-.as-card-text { flex: 1; min-width: 0; display: grid; gap: 2px; }
-.as-card-text strong { font-size: 15px; font-weight: 500; }
-.as-card-text span { font-size: 12.5px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
-.as-card.is-on .as-card-text span { color: var(--muted); }
-.as-card.phase-failed .as-card-text span { color: var(--fail-ink); }
+.as-card-text { flex: 1; min-width: 0; display: grid; gap: 3px; }
+.as-card-title { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.as-card-title strong { font-size: 14.5px; font-weight: 500; }
+.as-badge { flex: none; display: inline-flex; align-items: center; height: 19px; padding: 0 8px; border-radius: 10px; background: rgba(255, 255, 255, .06); font-size: 11px; font-style: normal; font-weight: 500; color: var(--faint); letter-spacing: .01em; }
+.as-badge.live { background: rgba(var(--accent-rgb), .14); color: var(--accent); }
+.as-badge.good { background: rgba(70, 167, 88, .14); color: var(--good-ink); }
+.as-badge.warn { background: rgba(245, 166, 35, .13); color: var(--warn-ink); }
+.as-badge.fail { background: rgba(229, 72, 77, .14); color: var(--fail-ink); }
+.as-card-text > span[role=status] { font-size: 12.5px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.as-card.is-on .as-card-text > span[role=status] { color: var(--muted); }
+.as-card.phase-failed .as-card-text > span[role=status] { color: var(--fail-ink); }
 .as-card-actions { flex: none; display: flex; align-items: center; gap: 6px; }
 .as-card-actions .switch { margin-left: 8px; }
 
-.as-chain { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 0; margin: 12px 0 0 58px; padding: 0; list-style: none; transition: opacity 240ms; }
-.as-chain.is-off { opacity: .5; }
-.as-link { display: flex; align-items: center; animation: swapIn 280ms var(--spring-soft) both; }
-.as-wire { display: inline-flex; align-items: center; gap: 6px; margin: 0 7px; color: var(--ghost); font-size: 11px; }
-.as-link:first-child .as-wire { margin-left: 0; }
-.as-wire i { width: 18px; height: 1.5px; border-radius: 2px; background: currentColor; }
-.as-wire em { font-style: normal; color: var(--faint); font-variant-numeric: tabular-nums; }
-.as-wire[data-state=sending], .as-wire[data-state=sent], .as-wire[data-state=verified] { color: rgba(255, 255, 255, .38); }
-.as-wire[data-state=waiting] i { background: linear-gradient(90deg, rgba(255, 255, 255, .12), rgba(var(--accent-rgb), .9), rgba(255, 255, 255, .12)); background-size: 200% 100%; animation: asFlow 1.1s linear infinite; }
-@keyframes asFlow { from { background-position: 100% 0; } to { background-position: -100% 0; } }
-.as-chip { display: inline-flex; align-items: center; gap: 7px; height: 28px; padding: 0 11px 0 4px; border: 1px solid var(--line-2); border-radius: 14px; background: var(--surface); font-size: 12.5px; color: var(--ink-2); transition: border-color 240ms, background 240ms, color 240ms, opacity 240ms; }
-.as-chip-mark { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: rgba(255, 255, 255, .06); font-size: 10.5px; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; transition: background 240ms, color 240ms; }
-.as-chip-mark .i { width: 12px; height: 12px; stroke-width: 2.4; }
-.as-chip-mark .spinner { width: 11px; height: 11px; border-width: 1.5px; }
-.as-chip-name { max-width: 180px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.as-chip[data-state=waiting] { border-color: rgba(var(--accent-rgb), .45); color: var(--ink); }
-.as-chip[data-state=waiting] .as-chip-mark { animation: asRing 1.6s ease-out infinite; }
-@keyframes asRing { from { box-shadow: 0 0 0 0 rgba(var(--accent-rgb), .45); } to { box-shadow: 0 0 0 6px rgba(var(--accent-rgb), 0); } }
-.as-chip[data-state=sending] { border-color: rgba(var(--accent-rgb), .6); background: rgba(var(--accent-rgb), .08); color: var(--ink); }
-.as-chip[data-state=sent], .as-chip[data-state=verified] { border-color: rgba(70, 167, 88, .35); color: var(--ink); }
-.as-chip[data-state=sent] .as-chip-mark, .as-chip[data-state=verified] .as-chip-mark { background: rgba(70, 167, 88, .18); color: var(--good-ink); }
-.as-chip[data-state=failed] { border-color: rgba(229, 72, 77, .45); color: var(--fail-ink); }
-.as-chip[data-state=failed] .as-chip-mark { background: rgba(229, 72, 77, .16); color: var(--fail); }
-.as-chip[data-state=skipped] { opacity: .45; }
-.as-chip[data-state=skipped] .as-chip-name { text-decoration: line-through; text-decoration-color: rgba(255, 255, 255, .3); }
-.as-card-note { margin: 10px 0 0 58px; font-size: 12px; line-height: 1.5; color: var(--warn-ink); animation: swapIn 280ms var(--spring-soft); }
+/* The order as a stage track: equal columns, so each payload's incoming link spans exactly one column. */
+.as-track { --as-col: 136px; display: grid; grid-template-columns: repeat(var(--as-cols), minmax(var(--as-col), 1fr)); margin: 8px 0 0 48px; padding: 16px 0 4px; list-style: none; overflow-x: auto; scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, .14) transparent; transition: opacity 240ms; }
+.as-track.is-off { opacity: .5; }
+.as-step { position: relative; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding-right: 12px; font-size: 12.5px; color: var(--ink-2); animation: swapIn 280ms var(--spring-soft) both; }
+.as-step:nth-child(2) { animation-delay: 30ms; } .as-step:nth-child(3) { animation-delay: 60ms; } .as-step:nth-child(4) { animation-delay: 90ms; } .as-step:nth-child(n+5) { animation-delay: 120ms; }
+.as-node { position: relative; z-index: 1; flex: none; display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; border: 1.5px solid rgba(255, 255, 255, .18); background: rgba(10, 10, 12, .85); color: var(--faint); font-size: 10.5px; font-weight: 600; font-variant-numeric: tabular-nums; transition: border-color 300ms, background 300ms, color 300ms; }
+.as-node .i { width: 12px; height: 12px; stroke-width: 2.4; }
+.as-node .spinner { width: 12px; height: 12px; border-width: 1.5px; }
+.as-step-name { max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.as-step small { display: block; min-height: 15px; margin-top: -3px; font-size: 11.5px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; font-variant-numeric: tabular-nums; }
+
+/* The link into a payload, from the previous node to this one, with the wait written above it. */
+.as-link { position: absolute; top: 11px; left: calc(-100% + 30px); right: calc(100% + 6px); height: 2px; border-radius: 2px; background: rgba(255, 255, 255, .08); }
+.as-link i { position: absolute; inset: 0 auto 0 0; width: 0; border-radius: inherit; background: rgba(255, 255, 255, .3); transition: width 600ms var(--spring-soft); }
+.as-link.is-done i { width: 100%; }
+.as-link.is-live i { background: rgba(var(--accent-rgb), .85); transition: width 250ms linear; }
+.as-link em { position: absolute; left: 50%; bottom: 7px; transform: translateX(-50%); padding: 0 6px; font-size: 11px; font-style: normal; color: var(--faint); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.as-link.is-live em { color: var(--ink-2); }
+
+.as-start { color: var(--faint); }
+.as-start .as-node { color: var(--muted); }
+.as-start[data-state=done] .as-node { border-color: rgba(var(--accent-rgb), .5); color: var(--accent); }
+.as-step[data-state=waiting] { color: var(--ink); }
+.as-step[data-state=waiting] .as-node, .as-step[data-state=sending] .as-node { border-color: transparent; background: rgba(var(--accent-rgb), .14); color: var(--accent); }
+.as-step[data-state=waiting] .as-node::after { content: ""; position: absolute; inset: -5px; border-radius: 50%; border: 1.5px solid rgba(var(--accent-rgb), .35); animation: asRing 1.6s ease-out infinite; }
+@keyframes asRing { from { opacity: 1; transform: scale(.85); } to { opacity: 0; transform: scale(1.25); } }
+.as-step[data-state=sending] { color: var(--ink); }
+.as-step[data-state=sent], .as-step[data-state=verified] { color: var(--ink); }
+.as-step[data-state=sent] .as-node, .as-step[data-state=verified] .as-node { border-color: rgba(70, 167, 88, .45); background: rgba(70, 167, 88, .16); color: var(--good-ink); }
+.as-step[data-state=sent] small, .as-step[data-state=verified] small { color: var(--good-ink); }
+.as-step[data-state=failed] { color: var(--fail-ink); }
+.as-step[data-state=failed] .as-node { border-color: rgba(229, 72, 77, .7); background: rgba(229, 72, 77, .12); color: var(--fail); }
+.as-step[data-state=failed] small { color: var(--fail-ink); }
+.as-step[data-state=skipped] { color: var(--faint); }
+.as-step[data-state=skipped] .as-node { border-style: dashed; border-color: rgba(255, 255, 255, .16); color: var(--faint); }
+.as-card-note { margin: 12px 0 0 48px; font-size: 12px; line-height: 1.5; color: var(--warn-ink); animation: swapIn 280ms var(--spring-soft); }
 .as-card-note.fail { color: var(--fail-ink); }
+@media (max-width: 1000px) { .as-track, .as-card-note { margin-left: 0; } }
 
 /* ---------------------------------------------------------------- autostart order editor */
 .dialog.as-dialog { width: min(980px, calc(100vw - 48px)); height: min(680px, calc(100vh - 80px)); padding: 22px 22px 18px; }
@@ -167,12 +184,4 @@ body.as-dragging, body.as-dragging * { cursor: grabbing !important; }
 .pc-meta a { color: var(--ink-2); text-underline-offset: 2px; }
 .pc-skel { height: 78px; }
 .pc-empty { padding: 30px; text-align: center; font-size: 13px; color: var(--faint); }
-.pl-running { flex: none; border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
-.pl-running-head, .pl-running-row { display: flex; gap: 12px; align-items: center; }
-.pl-running-head { justify-content: space-between; margin-bottom: 8px; }
-.pl-running-list { max-height: 168px; overflow: auto; }
-.pl-running-row { padding: 8px 0; }
-.pl-running-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-.pl-running-name small { margin-left: 10px; color: var(--muted); }
-.pl-running-note { color: var(--muted); font-size: 12px; margin-top: 8px; }
 .as-process-name { display: block; width: 100%; min-width: 0; margin-top: 7px; padding: 5px 7px; border: 1px solid var(--line-2); border-radius: 5px; background: var(--surface); color: var(--ink); font: inherit; font-size: 11px; }

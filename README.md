@@ -4,7 +4,7 @@
 
 SSPI Windows Manager is the desktop side of SSPI. It finds packages, downloads and extracts them on your PC, turns extracted PS5 dumps into installable packages, and installs the result on a PS5 or PS4 through a small receiver payload. It also looks after the console itself: installed titles and covers, payloads, system information, kernel logs, processes and game icons.
 
-**Version 2.24.5 · Windows 10 and 11 (x64) · Tauri 2, React and Rust**
+**Version 2.24.6 · Windows 10 and 11 (x64) · Tauri 2, React and Rust**
 
 This is a private development repository with a selected source export. Starting with 2.24.4, the only uploaded release asset is the Windows installer on the [Releases](../../releases) page.
 
@@ -21,6 +21,7 @@ This is a private development repository with a selected source export. Starting
 - Imports a PKG, scans a folder, or adds extracted game folders from this PC.
 - Extracts RAR and ZIP sets, including multipart and old-style `.rar`/`.r00` volumes.
 - Tracks every job by stage (download, extract, package, install), with pause, cancel and retry.
+- Downloads each file over several connections and resumes from the finished pieces. By default four games download and two extract at once, sharing the connections so they finish together. **Prioritize** (or T) puts one game first for downloading, extracting, packaging and installing.
 
 **Packaging for PS5**
 - Builds a finalized FPKG from an extracted dump, with Kraken compression and PFS v2 or v3.

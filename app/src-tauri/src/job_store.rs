@@ -143,7 +143,7 @@ fn reusable_base(record: &Record) -> bool {
         Some(Checkpoint::Archive { primary, .. }) => primary.is_file(),
         Some(Checkpoint::Extracted { paths, dump: true, .. }) => paths.len() == 1 && paths[0].is_dir(),
         Some(Checkpoint::Combined(state)) => state.retained_paths().iter().any(|path| path.exists()),
-        None => record.downloads.iter().any(|file| file.path.is_file()),
+        None => record.downloads.iter().any(|file| downloader::retained(&file.path)),
         _ => false,
     }
 }
@@ -355,9 +355,12 @@ pub(super) async fn resume_checkpoint(app: &AppHandle, settings: &Settings, job:
                 let download_root = PathBuf::from(&settings.download_dir);
                 let app_control = app.clone(); let job_control = job.to_string(); let control_cancel = cancel.clone();
                 let content = tokio::task::spawn_blocking(move || {
-                    let control: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || blocking_checkpoint(&app_control, &job_control, &control_cancel));
-                    archives::with_extraction_slot(&cache, control.as_ref(), &|| emit(&app_wait, Progress {
-                        job_id: job_wait.clone(), stage: "extracting".into(), message: "Waiting for another extraction on this drive".into(), ..Default::default()
+                    let control: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || {
+                        scheduler::yield_point(&job_control);
+                        blocking_checkpoint(&app_control, &job_control, &control_cancel)
+                    });
+                    scheduler::extraction_slot(&job_wait, control.as_ref(), &|ahead| emit(&app_wait, Progress {
+                        job_id: job_wait.clone(), stage: "extracting".into(), message: archives::extraction_wait_message(ahead), ..Default::default()
                     }), || {
                     // An Archive checkpoint has no verified extracted output.
                     // Retry discards only this job's interrupted attempt.
@@ -490,7 +493,7 @@ pub(super) fn recover_legacy(store: &mut Store, root: &Path) {
     for path in candidates {
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let kind = artifact_kind(&read_magic_sync(&path).unwrap_or([0; 8]), &name, "");
-        if !matches!(kind, ArtifactKind::Rar | ArtifactKind::Zip | ArtifactKind::Pkg) || path.extension().is_some_and(|s| s == "part") { continue; }
+        if !matches!(kind, ArtifactKind::Rar | ArtifactKind::Zip | ArtifactKind::Pkg) || path.extension().is_some_and(|s| s == "part") || downloader::working_file(&path) { continue; }
         if kind == ArtifactKind::Rar && rar_first_volume(&path) != path { continue; }
         let already_known = store.records.values().any(|r| r.downloads.iter().any(|f| f.path == path) || match &r.checkpoint {
             Some(Checkpoint::Archive { primary, .. }) | Some(Checkpoint::Package { path: primary, .. }) => primary == &path,
@@ -592,7 +595,8 @@ fn cleanup_files(record: &Record, protected: &[PathBuf]) -> Result<(usize, usize
     if !record.download_dir.exists() { return Ok((0, 0)); }
     let root = std::fs::canonicalize(&record.download_dir).map_err(redact)?;
     let remote = record.request.as_ref().is_some_and(|r| !r.package.url.is_empty());
-    let mut owned: Vec<_> = if matches!(record.checkpoint, Some(Checkpoint::Local { .. })) { vec![] } else { record.downloads.iter().map(|f| f.path.clone()).collect() };
+    // A partial download keeps its data and completed-piece map beside it.
+    let mut owned: Vec<_> = if matches!(record.checkpoint, Some(Checkpoint::Local { .. })) { vec![] } else { record.downloads.iter().flat_map(|f| downloader::partial_files(&f.path)).collect() };
     owned.extend(record.progress.work_paths.clone());
     if remote { owned.extend(referenced_paths(record)); }
     else if let Some(Checkpoint::Archive { inputs, .. }) = &record.checkpoint { owned.extend(inputs.clone()); }

@@ -623,26 +623,9 @@ pub(super) fn extracted_outputs(content: &ExtractedContent) -> Vec<PathBuf> {
 /// (On Windows an still-open handle surfaces here as a retryable cleanup
 /// error instead of a silent skip: close inputs before calling.)
 ///
-/// Delivery-wiring API (lib.rs staging/upload wiring + unit tests).
-#[allow(dead_code)]
-pub(super) fn with_extraction_slot<T>(destination: &Path, checkpoint: &dyn Fn() -> Result<(), String>, waiting: &dyn Fn(), work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    static VOLUMES: std::sync::OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = std::sync::OnceLock::new();
-    let slot = VOLUMES.get_or_init(Default::default).lock().unwrap()
-        .entry(volume_key(destination).to_ascii_lowercase()).or_default().clone();
-    let mut announced = false;
-    let _guard = loop {
-        checkpoint()?;
-        match slot.try_lock() {
-            Ok(guard) => break guard,
-            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                if !announced { waiting(); announced = true; }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-    };
-    checkpoint()?;
-    work()
+/// What a job shows while it waits for one of the scheduler's extraction slots.
+pub(super) fn extraction_wait_message(ahead: usize) -> String {
+    if ahead > 0 { format!("Waiting for an extraction slot · {ahead} ahead") } else { "Waiting for an extraction slot".into() }
 }
 
 pub(super) fn remove_consumed_inputs(
@@ -706,23 +689,6 @@ mod tests {
         std::fs::write(&a, b"one").unwrap(); std::fs::write(&b, b"two").unwrap();
         remove_consumed_inputs(&[a], &[]).unwrap(); assert!(b.exists());
         remove_consumed_inputs(&[b], &[]).unwrap(); assert!(!owned.exists()); assert!(root.exists());
-    }
-    #[test]
-    fn extraction_slot_wait_is_cancellable_and_releases_after_error() {
-        use std::sync::mpsc;
-        let destination = PathBuf::from("Q:/sspi-extraction-slot-test");
-        let (started_tx, started_rx) = mpsc::channel(); let (release_tx, release_rx) = mpsc::channel();
-        let first_path = destination.clone();
-        let first = std::thread::spawn(move || with_extraction_slot(&first_path, &|| Ok(()), &|| {}, || {
-            started_tx.send(()).unwrap(); release_rx.recv_timeout(Duration::from_secs(5)).unwrap(); Err::<(), _>("test error".into())
-        }));
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let cancelled = std::sync::atomic::AtomicBool::new(false);
-        let result = with_extraction_slot(&destination, &|| if cancelled.load(Ordering::Relaxed) { Err("cancelled".into()) } else { Ok(()) },
-            &|| cancelled.store(true, Ordering::Relaxed), || panic!("A second extraction must wait"));
-        assert_eq!(result, Err::<(), _>("cancelled".into()));
-        release_tx.send(()).unwrap(); assert!(first.join().unwrap().is_err());
-        assert!(with_extraction_slot(&destination, &|| Ok(()), &|| {}, || Ok(())).is_ok());
     }
     #[test]
     fn zip_preserves_ps5_dump_structure() {

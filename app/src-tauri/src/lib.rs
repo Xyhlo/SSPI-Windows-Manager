@@ -1,6 +1,8 @@
 mod rar_control;
 use job_store::resume_checkpoint;
 mod job_store;
+mod scheduler;
+mod downloader;
 mod receiver_notifications;
 mod storage;
 mod package_sources;
@@ -98,21 +100,17 @@ impl ReceiverEndpoint {
     }
 }
 
-// The receiver owns one AppInst status slot; serialize console deliveries, while
-// downloads/extraction and the lanes within each delivery remain concurrent.
-static CONSOLE_DELIVERY: AsyncMutex<()> = AsyncMutex::const_new(());
-static PACKAGING_WORK: AsyncMutex<()> = AsyncMutex::const_new(());
-
-async fn console_delivery_slot(cancel: &watch::Receiver<bool>) -> Result<tokio::sync::MutexGuard<'static, ()>, String> {
-    if *cancel.borrow() { return Err("cancelled".into()); }
-    let mut cancelled = cancel.clone();
-    tokio::select! {
-        slot = CONSOLE_DELIVERY.lock() => {
-            if *cancel.borrow() { return Err("cancelled".into()); }
-            Ok(slot)
-        },
-        _ = cancelled.changed() => Err("cancelled".into()),
-    }
+// The receiver owns one AppInst status slot: console deliveries take the scheduler's console
+// slot one at a time (the priority game first), while downloads, extraction and the lanes
+// within each delivery stay concurrent.
+async fn console_delivery_slot(app: &AppHandle, job: &str, cancel: &watch::Receiver<bool>) -> Result<scheduler::Permit, String> {
+    let (app, job_id) = (app.clone(), job.to_string());
+    scheduler::acquire(scheduler::Gate::Console, job, cancel, move |ahead| {
+        let stage = app.state::<AppState>().jobs.lock().unwrap().get(&job_id).map(|p| p.stage.clone()).filter(|stage| !stage.is_empty()).unwrap_or_else(|| "uploading".into());
+        emit(&app, Progress { job_id: job_id.clone(), stage,
+            message: if ahead > 0 { format!("Waiting for the console to finish another install · {ahead} ahead") } else { "Waiting for the console to finish another install".into() },
+            ..Default::default() });
+    }).await
 }
 
 fn retryable_upload_error(error: &str) -> bool {
@@ -198,8 +196,25 @@ struct Settings {
     /// What adding game folders does: ask | package | package-send | send.
     #[serde(default = "default_folder_action")]
     folder_action: String,
+    /// Games that download at once; the priority game downloads beside them.
+    #[serde(default = "default_download_slots")]
+    download_slots: u32,
+    /// Games that extract at once; each RAR extraction runs in its own process.
+    #[serde(default = "default_extraction_slots")]
+    extraction_slots: u32,
+    /// Connections shared by every download, split by the bytes each has left.
+    #[serde(default = "default_download_connections")]
+    download_connections: u32,
 }
 fn default_folder_action() -> String { "ask".into() }
+fn default_download_slots() -> u32 { 4 }
+fn default_extraction_slots() -> u32 { 2 }
+fn default_download_connections() -> u32 { 16 }
+impl Settings {
+    fn scheduler_limits(&self) -> scheduler::Limits {
+        scheduler::Limits { downloads: self.download_slots as usize, extractions: self.extraction_slots as usize, connections: self.download_connections as usize }
+    }
+}
 fn default_package_format() -> String { "fpkg".into() }
 fn default_keep_packages() -> bool { true }
 fn default_console() -> String { "ps5".into() }
@@ -256,6 +271,9 @@ impl Default for Settings {
             package_format: default_package_format(),
             lizard_packing: false,
             folder_action: default_folder_action(),
+            download_slots: default_download_slots(),
+            extraction_slots: default_extraction_slots(),
+            download_connections: default_download_connections(),
         }
     }
 }
@@ -345,6 +363,10 @@ struct Progress {
     provider_preparation: Option<debrid::PreparationProgress>,
     retryable: bool,
     space: Option<storage::SpacePlan>,
+    /// The one game that downloads, extracts and packages first (set_job_priority).
+    priority: bool,
+    /// Connections a segmented download is using now; only on download events.
+    connections: Option<u32>,
 }
 impl Default for Progress {
     fn default() -> Self {
@@ -376,6 +398,8 @@ impl Default for Progress {
             provider_preparation: None,
             retryable: false,
             space: None,
+            priority: false,
+            connections: None,
         }
     }
 }
@@ -626,6 +650,9 @@ struct SaveSettings {
     #[serde(default)] package_format: Option<String>,
     #[serde(default)] lizard_packing: Option<bool>,
     #[serde(default)] folder_action: Option<String>,
+    #[serde(default)] download_slots: Option<u32>,
+    #[serde(default)] extraction_slots: Option<u32>,
+    #[serde(default)] download_connections: Option<u32>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -1165,6 +1192,8 @@ fn inherit_progress_context(p: &mut Progress, prev: &Progress) {
     if p.stage == "packaging" && prev.stage == "packaging" && p.progress == 0. { p.progress = prev.progress; }
     p.created_at = prev.created_at;
     p.stage_history = prev.stage_history.clone();
+    // Priority belongs to the jobs map (set_job_priority); events never change it.
+    p.priority = prev.priority;
     p.paused = prev.paused && !terminal_stage(&p.stage);
     if p.target == "ps4" && matches!(p.stage.as_str(), "handoff" | "installing") { p.paused = false; }
 }
@@ -1216,6 +1245,7 @@ fn emit(app: &AppHandle, mut p: Progress) {
         jobs.insert(p.job_id.clone(), p.clone());
         if terminal {
             state.cancel.lock().unwrap().remove(&p.job_id);
+            scheduler::finished(&p.job_id);
         }
     }
     if p.target != "ps4" || ps4_receiver_job(app, &p.job_id) { receiver_notifications::observe(app, &p); }
@@ -1675,19 +1705,8 @@ fn extract_rar_builtin(
             std::thread::sleep(Duration::from_millis(500));
         }
     });
-    let mut last = "Unable to extract RAR; check the password and all archive volumes.".to_string();
-    let result = (|| {
-        for password in archive_passwords(password) {
-            checkpoint()?;
-            processed.store(0, Ordering::Relaxed);
-            match rar_control::extract_measured(&path, dest, password, checkpoint.as_ref(), &processed) {
-                Ok(_) => return Ok(()),
-                Err(error) if error.starts_with("RAR password error") => last = error,
-                Err(error) => return Err(error),
-            }
-        }
-        Err(last)
-    })();
+    // Each RAR extraction runs in its own process, so two extraction slots can work at once.
+    let result = rar_control::extract_isolated(&path, dest, &archive_passwords(password), checkpoint.as_ref(), &processed).map(|_| ());
     stop.store(true, Ordering::Relaxed);
     let _ = poller.join();
     if result.is_ok() {
@@ -2481,8 +2500,12 @@ fn save_settings(
         package_format: input.package_format.unwrap_or_else(|| s.package_format.clone()),
         lizard_packing: input.lizard_packing.unwrap_or(s.lizard_packing),
         folder_action: input.folder_action.unwrap_or_else(|| s.folder_action.clone()),
+        download_slots: input.download_slots.unwrap_or(s.download_slots).clamp(1, 8),
+        extraction_slots: input.extraction_slots.unwrap_or(s.extraction_slots).clamp(1, 4),
+        download_connections: input.download_connections.unwrap_or(s.download_connections).clamp(1, 32),
     };
     write_settings(&app, &s)?;
+    scheduler::configure(s.scheduler_limits());
     Ok(s.clone())
 }
 
@@ -3786,9 +3809,9 @@ async fn package_and_install_dump(
     tx: &mut watch::Receiver<bool>, cleanup: bool, cleanup_extra: &[PathBuf],
 ) -> Result<(), String> {
     if *tx.borrow() { return Err("cancelled".into()); }
-    emit(app, Progress { job_id: job.into(), stage: "packaging".into(), message: "Waiting for packaging worker".into(), ..Default::default() });
-    let mut queue_cancel = tx.clone();
-    let package_slot = tokio::select! { slot = PACKAGING_WORK.lock() => slot, _ = queue_cancel.changed() => return Err("cancelled".into()) };
+    let (app_wait, job_wait) = (app.clone(), job.to_string());
+    let package_slot = scheduler::acquire(scheduler::Gate::Packaging, job, tx, move |ahead| emit(&app_wait, Progress { job_id: job_wait.clone(), stage: "packaging".into(),
+        message: if ahead > 0 { format!("Waiting for packaging · {ahead} ahead") } else { "Waiting for packaging to finish another game".into() }, ..Default::default() })).await?;
     // Total packaging time starts once this job owns the packaging worker, not while queued.
     let packaging_started = Instant::now();
     let engine = fpkg::locate_engine(Some(&s.fpkg_engine_path))
@@ -3860,10 +3883,8 @@ async fn package_and_install_dump(
         }
     };
     if image {
-        let result = package_image(app, s, root, job, title_id, title_name, icon, tx, cleanup, cleanup_extra,
-            packaging_started, &job_root, &staging, doctor_report, preflight, workspace_seconds).await;
-        drop(package_slot);
-        return result;
+        return package_image(app, s, root, job, title_id, title_name, icon, tx, cleanup, cleanup_extra,
+            packaging_started, &job_root, &staging, doctor_report, preflight, workspace_seconds, package_slot).await;
     }
     let mut options = fpkg::PackageOptions::new(staging.clone(), job_root.join("output"));
     options.title_id = dump_title_id(root).or_else(|| title_id.map(str::to_string));
@@ -3889,7 +3910,7 @@ async fn package_and_install_dump(
     let app_event = app.clone(); let job_event = job.to_string(); let info_event = info.clone();
     let started = Instant::now();
     let last_engine = Arc::new(Mutex::new(None::<Value>)); let engine_seen = last_engine.clone();
-    let pause_app = app.clone(); let pause_job = job.to_string(); let build_cancel = tx.clone();
+    let pause_app = app.clone(); let pause_job = job.to_string(); let build_cancel = tx.clone(); let yield_job = job.to_string();
     let build = fpkg::build_controlled(&engine, &options, move |line| {
         let value = serde_json::from_str::<Value>(&line).ok();
         let message = value.as_ref().and_then(|v| v["message"].as_str()).unwrap_or(&line).to_string();
@@ -3914,7 +3935,7 @@ async fn package_and_install_dump(
     }, |_, _| {}, move || {
         if *build_cancel.borrow() { return Err("cancelled".into()); }
         Ok(pause_app.state::<AppState>().jobs.lock().unwrap().get(&pause_job).is_some_and(|p| p.paused))
-    });
+    }, move || scheduler::should_yield(&yield_job));
     let outcome = match build.await {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -3967,7 +3988,7 @@ async fn package_image(
     app: &AppHandle, s: &Settings, root: &Path, job: &str, requested_id: Option<&str>,
     title_name: &Option<String>, icon: &Option<String>, tx: &mut watch::Receiver<bool>, cleanup: bool, cleanup_extra: &[PathBuf],
     packaging_started: Instant, job_root: &Path, staging: &Path, doctor: Option<fpkg_doctor::DoctorReport>,
-    preflight: fpkg::Preflight, workspace_seconds: f64,
+    preflight: fpkg::Preflight, workspace_seconds: f64, package_slot: scheduler::Permit,
 ) -> Result<(), String> {
     let id = dump_title_id(root).or_else(|| requested_id.map(str::to_ascii_uppercase)).filter(|id| title_id(id))
         .ok_or("An exFAT image needs a CUSA or PPSA title ID in sce_sys/param.json")?;
@@ -4019,6 +4040,8 @@ async fn package_image(
     info.activity = "exFAT image verified".into(); info.phase_progress = Some(1.);
     emit(app, Progress { job_id: job.into(), stage: "packaging".into(), progress: 1., packaging: Some(info),
         message: format!("exFAT image verified: {} files, {:.2} GiB of game data in {}", built.files, built.payload_bytes as f64 / 1_073_741_824., built.path.display()), ..Default::default() });
+    // The image is built: the next game can package while this one goes to the console.
+    drop(package_slot);
     let mut disposable = vec![job_root.to_path_buf()];
     if !s.keep_extractions {
         if cleanup { disposable.push(root.to_path_buf()); }
@@ -4081,7 +4104,7 @@ pub(crate) async fn deliver_image(app: &AppHandle, s: &Settings, path: &Path, jo
         .filter(|n| n.len() <= 200 && n.bytes().all(|b| b.is_ascii_graphic()) && n.to_ascii_lowercase().ends_with(".exfat") && !n.starts_with('.'))
         .ok_or("The image file name must be ASCII without spaces and end in .exfat")?.to_string();
     let size = fs::metadata(path).await.map_err(redact)?.len();
-    let _delivery = console_delivery_slot(tx).await?;
+    let _delivery = console_delivery_slot(app, job, tx).await?;
     test_ps5(endpoint.host.clone(), endpoint.port).await?;
     let (code, reply) = image_request(endpoint, b's', &name).await?;
     if code != 3 {
@@ -4191,7 +4214,7 @@ async fn upload_dump(
 ) -> Result<(), String> {
     let endpoint = &ReceiverEndpoint::ps5(s);
     validate_mountable_dump(root)?;
-    let _delivery = console_delivery_slot(tx).await?;
+    let _delivery = console_delivery_slot(app, job, tx).await?;
     test_ps5(s.ps5_host.clone(), s.ps5_port).await?;
     let title = dump_title_id(root)
         .or_else(|| title.map(str::to_ascii_uppercase).filter(|id| title_id(id)));
@@ -4461,7 +4484,7 @@ async fn upload(
         if announce_complete { emit(app, Progress { job_id: job.into(), stage: "complete".into(), progress: 1., bytes_done: set_offset + size, bytes_total: set_total.max(set_offset + size), message: format!("Package saved locally: {}", path.display()), ..Default::default() }); }
         return Ok(());
     }
-    let _delivery = console_delivery_slot(tx).await?;
+    let _delivery = console_delivery_slot(app, job, tx).await?;
     test_ps5(endpoint.host.clone(), endpoint.port).await?;
     let (header, _, _) = file_header(path).await?;
     set_receiver_title(app, endpoint, job, title, header.starts_with(&[0x7f,b'F',b'I',b'H'])).await?;
@@ -4773,149 +4796,29 @@ fn validate_download_range(existing: u64, content_range: &str) -> Result<(), Str
     Ok(())
 }
 
-async fn download_url(
-    http: &Client,
-    url: &str,
-    part: &Path,
-    app: &AppHandle,
-    job: &str,
-    rx: &watch::Receiver<bool>,
-    message: &str,
-    title: &str,
-    icon: &Option<String>,
-    size_hint: u64,
-    set_done: u64,
-    set_total: u64,
-    set_started: Instant,
-) -> Result<(Vec<u8>, String, Option<String>), String> {
-    let mut existing = fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
-    // D1: one model — bar and text both come from set-wide bytes.
-    let set_fraction = |done: u64, total: u64| {
-        if total > 0 {
-            (done as f64 / total as f64).clamp(0., 0.99)
-        } else {
-            0.
-        }
+/// Unlocks hoster link `index` of `count` through the debrid service: its direct URL, name and size.
+async fn unlock_part(app: &AppHandle, s: &Settings, http: &Client, job: &str, request: &DeliveryRequest, link: &str, index: usize, count: usize, cancel: &watch::Receiver<bool>) -> Result<(String, Option<String>, Option<u64>), String> {
+    if *cancel.borrow() { return Err("cancelled".into()); }
+    let (title, icon) = (request.title_name.clone().unwrap_or_default(), request.icon.clone());
+    emit(app, Progress {
+        job_id: job.into(), stage: "unlocking".into(), progress: index as f64 / count.max(1) as f64,
+        message: format!("Unlocking hoster link {}/{}", index + 1, count), title: title.clone(), icon: icon.clone(), ..Default::default()
+    });
+    let provider_progress = |preparation: Option<debrid::PreparationProgress>| {
+        let message = preparation.as_ref().map(|p| format!("{} · file {}/{}", p.state, index + 1, count))
+            .unwrap_or_else(|| format!("Unlocking hoster link {}/{}", index + 1, count));
+        emit(app, Progress {
+            job_id: job.into(), stage: "unlocking".into(), message,
+            provider_preparation: preparation,
+            title: title.clone(), icon: icon.clone(), ..Default::default()
+        });
     };
-    emit(
-        app,
-        Progress {
-            job_id: job.into(),
-            stage: "downloading".into(),
-            progress: set_fraction(set_done + existing, set_total),
-            bytes_done: set_done + existing,
-            bytes_total: set_total,
-            speed_bps: 0.,
-            eta_seconds: None,
-            // D3: resumed bytes are stated, not silently folded in.
-            message: if existing > 0 {
-                format!("{message} — connecting (resumed {} MB)", existing / 1_048_576)
-            } else {
-                format!("{message} — connecting")
-            },
-            title: title.into(),
-            icon: icon.clone(),
-            ..Default::default()
-        },
-    );
-    let mut request = http.get(url);
-    if existing > 0 {
-        request = request.header(reqwest::header::RANGE, format!("bytes={existing}-"));
+    let mut cancelled = cancel.clone();
+    tokio::select! {
+        result = debrid::resolve(http, s, link, request.provider.as_deref(), &provider_progress) => result,
+        _ = cancelled.changed() => Err("cancelled".into()),
     }
-    let mut cancelled = rx.clone();
-    let response = tokio::select! {
-        result = tokio::time::timeout(Duration::from_secs(45), request.send()) => result,
-        _ = cancelled.changed() => return Err("cancelled".into()),
-    }
-        .map_err(|_| network_error("Package download request timed out"))?
-        .map_err(|_| network_error("Package download request"))?;
-    if !(response.status().is_success() || response.status() == reqwest::StatusCode::PARTIAL_CONTENT)
-    {
-        return Err(format!("Download failed: HTTP {}", response.status()));
-    }
-    if existing > 0 && response.status() == reqwest::StatusCode::OK { existing = 0; }
-    if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-        validate_download_range(existing, response.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok()).unwrap_or(""))?;
-    }
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_owned();
-    let filename = response
-        .headers()
-        .get(reqwest::header::CONTENT_DISPOSITION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(disposition_filename);
-    let total = (response.content_length().unwrap_or(0) + existing).max(size_hint);
-    let set_total = set_total.max(set_done + total);
-    let settings = app.state::<AppState>().settings.lock().unwrap().clone();
-    let plan = storage::download_plan(&settings, set_total, set_done + existing,
-        !filename.as_deref().unwrap_or(url).to_ascii_lowercase().ends_with(".pkg"));
-    storage::publish(app, job, plan)?;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(existing > 0)
-        .truncate(existing == 0)
-        .open(part)
-        .await
-        .map_err(redact)?;
-    let mut stream = response.bytes_stream();
-    let mut done = existing;
-    let mut checked = existing;
-    loop {
-        if *rx.borrow() {
-            return Err("cancelled".into());
-        }
-        transfer_checkpoint(app, job, rx).await?;
-        let mut cancelled = rx.clone();
-        let next = tokio::select! {
-            result = tokio::time::timeout(Duration::from_secs(30), stream.next()) => result,
-            _ = cancelled.changed() => return Err("cancelled".into()),
-        };
-        let chunk = match next {
-            Err(_) => return Err("Download stalled for 30 seconds. Cancel and retry.".into()),
-            Ok(None) => break,
-            Ok(Some(Ok(chunk))) => chunk,
-            Ok(Some(Err(_))) => return Err(network_error("Package download stream")),
-        };
-        if done.saturating_sub(checked) >= 64 * 1024 * 1024 || checked == existing {
-            storage::guard_bytes(part, total.saturating_sub(done).max(chunk.len() as u64), "download")?;
-            checked = done;
-        }
-        file.write_all(&chunk).await.map_err(redact)?;
-        done += chunk.len() as u64;
-        let all = set_done + done;
-        // D2: speed/ETA measured on the whole set across volumes, not per volume.
-        let speed = all as f64 / set_started.elapsed().as_secs_f64().max(0.01);
-        emit(
-            app,
-            Progress {
-                job_id: job.to_owned(),
-                stage: "downloading".into(),
-                progress: set_fraction(all, set_total),
-                bytes_done: all,
-                bytes_total: set_total,
-                speed_bps: speed,
-                eta_seconds: (set_total > all)
-                    .then(|| ((set_total - all) as f64 / speed.max(0.01)) as u64),
-                message: message.into(),
-                title: title.into(),
-                icon: icon.clone(),
-                ..Default::default()
-            },
-        );
-    }
-    file.flush().await.map_err(redact)?;
-    if total > 0 && done < total { return Err(format!("Download incomplete ({done} of {total} bytes). Retry resumes the retained partial file.")); }
-    let mut magic = [0; 8];
-    let mut reader = fs::File::open(part).await.map_err(redact)?;
-    let read = reader.read(&mut magic).await.map_err(redact)?;
-    Ok((magic[..read].to_vec(), content_type, filename))
 }
-
 
 async fn download_delivery_inputs(app2: &AppHandle, s: &Settings, http: &Client, job2: &String, request: &DeliveryRequest, parts: Vec<Package>, resume: Option<&job_store::Record>, rx: &mut watch::Receiver<bool>, index_offset: usize, slot: &str) -> Result<(PathBuf, Vec<PathBuf>, ArtifactKind), String> {
     let archive_set = request.package.archive_set_id.is_some();
@@ -4951,9 +4854,10 @@ async fn download_delivery_inputs(app2: &AppHandle, s: &Settings, http: &Client,
             let mut detected = ArtifactKind::Unknown;
             let set_total: u64 = parts.iter().filter_map(|package| package.expected_size).sum();
             let mut set_done: u64 = 0;
-            let set_started = Instant::now();
             let initial = storage::download_plan(&s, set_total, 0, archive_set || !request.package.url.to_ascii_lowercase().ends_with(".pkg"));
             storage::publish(&app2, &job2, initial)?;
+            // Taken just before the first byte is fetched: reused files and link unlocking need no slot.
+            let mut slot: Option<scheduler::Permit> = None;
             for (index, package) in parts.iter().enumerate() {
                 transfer_checkpoint(&app2, &job2, &rx).await?;
                 if let Some(saved) = resume.as_ref().and_then(|r| r.downloads.iter().find(|f| f.index == index + index_offset && f.complete && f.path.is_file())) {
@@ -4976,45 +4880,9 @@ async fn download_delivery_inputs(app2: &AppHandle, s: &Settings, http: &Client,
                             .into(),
                     );
                 }
-                let mut rd_name = None;
-                let mut rd_size = None;
+                let (mut rd_name, mut rd_size) = (None, None);
                 if needs_unlock {
-                    emit(
-                        &app2,
-                        Progress {
-                            job_id: job2.clone(),
-                            stage: "unlocking".into(),
-                            progress: index as f64 / parts.len().max(1) as f64,
-                            bytes_done: 0,
-                            bytes_total: 0,
-                            speed_bps: 0.,
-                            eta_seconds: None,
-                            message: format!(
-                                "Unlocking hoster link {}/{}",
-                                index + 1,
-                                parts.len()
-                            ),
-                            title: job_title.clone(),
-                            icon: job_icon.clone(),
-                            ..Default::default()
-                        },
-                    );
-                    let provider_progress = |preparation: Option<debrid::PreparationProgress>| {
-                        let message = preparation.as_ref().map(|p| format!("{} · file {}/{}", p.state, index + 1, parts.len()))
-                            .unwrap_or_else(|| format!("Unlocking hoster link {}/{}", index + 1, parts.len()));
-                        emit(&app2, Progress {
-                            job_id: job2.clone(), stage: "unlocking".into(), message,
-                            provider_preparation: preparation,
-                            title: job_title.clone(), icon: job_icon.clone(), ..Default::default()
-                        });
-                    };
-                    let unrestricted = tokio::select! {
-                        result = debrid::resolve(http, s, &url, request.provider.as_deref(), &provider_progress) => result?,
-                        _ = rx.changed() => return Err("cancelled".into()),
-                    };
-                    url = unrestricted.0;
-                    rd_name = unrestricted.1;
-                    rd_size = unrestricted.2;
+                    (url, rd_name, rd_size) = unlock_part(app2, s, http, job2, request, &package.url, index, parts.len(), rx).await?;
                 }
                 let file_key = download_key(
                     &package.url,
@@ -5028,29 +4896,29 @@ async fn download_delivery_inputs(app2: &AppHandle, s: &Settings, http: &Client,
                         .map(|part| format!("_p{part:02}"))
                         .unwrap_or_default()
                 ));
-                let part_path = resume.as_ref().and_then(|r| r.downloads.iter().find(|f| f.index == index + index_offset && !f.complete && f.path.is_file())).map(|f| f.path.clone()).unwrap_or(part_path);
+                let part_path = resume.as_ref().and_then(|r| r.downloads.iter().find(|f| f.index == index + index_offset && !f.complete && downloader::retained(&f.path))).map(|f| f.path.clone()).unwrap_or(part_path);
                 job_store::downloaded(&app2, &job2, job_store::DownloadedFile { index: index + index_offset, path: part_path.clone(), name: String::new(), kind: ArtifactKind::Unknown, complete: false })?;
-                let (header, content_type, disposition) = download_url(
-                    &http,
-                    &url,
-                    &part_path,
-                    &app2,
-                    &job2,
-                    &rx,
-                    &format!(
-                        "Downloading {} · part {}/{}",
-                        package.label,
-                        index + 1,
-                        parts.len()
-                    ),
-                    &job_title,
-                    &job_icon,
-                    rd_size.or(package.expected_size).unwrap_or(0),
-                    set_done,
-                    set_total,
-                    set_started,
-                )
-                .await?;
+                if slot.is_none() {
+                    let (app_wait, job_wait, title_wait, icon_wait) = (app2.clone(), job2.clone(), job_title.clone(), job_icon.clone());
+                    slot = Some(scheduler::acquire(scheduler::Gate::Download, job2, rx, move |ahead| emit(&app_wait, Progress {
+                        job_id: job_wait.clone(), stage: "queued".into(),
+                        message: if ahead > 0 { format!("Waiting for a download slot · {ahead} ahead") } else { "Waiting for a download slot".into() },
+                        title: title_wait.clone(), icon: icon_wait.clone(), ..Default::default()
+                    })).await?);
+                }
+                let message = format!("Downloading {} · part {}/{}", package.label, index + 1, parts.len());
+                let context = downloader::Context { http, app: app2, job: job2, cancel: rx, message: &message,
+                    title: &job_title, icon: &job_icon, set_done, set_total };
+                let fetched = match downloader::fetch(&context, &url, &part_path, rd_size.or(package.expected_size).unwrap_or(0)).await {
+                    // An unlocked link can expire while the game waits for a slot or downloads for
+                    // hours: unlock it once more and continue from the completed pieces.
+                    Err(error) if needs_unlock && downloader::link_expired(&error) => {
+                        (url, rd_name, rd_size) = unlock_part(app2, s, http, job2, request, &package.url, index, parts.len(), rx).await?;
+                        downloader::fetch(&context, &url, &part_path, rd_size.or(package.expected_size).unwrap_or(0)).await
+                    }
+                    result => result,
+                };
+                let (header, content_type, disposition) = fetched?;
                 let name = rd_name
                     .or(disposition)
                     .or_else(|| package.archive_file_name.clone())
@@ -5219,6 +5087,8 @@ async fn queue_delivery(app: AppHandle, state: &AppState, mut request: DeliveryR
     tauri::async_runtime::spawn(async move {
         let job_title = request.title_name.clone().unwrap_or_default();
         let job_icon = request.icon.clone();
+        // A retried game keeps the priority it had.
+        if app2.state::<AppState>().jobs.lock().unwrap().get(&job2).is_some_and(|p| p.priority) { scheduler::set_priority(Some(job2.clone())); }
         emit(
             &app2,
             Progress {
@@ -5354,7 +5224,34 @@ fn pause_job(app: AppHandle, state: State<AppState>, job_id: String, paused: boo
         job.paused = paused;
         job.clone()
     };
+    scheduler::set_paused(&job_id, paused);
     let _ = app.emit("delivery-progress", event);
+    Ok(())
+}
+
+/// Makes `job_id` the one game that downloads, extracts and packages first, or clears it.
+#[tauri::command]
+fn set_job_priority(app: AppHandle, state: State<AppState>, job_id: String, priority: bool) -> Result<(), String> {
+    let changed: Vec<Progress> = {
+        let mut jobs = state.jobs.lock().unwrap();
+        let job = jobs.get(&job_id).ok_or("Transfer no longer exists")?;
+        if priority && terminal_stage(&job.stage) { return Err("This transfer has stopped. Retry it to give it priority.".into()); }
+        jobs.iter_mut().filter_map(|(id, p)| {
+            let want = priority && *id == job_id;
+            (p.priority != want).then(|| { p.priority = want; p.clone() })
+        }).collect()
+    };
+    {
+        let mut store = state.retry.lock().unwrap();
+        for p in &changed {
+            if let Some(record) = store.records.get_mut(&p.job_id) {
+                record.progress.priority = p.priority;
+                if let Err(error) = store.save(&p.job_id) { eprintln!("Retry journal: {error}"); }
+            }
+        }
+    }
+    scheduler::set_priority(priority.then_some(job_id));
+    for p in changed { let _ = app.emit("delivery-progress", p); }
     Ok(())
 }
 
@@ -5723,6 +5620,12 @@ async fn start_local_install(
     job_store::queue_local(app.clone(), &state, source, None, None, false, target, None).await
 }
 
+/// When SSPI was started as a helper process (a RAR extraction worker), runs it and returns its
+/// exit code; `main` exits with it instead of starting the app.
+pub fn child_process() -> Option<i32> {
+    (std::env::args().nth(1).as_deref() == Some(rar_control::CHILD_FLAG)).then(rar_control::child_main)
+}
+
 pub fn run() {
     if let Err(error) = updater::recover_if_needed() {
         let message = format!("SSPI could not restore an interrupted update.\n\n{error}\n\nYour settings and downloads have not been removed.");
@@ -5755,7 +5658,10 @@ pub fn run() {
                 .unwrap_or_default();
             let mut retry = job_store::Store::load(handle.path().app_config_dir()?.join("jobs"));
             job_store::recover_legacy(&mut retry, Path::new(&settings.download_dir));
-            let restored_jobs = retry.records.iter().filter(|(_, r)| !r.progress.removed).map(|(id, r)| (id.clone(), r.progress.clone())).collect();
+            let restored_jobs: HashMap<String, Progress> = retry.records.iter().filter(|(_, r)| !r.progress.removed).map(|(id, r)| (id.clone(), r.progress.clone())).collect();
+            scheduler::configure(settings.scheduler_limits());
+            scheduler::set_priority(restored_jobs.values().filter(|p| p.priority).max_by_key(|p| p.created_at).map(|p| p.job_id.clone()));
+            scheduler::start();
             app.manage(AppState {
                 settings: Arc::new(Mutex::new(settings)),
                 cancel: Arc::new(Mutex::new(HashMap::new())),
@@ -5847,6 +5753,7 @@ pub fn run() {
             system_drive_prefix,
             cancel_job,
             pause_job,
+            set_job_priority,
             scan_local_packages,
             start_local_install,
             scan_manual_folder,
@@ -6342,15 +6249,17 @@ mod tests {
     }
     #[test]
     fn console_deliveries_wait_and_can_be_cancelled() {
+        let _serial = scheduler::test_serial();
         tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let slot = |job: &'static str, rx: watch::Receiver<bool>| async move { scheduler::acquire(scheduler::Gate::Console, job, &rx, |_| {}).await };
             let (_tx, rx) = watch::channel(false);
-            let first = console_delivery_slot(&rx).await.unwrap();
+            let first = slot("console-first", rx.clone()).await.unwrap();
             let (cancel, waiting) = watch::channel(false);
-            assert!(tokio::time::timeout(Duration::from_millis(20),console_delivery_slot(&waiting)).await.is_err());
+            assert!(tokio::time::timeout(Duration::from_millis(20), slot("console-second", waiting.clone())).await.is_err());
             cancel.send(true).unwrap();
-            assert!(console_delivery_slot(&waiting).await.is_err());
+            assert!(slot("console-second", waiting).await.is_err());
             drop(first);
-            assert!(console_delivery_slot(&rx).await.is_ok());
+            assert!(slot("console-third", rx).await.is_ok());
         });
     }
     #[test]

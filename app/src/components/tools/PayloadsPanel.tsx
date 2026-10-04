@@ -21,10 +21,9 @@ import { autostartRunning, getAutostart, launcherAvailable, runAutostart, setAut
 import { AutostartCard } from "./payloads/AutostartCard"
 import { AutostartDialog, Glyph } from "./payloads/AutostartDialog"
 import { CatalogDialog } from "./payloads/CatalogDialog"
-import { RunningPayloads } from "./payloads/RunningPayloads"
 import "./payloads/payloads.css"
 
-type Props = { target: ConsoleKind; settings: Settings; demo: boolean; onReceiverLoaded: (target: ConsoleKind) => void }
+type Props = { target: ConsoleKind; settings: Settings; demo: boolean; onReceiverLoaded: (target: ConsoleKind) => void; onOpenProcesses: () => void }
 type SessionSend = { id: string; name: string; at: number; result: string; ok: boolean; totalMs?: number; bytesPerSecond?: number | null }
 type Traced = PayloadSendResult & { at: number }
 
@@ -39,7 +38,7 @@ const when = (at: number) => {
   return day.toDateString() === today.toDateString() ? time(at) : day.toLocaleDateString([], { month: "short", day: "numeric" })
 }
 
-export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Props) {
+export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onOpenProcesses }: Props) {
   const endpoint = loaderEndpoint(settings, target)
   const name = target.toUpperCase()
   const loader = target === "ps4" ? "GoldHEN BinLoader" : "ELF loader"
@@ -56,7 +55,6 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
   const [autoBusy, setAutoBusy] = useState(false)
   const [ordering, setOrdering] = useState<{ adding?: string } | null>(null)
   const [catalogOpen, setCatalogOpen] = useState(false)
-  const [processRevision, setProcessRevision] = useState(0)
   const autoGeneration = useRef(0)
   const fileRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
@@ -140,7 +138,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
       setPayloads(old => old.map(item => item.id === entry.id ? { ...item, lastSentAt: Date.now(), lastResult: message } : item))
       setHistory(old => [{ id: `${entry.id}-${Date.now()}`, name: entry.name, at: Date.now(), result: message, ok: false }, ...old].slice(0, 20))
       toast({ tone: "error", title: `${entry.name} wasn't sent`, text: `${message} Check that ${loader} is running on your ${name}.` })
-    } finally { setBusy(""); setProcessRevision(value => value + 1) }
+    } finally { setBusy("") }
   }
   const save = async (entry: PayloadEntry, draft: { name: string; target: PayloadTarget; notes: string }) => {
     setBusy(entry.id)
@@ -185,12 +183,12 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
           <span className={`dot ${endpoint.host ? "good" : ""}`} />
           <span>{endpoint.host ? <>Sends to <strong>{endpoint.host}:{endpoint.port}</strong>, the {loader} on your {name}</> : <>Add your {name}'s address in Options, Consoles to send payloads</>}</span>
         </p>
+        <button type="button" className="btn sm ghost" title="Running payloads, with Stop and End, in System" onClick={onOpenProcesses}><Icon name="cpu" />Processes</button>
         {target === "ps5" && <button type="button" className="btn sm ghost" onClick={() => setCatalogOpen(true)}><Icon name="globe" />Catalog</button>}
         <button type="button" className="btn sm" disabled={busy === "add"} onClick={() => void choose()}>{busy === "add" ? <span className="spinner" /> : <Icon name="plus" />}Add payloads</button>
         <input ref={fileRef} type="file" accept=".elf,.bin" multiple hidden onChange={(event: ChangeEvent<HTMLInputElement>) => { const files = Array.from(event.currentTarget.files || []); event.currentTarget.value = ""; void addPaths(files.map(file => `preview/${file.name}`)) }} />
       </div>
       {error && <p className="pl-error" role="alert">{error}</p>}
-      <RunningPayloads key={`${target}:${endpoint.host}`} target={target} settings={settings} demo={demo} revision={processRevision} />
       <AutostartCard status={auto} payloads={shown} loader={loader} busy={autoBusy || loading} available={launcherAvailable(demo)}
         onToggle={toggleAutostart} onEdit={() => setOrdering({})}
         onRun={() => void autoAction(() => runAutostart(target, demo), "Autostart didn't start").catch(() => undefined)}

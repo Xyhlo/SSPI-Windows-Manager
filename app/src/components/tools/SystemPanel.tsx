@@ -17,8 +17,9 @@ import type { ConsoleMount, ConsoleProbe, ConsoleSystemInfo } from "@/lib/consol
 import { errorText, fmtBytes } from "@/lib/format"
 import type { ConsoleKind, Settings } from "@/types"
 
-type Props = { target: ConsoleKind; settings: Settings; demo: boolean; probe?: ConsoleProbe; onLoadReceiver: () => void }
-type View = "overview" | "timeline" | "klog" | "processes" | "logs"
+type Props = { target: ConsoleKind; settings: Settings; demo: boolean; probe?: ConsoleProbe; onLoadReceiver: () => void; initialView?: SystemView }
+export type SystemView = "overview" | "timeline" | "klog" | "processes" | "logs"
+type View = SystemView
 
 const CAPABILITY_NAMES: Record<string, string> = {
   "installed-library-v1": "Installed titles",
@@ -33,9 +34,9 @@ const CAPABILITY_NAMES: Record<string, string> = {
 }
 const VIEWS: Array<[View, string]> = [["overview", "Overview"], ["timeline", "Crash timeline"], ["klog", "Kernel log"], ["processes", "Processes"], ["logs", "Logs & crashes"]]
 
-export function SystemPanel({ target, settings, demo, probe, onLoadReceiver }: Props) {
+export function SystemPanel({ target, settings, demo, probe, onLoadReceiver, initialView }: Props) {
   const name = target.toUpperCase()
-  const [view, setView] = useState<View>("overview")
+  const [view, setView] = useState<View>(initialView ?? "overview")
   const [klogFocus, setKlogFocus] = useState<KernelLogFocus | null>(null)
   const receiver = probe?.receiver.state
   const unreachable = !demo && (!probe || receiver === "offline" || receiver === "unconfigured" || receiver === "error")

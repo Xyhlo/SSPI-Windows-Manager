@@ -19,6 +19,8 @@
 !/app/src-tauri/src/ampr_index.rs
 !/app/src-tauri/src/job_store.rs
 !/app/src-tauri/src/rar_control.rs
+!/app/src-tauri/src/scheduler.rs
+!/app/src-tauri/src/downloader.rs
 !/app/src-tauri/src/storage.rs
 !/app/src-tauri/src/static_catalog.rs
 !/app/src-tauri/src/lib.rs
@@ -216,7 +218,6 @@
 !/app/src/components/tools/payloads/AutostartCard.tsx
 !/app/src/components/tools/payloads/AutostartDialog.tsx
 !/app/src/components/tools/payloads/CatalogDialog.tsx
-!/app/src/components/tools/payloads/RunningPayloads.tsx
 !/app/src/components/tools/payloads/payloads.css
 !/app/src-tauri/src/updater.rs
 !/app/src/lib/updater.ts

@@ -376,6 +376,19 @@ export function OptionsOverlay(props: Props) {
         <Row label="Keep packaged PKGs" detail="After a confirmed install"><Switch label="Keep packaged PKGs" checked={draft.keepPackages} onChange={value => patch({ keepPackages: value })} /></Row>
       </div>
       <p className="opt-note">Imported originals are never removed.</p>
+      <div className="opt-section">At the same time</div>
+      <div className="orows">
+        <Row label="Games downloading" detail="1 to 8. A prioritized game always starts">
+          <Field label="Games downloading" type="number" width={90} value={draft.downloadSlots ?? 4} onChange={value => patch({ downloadSlots: Math.min(8, Math.max(1, Math.round(Number(value)) || 4)) })} />
+        </Row>
+        <Row label="Games extracting" detail="1 to 4">
+          <Field label="Games extracting" type="number" width={90} value={draft.extractionSlots ?? 2} onChange={value => patch({ extractionSlots: Math.min(4, Math.max(1, Math.round(Number(value)) || 2)) })} />
+        </Row>
+        <Row label="Download connections" detail="1 to 32, shared so downloads finish together">
+          <Field label="Download connections" type="number" width={90} value={draft.downloadConnections ?? 16} onChange={value => patch({ downloadConnections: Math.min(32, Math.max(1, Math.round(Number(value)) || 16)) })} />
+        </Row>
+      </div>
+      <p className="opt-note">Prioritize a game on its download card (or press T) to give it about 90% of the download connections and the first extraction, packaging and console slot. Other games' extraction and packaging run at low priority while it works.</p>
       <div className="opt-section">Upload to PS5</div>
       <div className="orows">
         <Row label="Max bandwidth" detail="Up to 12 upload lanes instead of 4"><Switch label="Max bandwidth" checked={(draft.transferMode || "balanced") === "max"} onChange={value => patch({ transferMode: value ? "max" : "balanced" })} /></Row>

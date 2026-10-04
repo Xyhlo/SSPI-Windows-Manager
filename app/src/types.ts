@@ -51,6 +51,12 @@ export type Settings = {
   lizardPacking?: boolean
   /** What adding game folders does: ask, or start one batch action right away. */
   folderAction?: FolderAction
+  /** Games that download at once; the priority game downloads beside them. */
+  downloadSlots?: number
+  /** Games that extract at once. */
+  extractionSlots?: number
+  /** Connections shared by every download, split by the bytes each has left. */
+  downloadConnections?: number
 }
 export type FolderAction = "ask" | "package" | "package-send" | "send"
 export type PackageFormat = "fpkg" | "exfat"
@@ -197,6 +203,10 @@ export type DeliveryJob = {
   createdAt?: number
   stageHistory?: string[]
   paused?: boolean
+  /** The one game that downloads, extracts and packages first. */
+  priority?: boolean
+  /** Connections a segmented download is using now (download events only). */
+  connections?: number | null
   stage: string
   progress: number
   bytesDone?: number
@@ -329,6 +339,9 @@ export const blankSettings: Settings = {
   packageFormat: "fpkg",
   lizardPacking: false,
   folderAction: "ask",
+  downloadSlots: 4,
+  extractionSlots: 2,
+  downloadConnections: 16,
 }
 
 export const isActiveJob = (stage: string) =>

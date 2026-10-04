@@ -3,6 +3,7 @@ use std::ffi::CString;
 use std::io::{BufWriter, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use unrar_sys as rar;
+use base64::Engine as _;
 
 pub(super) fn library_lock(checkpoint: &dyn Fn() -> Result<(), String>) -> Result<std::sync::MutexGuard<'static, ()>, String> {
     // The bundled static library shares error state between archive handles.
@@ -143,9 +144,247 @@ pub(super) fn extract_measured(path: &Path, dest: &Path, password: &[u8], checkp
     Ok(files)
 }
 
+/* ---------------------------------------------------------------- extraction in a child process */
+
+/// Starts SSPI as a RAR extraction worker instead of the app (`main` checks for it first).
+pub(super) const CHILD_FLAG: &str = "--sspi-rar-extract";
+
+/// Unit tests extract in this process unless a test points at a built SSPI executable.
+#[cfg(test)]
+static TEST_WORKER: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// The executable that runs extraction workers, or None to extract in this process.
+fn worker_exe() -> Option<PathBuf> {
+    #[cfg(test)]
+    { TEST_WORKER.lock().unwrap().clone() }
+    #[cfg(not(test))]
+    { if std::env::var_os("SSPI_RAR_IN_PROCESS").is_some() { None } else { std::env::current_exe().ok() } }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ChildRequest { archive: PathBuf, dest: PathBuf, passwords: Vec<String> }
+
+/// The library's error state is process-wide, so one process extracts one RAR at a time. Each
+/// extraction runs in its own SSPI process instead, so the scheduler's extraction slots can run
+/// two at once. Pause, cancel and background priority reach the child over stdin; it reports
+/// decompressed bytes and its result over stdout. Falls back to extracting in this process
+/// (one at a time) when a child can't be started. Returns the number of files written.
+pub(super) fn extract_isolated(path: &Path, dest: &Path, passwords: &[&[u8]], checkpoint: &dyn Fn() -> Result<(), String>, processed: &std::sync::atomic::AtomicU64) -> Result<u64, String> {
+    use std::io::BufRead;
+    use std::process::{Command, Stdio};
+    let in_process = |processed: &std::sync::atomic::AtomicU64| {
+        let mut last = "Unable to extract RAR; check the password and all archive volumes.".to_string();
+        for password in passwords {
+            checkpoint()?;
+            processed.store(0, Ordering::Relaxed);
+            match extract_measured(path, dest, password, checkpoint, processed) {
+                Ok(files) => return Ok(files),
+                Err(error) if error.starts_with("RAR password error") => last = error,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last)
+    };
+    let Some(exe) = worker_exe() else { return in_process(processed); };
+    let mut command = Command::new(exe);
+    command.arg(CHILD_FLAG).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(windows)]
+    { use std::os::windows::process::CommandExt; command.creation_flags(0x0800_0000); }
+    let Ok(mut child) = command.spawn() else { return in_process(processed); };
+    let request = ChildRequest { archive: path.to_path_buf(), dest: dest.to_path_buf(),
+        passwords: passwords.iter().map(|password| BASE64.encode(password)).collect() };
+    let input = Arc::new(Mutex::new(child.stdin.take()));
+    let say = |line: &str| {
+        let mut input = input.lock().unwrap();
+        if let Some(pipe) = input.as_mut() { let _ = writeln!(pipe, "{line}").and_then(|()| pipe.flush()); }
+    };
+    say(&serde_json::to_string(&request).map_err(redact)?);
+    let outcome: Arc<Mutex<Option<Result<u64, String>>>> = Arc::new(Mutex::new(None));
+    let reader = {
+        let stdout = child.stdout.take().ok_or("RAR worker output unavailable")?;
+        let outcome = outcome.clone();
+        let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let shared = progress.clone();
+        let handle = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(bytes) = line.strip_prefix("progress ").and_then(|n| n.trim().parse().ok()) { shared.store(bytes, Ordering::Relaxed); }
+                else if let Some(files) = line.strip_prefix("done ").and_then(|n| n.trim().parse().ok()) { *outcome.lock().unwrap() = Some(Ok(files)); }
+                else if let Some(error) = line.strip_prefix("error ") { *outcome.lock().unwrap() = Some(Err(error.to_string())); }
+            }
+        });
+        (handle, progress)
+    };
+    // While the job is paused its checkpoint blocks; a watchdog sees that and pauses the child.
+    let inside = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let child_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = {
+        let (inside, child_paused, finished, input) = (inside.clone(), child_paused.clone(), finished.clone(), input.clone());
+        std::thread::spawn(move || {
+            let mut since: Option<Instant> = None;
+            while !finished.load(Ordering::Relaxed) {
+                if inside.load(Ordering::Relaxed) {
+                    let entered = *since.get_or_insert_with(Instant::now);
+                    if entered.elapsed() > Duration::from_millis(150) && !child_paused.swap(true, Ordering::Relaxed) {
+                        if let Some(pipe) = input.lock().unwrap().as_mut() { let _ = writeln!(pipe, "pause").and_then(|()| pipe.flush()); }
+                    }
+                } else { since = None; }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+    let mut background = false;
+    let result = loop {
+        processed.store(reader.1.load(Ordering::Relaxed), Ordering::Relaxed);
+        inside.store(true, Ordering::Relaxed);
+        let control = checkpoint();
+        inside.store(false, Ordering::Relaxed);
+        if child_paused.swap(false, Ordering::Relaxed) { say("resume"); }
+        if let Err(error) = control { stopped.store(true, Ordering::Relaxed); break Err(error); }
+        // The checkpoint notes whether to give way to the priority game; the child follows.
+        let wanted = scheduler::yielding();
+        if wanted != background { background = wanted; say(if wanted { "background 1" } else { "background 0" }); }
+        match child.try_wait() {
+            Ok(Some(_)) => break Ok(()),
+            Ok(None) => {}
+            Err(error) => { stopped.store(true, Ordering::Relaxed); break Err(redact(error)); }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if stopped.load(Ordering::Relaxed) { let _ = child.kill(); }
+    let _ = child.wait();
+    finished.store(true, Ordering::Relaxed);
+    let _ = watchdog.join();
+    let _ = reader.0.join();
+    processed.store(reader.1.load(Ordering::Relaxed), Ordering::Relaxed);
+    result?;
+    let outcome = outcome.lock().unwrap().take();
+    outcome.unwrap_or_else(|| Err("The RAR extraction worker stopped without a result. Retry the transfer.".into()))
+}
+
+/// The child's side: read the request, extract with each password in turn, report on stdout.
+pub(super) fn child_main() -> i32 {
+    use std::io::BufRead;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    let stdout = Arc::new(Mutex::new(std::io::stdout()));
+    let say = |line: String| { let mut out = stdout.lock().unwrap(); let _ = writeln!(out, "{line}").and_then(|()| out.flush()); };
+    let mut lines = std::io::stdin().lock().lines();
+    let request: ChildRequest = match lines.next().and_then(Result::ok).and_then(|line| serde_json::from_str(&line).ok()) {
+        Some(request) => request,
+        None => { say("error The RAR extraction request was unreadable".into()); return 2; }
+    };
+    drop(lines);
+    let paused = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    {
+        let (paused, cancelled) = (paused.clone(), cancelled.clone());
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                match line.as_deref() {
+                    Ok("pause") => paused.store(true, Ordering::Relaxed),
+                    Ok("resume") => paused.store(false, Ordering::Relaxed),
+                    Ok("background 1") => set_process_background(true),
+                    Ok("background 0") => set_process_background(false),
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            // The app closed the pipe or exited: stop rather than keep writing on our own.
+            cancelled.store(true, Ordering::Relaxed);
+        });
+    }
+    let processed = Arc::new(AtomicU64::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+    let reporter = {
+        let (processed, done, stdout) = (processed.clone(), done.clone(), stdout.clone());
+        std::thread::spawn(move || while !done.load(Ordering::Relaxed) {
+            { let mut out = stdout.lock().unwrap(); let _ = writeln!(out, "progress {}", processed.load(Ordering::Relaxed)).and_then(|()| out.flush()); }
+            std::thread::sleep(Duration::from_millis(250));
+        })
+    };
+    let checkpoint = || -> Result<(), String> {
+        loop {
+            if cancelled.load(Ordering::Relaxed) { return Err("cancelled".into()); }
+            if !paused.load(Ordering::Relaxed) { return Ok(()); }
+            std::thread::sleep(Duration::from_millis(80));
+        }
+    };
+    let passwords: Vec<Vec<u8>> = request.passwords.iter().filter_map(|password| BASE64.decode(password).ok()).collect();
+    let mut last = "Unable to extract RAR; check the password and all archive volumes.".to_string();
+    let mut result = Err(last.clone());
+    for password in &passwords {
+        processed.store(0, Ordering::Relaxed);
+        match extract_measured(&request.archive, &request.dest, password, &checkpoint, &processed) {
+            Ok(files) => { result = Ok(files); break; }
+            Err(error) if error.starts_with("RAR password error") => { last = error; result = Err(last.clone()); }
+            Err(error) => { result = Err(error); break; }
+        }
+    }
+    done.store(true, Ordering::Relaxed);
+    let _ = reporter.join();
+    say(format!("progress {}", processed.load(Ordering::Relaxed)));
+    match result {
+        Ok(files) => { say(format!("done {files}")); 0 }
+        Err(error) => { say(format!("error {}", error.replace(['\r', '\n'], " "))); 1 }
+    }
+}
+
+/// Background mode lowers this process's CPU and disk priority while another game has priority.
+fn set_process_background(on: bool) {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn SetPriorityClass(process: *mut std::ffi::c_void, class: u32) -> i32;
+        }
+        const PROCESS_MODE_BACKGROUND_BEGIN: u32 = 0x0010_0000;
+        const PROCESS_MODE_BACKGROUND_END: u32 = 0x0020_0000;
+        unsafe { SetPriorityClass(GetCurrentProcess(), if on { PROCESS_MODE_BACKGROUND_BEGIN } else { PROCESS_MODE_BACKGROUND_END }); }
+    }
+    #[cfg(not(windows))]
+    let _ = on;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drives a real worker process (the debug SSPI build) through the parent side: password
+    /// fallback, a pause relayed while the job's checkpoint blocks, and cancel killing the worker.
+    #[cfg(windows)]
+    #[test]
+    fn a_worker_process_extracts_pauses_and_cancels_through_the_parent() {
+        use std::os::windows::process::CommandExt;
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
+        let worker = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../Build-Output/Windows Manager/cargo/debug/game-search.exe");
+        let archiver = Path::new("C:/Program Files/WinRAR/Rar.exe");
+        if !worker.is_file() || !archiver.is_file() { eprintln!("skipping: needs WinRAR and a debug build of SSPI"); return; }
+        let root = crate::test_output_root().join(format!("rar-worker-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let payload: Vec<u8> = (0..24u32 * 1024 * 1024).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        std::fs::write(root.join("payload.bin"), &payload).unwrap();
+        let status = std::process::Command::new(archiver).args(["a", "-idq", "-ep", "-m0", "-v8m", "-hpsecret"])
+            .arg(root.join("set.rar")).arg(root.join("payload.bin")).creation_flags(0x0800_0000).status().unwrap();
+        assert!(status.success());
+        let archive = root.join("set.part1.rar");
+        *TEST_WORKER.lock().unwrap() = Some(worker);
+        // The third checkpoint blocks like a paused job; the watchdog pauses the worker meanwhile.
+        let calls = AtomicUsize::new(0);
+        let blocking = || { if calls.fetch_add(1, Ordering::SeqCst) == 2 { std::thread::sleep(Duration::from_millis(700)); } Ok(()) };
+        let processed = AtomicU64::new(0);
+        let files = extract_isolated(&archive, &root.join("out"), &[b"wrong", b"secret"], &blocking, &processed).unwrap();
+        assert_eq!(files, 1);
+        assert!(std::fs::read(root.join("out").join("payload.bin")).unwrap() == payload);
+        assert_eq!(processed.load(Ordering::SeqCst), payload.len() as u64);
+        // Cancelling from the job's checkpoint stops the worker and reports the cancel.
+        let cancel = || Err::<(), String>("cancelled".into());
+        assert_eq!(extract_isolated(&archive, &root.join("cancelled"), &[b"secret"], &cancel, &AtomicU64::new(0)).unwrap_err(), "cancelled");
+        *TEST_WORKER.lock().unwrap() = None;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn io_and_crc_errors_are_not_password_retries() {
         for code in [rar::ERAR_EWRITE, rar::ERAR_EREAD, rar::ERAR_BAD_DATA, rar::ERAR_ECREATE] {

@@ -33,7 +33,7 @@ export function titleIdOf(job: DeliveryJob) {
 
 export const kindLabel = (kind: string) => ({base: "Base package", combined: "Base + backport", update: "Game update", dlc: "DLC", backport: "Backport", batch: "Manual batch"}[kind] || "Package")
 
-export function jobControls(job: Pick<DeliveryJob, "stage" | "retryable">) {
+export function jobControls(job: Pick<DeliveryJob, "stage" | "retryable" | "priority">) {
   const terminal = ["complete", "delivered", "failed", "cancelled", "monitoring-ended"].includes(job.stage)
   const consoleOwned = ["submitting", "installing", "mounting", "handoff"].includes(job.stage)
   return {
@@ -41,8 +41,14 @@ export function jobControls(job: Pick<DeliveryJob, "stage" | "retryable">) {
     pause: !terminal && !consoleOwned,
     cancel: !terminal && !consoleOwned,
     remove: terminal,
+    // Priority matters while the PC still has work to do for the game; it can always be removed.
+    priority: !terminal && (!consoleOwned || !!job.priority),
   }
 }
+
+/** The scheduler's messages for a game waiting its turn for a download, extraction, packaging or console slot. */
+export const slotWait = (message?: string) =>
+  /^waiting for (a download slot|an extraction slot|another extraction|packaging|the console to finish another install)/i.test(message || "")
 
 export function stageLabel(job: DeliveryJob) {
   if (job.paused) return "Paused"
@@ -319,8 +325,8 @@ export function phaseDetail(job: JobSnapshot): PhaseDetail {
     return { phase: "staging", label: preparation?.state || "Preparing link", indeterminate: preparation?.progress == null }
   }
   if (job.stage === "extracting") {
-    if (/^waiting for another extraction/i.test(job.message || "")) {
-      return { phase: "extraction", label: "Waiting for another extraction on this drive", indeterminate: false }
+    if (/^waiting for (an extraction slot|another extraction)/i.test(job.message || "")) {
+      return { phase: "extraction", label: "Waiting for an extraction slot", indeterminate: false }
     }
     const extracted = /extracted\s+(\d+)\s+pkgs?/i.exec(job.message || "")
     if (extracted) {
