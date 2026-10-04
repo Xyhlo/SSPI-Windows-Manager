@@ -71,6 +71,35 @@ export type Game = {
   sourceId?: string
   sourceName?: string
   sourceVersion?: string
+  /** Console tags of a title from the global homebrew source. */
+  homebrew?: HomebrewTitle
+}
+
+/** `platform` is the console the app was built for; `runsOn` lists every console that can install it. */
+export type HomebrewTitle = {
+  platform: ConsoleKind
+  runsOn: ConsoleKind[]
+  unverifiedOn?: ConsoleKind[]
+  category?: string
+  developer?: string
+  description?: string
+  version?: string
+}
+
+/** pkg: a PS4 package. folder: a ZIP copied to /data/homebrew/<installDir>. payload: an ELF added to Payloads. */
+export type HomebrewPackage = {
+  platform: ConsoleKind
+  format: "pkg" | "folder" | "payload"
+  runsOn: ConsoleKind[]
+  archiveRoot?: string
+  installDir?: string
+  layout?: "title" | "websrv"
+  archiveMember?: string
+  memberSha256?: string
+  memberSize?: number
+  payloadName?: string
+  unpackedSize?: number
+  fileCount?: number
 }
 
 export type PackageSource = {
@@ -123,6 +152,7 @@ export type PackageCandidate = {
   intermediateUrl?: string
   referer?: string
   diagnostics?: string[]
+  homebrew?: HomebrewPackage
 }
 
 export type DeliveryRequest = {

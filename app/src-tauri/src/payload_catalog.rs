@@ -120,9 +120,81 @@ pub(super) async fn download_catalog_payload(app: AppHandle, filename: String) -
     result
 }
 
+/// A payload row from a multi-platform homebrew source (GitHub releases only).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct HomebrewPayload {
+    url: String,
+    name: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    sha256: String,
+    homebrew: crate::static_catalog::HomebrewPackage,
+}
+fn github_url(raw: &str) -> bool { valid_url(raw) && url::Url::parse(raw).is_ok_and(|u| u.host_str() == Some("github.com")) }
+fn sha_matches(bytes: &[u8], expected: &str) -> bool { expected.is_empty() || crate::sha256_hex(bytes).eq_ignore_ascii_case(expected) }
+/// The payload file of a homebrew row: the download itself, or one member of a ZIP.
+fn homebrew_elf(bytes: Vec<u8>, request: &HomebrewPayload) -> Result<Vec<u8>, String> {
+    if !sha_matches(&bytes, &request.sha256) { return Err("The download did not match the catalog checksum. Nothing was imported.".into()); }
+    let member = request.homebrew.archive_member.as_str();
+    if member.is_empty() { return Ok(bytes); }
+    use std::io::Read;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|_| "The payload archive could not be read.".to_string())?;
+    let mut entry = archive.by_name(member).map_err(|_| "The payload archive does not contain the listed payload.".to_string())?;
+    if entry.size() > MAX_PAYLOAD as u64 { return Err("The payload exceeds its size limit.".into()); }
+    let mut elf = Vec::with_capacity(entry.size() as usize);
+    (&mut entry).take(MAX_PAYLOAD as u64 + 1).read_to_end(&mut elf).map_err(|e| e.to_string())?;
+    if !sha_matches(&elf, &request.homebrew.member_sha256) { return Err("The payload did not match the catalog checksum. Nothing was imported.".into()); }
+    Ok(elf)
+}
+#[tauri::command]
+pub(super) async fn add_homebrew_payload(app: AppHandle, request: HomebrewPayload) -> Result<Vec<PayloadEntry>, String> {
+    let _operation = operation().lock().await;
+    let filename = request.homebrew.payload_name.clone();
+    if request.homebrew.format != "payload" || !valid_filename(&filename) || !github_url(&request.url) { return Err("This homebrew entry is not a payload SSPI can import.".into()); }
+    let target = if request.homebrew.platform == "ps4" { "ps4" } else { "ps5" };
+    let download = download(&client()?, &request.url, MAX_PAYLOAD).await?;
+    let bytes = homebrew_elf(download, &request)?;
+    if bytes.is_empty() || (filename.to_ascii_lowercase().ends_with(".elf") && !bytes.starts_with(b"\x7fELF")) { return Err("The download is not a valid payload file.".into()); }
+    let hash = crate::sha256_hex(&bytes);
+    let existing = payloads::list_payloads(app.clone())?;
+    if existing.iter().any(|payload| payload.sha256 == hash) { return Ok(existing); }
+    let folder = root(&app)?.join(uuid::Uuid::new_v4().to_string()); fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+    let path = folder.join(&filename);
+    let result = (|| {
+        fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        let entries = payloads::add_payloads(app.clone(), vec![path.to_string_lossy().into_owned()], target.into())?;
+        if let Some(imported) = entries.iter().find(|p| p.sha256 == hash) {
+            let name: String = format!("{} {}", request.name, request.version).trim().chars().take(80).collect();
+            let notes = format!("Homebrew source; {}.", if request.sha256.is_empty() { "no published checksum" } else { "SHA-256 verified" });
+            payloads::update_payload(app.clone(), imported.id.clone(), Some(name), None, Some(notes))
+        } else { Ok(entries) }
+    })();
+    let _ = fs::remove_file(path); let _ = fs::remove_dir(folder);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn homebrew_payloads_come_from_github_and_match_their_checksums() {
+        use std::io::Write;
+        let elf = b"\x7fELF payload".to_vec();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("dir/tool.elf", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(&elf).unwrap();
+        let archive = zip.finish().unwrap().into_inner();
+        let mut request = HomebrewPayload { url: "https://github.com/o/r/releases/download/v1/tool.zip".into(), name: "Tool".into(), version: "1".into(), sha256: crate::sha256_hex(&archive),
+            homebrew: crate::static_catalog::HomebrewPackage { format: "payload".into(), archive_member: "dir/tool.elf".into(), member_sha256: crate::sha256_hex(&elf), ..Default::default() } };
+        assert_eq!(homebrew_elf(archive.clone(), &request).unwrap(), elf);
+        request.homebrew.member_sha256 = "00".repeat(32);
+        assert!(homebrew_elf(archive.clone(), &request).is_err());
+        request.sha256 = "00".repeat(32);
+        assert!(homebrew_elf(archive, &request).is_err());
+        assert!(github_url(&request.url) && !github_url("https://example.test/tool.elf") && !github_url("http://github.com/o/r"));
+    }
     #[test]
     fn upstream_array_and_documented_object_catalogs_work() {
         let entry = r#"{"name":"FTP Server","filename":"ftpsrv.elf","url":"https://example.test/ftpsrv.elf","version":"v1","last_update":"2026-10-01","category":"Networking & Servers"}"#;

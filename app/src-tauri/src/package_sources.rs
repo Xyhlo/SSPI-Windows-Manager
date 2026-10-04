@@ -1,6 +1,6 @@
 mod local_recipe;
 pub mod community;
-use crate::static_catalog;
+use crate::static_catalog::{self, HomebrewPackage, HomebrewTitle};
 use local_recipe::{scoped_titles, scoped_packages, source_link, utf8_window};
 use regex::Regex;
 use reqwest::{redirect, Client};
@@ -56,6 +56,9 @@ pub struct SourceTitle {
     pub source_id: String,
     pub source_name: String,
     pub source_version: String,
+    /// Platform tags when the title comes from a multi-platform catalog.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub homebrew: Option<HomebrewTitle>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,6 +100,9 @@ pub struct SourcePackage {
     pub referer: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub diagnostics: Vec<String>,
+    /// Install format and target for homebrew rows (pkg, folder, payload).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub homebrew: Option<HomebrewPackage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -122,6 +128,12 @@ struct Descriptor {
     origins: Vec<String>,
     #[serde(default)]
     files: Vec<ManifestFile>,
+    /// Per-edition names, e.g. {"ps4": "Homebrew (PS4)", "windows": "Homebrew"}.
+    #[serde(default)]
+    display_names: HashMap<String, String>,
+    /// Source ids this source supersedes; installing it removes them.
+    #[serde(default)]
+    replaces: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -447,7 +459,42 @@ fn version_cmp(left: &str, right: &str) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
+/// GitHub release assets listed by their API URL download from the release's
+/// public download URL instead. Every 8 MiB piece is its own request, and the
+/// API answers anonymous clients 60 times an hour.
+fn github_download_url(url: &str, page: &str, name: Option<&str>) -> Option<String> {
+    let api = url.strip_prefix("https://api.github.com/repos/")?;
+    let (repo, asset) = api.split_once("/releases/assets/")?;
+    if repo.split('/').count() != 2 || asset.is_empty() || !asset.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let tag = page
+        .strip_prefix("https://github.com/")?
+        .strip_prefix(repo)?
+        .strip_prefix("/releases/tag/")?;
+    let name = name.filter(|name| !name.is_empty() && !name.contains('/'))?;
+    if tag.is_empty() || tag.contains(['?', '#']) {
+        return None;
+    }
+    let encoded: String = name
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (byte as char).to_string(),
+            _ => format!("%{byte:02X}"),
+        })
+        .collect();
+    Some(format!("https://github.com/{repo}/releases/download/{tag}/{encoded}"))
+}
+
+/// First-party SSPI sources keep their own names and descriptions.
+fn first_party(id: &str) -> bool {
+    id.starts_with("org.sspi.")
+}
+
 fn catalog_name(id: &str, name: &str) -> String {
+    if first_party(id) {
+        return name.into();
+    }
     let value = format!("{id} {name}").to_ascii_lowercase();
     if value.contains("ps4") { "Global PS4".into() }
     else if value.contains("ps5") { "Global PS5".into() }
@@ -456,7 +503,7 @@ fn catalog_name(id: &str, name: &str) -> String {
 }
 
 fn summary(entry: &RegistryEntry) -> SourceSummary {
-    SourceSummary {
+    let mut summary = SourceSummary {
         id: entry.id.clone(),
         name: catalog_name(&entry.id, &entry.name),
         description: if entry.engine_type == "embedded-catalog-v1" { "Global game catalog. Downloads use your connected services.".into() } else { entry.description.replace("DLPS", "Global").replace("dlps", "Global") },
@@ -465,7 +512,11 @@ fn summary(entry: &RegistryEntry) -> SourceSummary {
         enabled: entry.enabled,
         trust: entry.trust.clone(),
         install_url: entry.install_url.clone(),
+    };
+    if first_party(&entry.id) {
+        summary.description = entry.description.clone();
     }
+    summary
 }
 
 pub fn list(app: &AppHandle) -> Result<Vec<SourceSummary>, String> {
@@ -692,9 +743,26 @@ fn install_validated_archive(
     static_catalog::invalidate(&destination);
     fs::rename(staging, &destination).map_err(|error| error.to_string())?;
     registry.sources.retain(|item| item.id != descriptor.id);
+    // A source that supersedes an older one (Homebrew (PS4) -> Homebrew)
+    // takes its place instead of showing both.
+    for replaced in descriptor.replaces.iter().filter(|id| **id != descriptor.id && id_value(id, 128)) {
+        if registry.sources.iter().any(|item| &item.id == replaced) {
+            registry.sources.retain(|item| &item.id != replaced);
+            let owned = source_root(app)?.join("installed").join(replaced);
+            if owned.is_dir() {
+                let _ = fs::remove_dir_all(owned);
+            }
+        }
+    }
+    let name = descriptor
+        .display_names
+        .get("windows")
+        .filter(|name| !name.trim().is_empty())
+        .cloned()
+        .unwrap_or(descriptor.name);
     registry.sources.push(RegistryEntry {
         id: descriptor.id,
-        name: descriptor.name,
+        name,
         description: descriptor.description,
         version: descriptor.version,
         engine_type: descriptor.engine.engine_type,
@@ -925,8 +993,7 @@ async fn remote_search(
                     .filter(|item| !item.is_empty()),
                 source_id: descriptor.id.clone(),
                 source_name: catalog_name(&descriptor.id, &descriptor.name),
-                source_version: descriptor.version.clone(),
-            })
+                source_version: descriptor.version.clone(), homebrew: None })
         })
         .take(limit)
         .collect())
@@ -1010,8 +1077,7 @@ fn package_from_remote(
         mirror_id: None,
         intermediate_url: None,
         referer: None,
-        diagnostics: Vec::new(),
-    })
+        diagnostics: Vec::new(), homebrew: None })
 }
 
 fn steps<'a>(recipe: &'a Value, key: &str) -> Result<&'a Vec<Value>, String> {
@@ -1180,7 +1246,7 @@ async fn recipe_search(
                 for item in items.iter().take(limit.min(MAX_RESULTS)) {
                     output.push(SourceTitle { title_id: item.title_id.clone(), name: item.name.clone(),
                         region: item.region.clone(), icon: Some(item.image.clone()).filter(|s|!s.is_empty()),
-                        source_id: descriptor.id.clone(), source_name: catalog_name(&descriptor.id, &descriptor.name), source_version: descriptor.version.clone() });
+                        source_id: descriptor.id.clone(), source_name: catalog_name(&descriptor.id, &descriptor.name), source_version: descriptor.version.clone(), homebrew: None });
                 }
             },
             "items.dedupe" => {
@@ -1231,8 +1297,7 @@ async fn recipe_search(
                         icon: Some(item.image.clone()).filter(|value| !value.is_empty()),
                         source_id: descriptor.id.clone(),
                         source_name: catalog_name(&descriptor.id, &descriptor.name),
-                        source_version: descriptor.version.clone(),
-                    });
+                        source_version: descriptor.version.clone(), homebrew: None });
                 }
             }
             _ => return Err(format!("Unsupported search recipe operation: {op}")),
@@ -2497,8 +2562,7 @@ fn emit_packages(
                 intermediate_url: (!item.intermediate_url.is_empty())
                     .then_some(item.intermediate_url),
                 referer: (!item.parent_url.is_empty()).then_some(item.parent_url),
-                diagnostics: item.diagnostics,
-            })
+                diagnostics: item.diagnostics, homebrew: None })
         })
         .take(MAX_RESULTS)
         .collect()
@@ -2863,8 +2927,7 @@ fn static_search(
             icon: title.icon,
             source_id: descriptor.id.clone(),
             source_name: catalog_name(&descriptor.id, &descriptor.name),
-            source_version: descriptor.version.clone(),
-        })
+            source_version: descriptor.version.clone(), homebrew: title.homebrew })
         .collect())
 }
 
@@ -2883,7 +2946,8 @@ fn static_resolve(
         .map(|row| SourcePackage {
             kind: if row.kind != "base" && row.label.to_ascii_lowercase().contains("backport") { "backport".into() } else { infer_kind(&row.kind).to_owned() },
             label: row.label.clone(),
-            url: row.url.clone(),
+            url: github_download_url(&row.url, &row.source_page_url, row.file_name.as_deref())
+                .unwrap_or_else(|| row.url.clone()),
             access_type: {
                 let kind = row.access_type.to_ascii_lowercase();
                 match kind.as_str() {
@@ -2907,8 +2971,8 @@ fn static_resolve(
             firmware: row.firmware.clone(),
             source_page_url: row.source_page_url.clone(),
             expected_size: row.expected_size,
-            expected_sha256: String::new(),
-            expected_content_id: String::new(),
+            expected_sha256: row.sha256.clone(),
+            expected_content_id: row.content_id.clone(),
             archive_set_id: row.archive_set_id.clone(),
             archive_part_number: row.archive_part_number,
             archive_part_count: row.archive_part_count,
@@ -2925,8 +2989,7 @@ fn static_resolve(
                 )); notes
             } else {
                 row.diagnostics.clone()
-            },
-        })
+            }, homebrew: row.homebrew.clone() })
         .collect();
     annotate_static_parts(&mut packages);
     Ok(packages)
@@ -3040,7 +3103,7 @@ pub fn home_titles(app: &AppHandle) -> Result<Vec<SourceTitle>, String> {
         let catalog = static_catalog::cached(&directory)?;
         for title in catalog.search("", "", 60000) {
             results.push(SourceTitle { title_id: title.title_id, name: title.name, region: title.region, icon: title.icon,
-                source_id: descriptor.id.clone(), source_name: catalog_name(&descriptor.id, &descriptor.name), source_version: descriptor.version.clone() });
+                source_id: descriptor.id.clone(), source_name: catalog_name(&descriptor.id, &descriptor.name), source_version: descriptor.version.clone(), homebrew: title.homebrew });
         }
     }
     Ok(results)
@@ -3214,6 +3277,19 @@ pub fn has_enabled(app: &AppHandle) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_api_assets_download_from_the_release_url() {
+        assert_eq!(
+            github_download_url("https://api.github.com/repos/o/r/releases/assets/42", "https://github.com/o/r/releases/tag/v1.0", Some("My App.zip")).as_deref(),
+            Some("https://github.com/o/r/releases/download/v1.0/My%20App.zip")
+        );
+        assert!(github_download_url("https://api.github.com/repos/o/r/releases/assets/x", "https://github.com/o/r/releases/tag/v1", Some("a.zip")).is_none());
+        assert!(github_download_url("https://api.github.com/repos/o/r/releases/assets/1", "https://github.com/other/r/releases/tag/v1", Some("a.zip")).is_none());
+        assert!(github_download_url("https://api.github.com/repos/o/r/releases/assets/1", "https://github.com/o/r/releases/tag/v1", Some("../a.zip")).is_none());
+        assert!(github_download_url("https://example.test/a.zip", "", Some("a.zip")).is_none());
+        assert!(first_party("org.sspi.homebrew") && !first_party("com.example.catalog"));
+    }
 
     #[test]
     fn title_and_origin_validation() {
@@ -3663,6 +3739,8 @@ mod tests {
                 },
                 origins: Vec::new(),
                 files: Vec::new(),
+                display_names: HashMap::new(),
+                replaces: Vec::new(),
             },
             items,
             &serde_json::json!({"accessType":"HosterLanding","preserveArchiveParts":true}),

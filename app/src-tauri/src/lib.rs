@@ -414,6 +414,9 @@ struct Game {
     source_id: String,
     source_name: String,
     source_version: String,
+    /// Console tags of a homebrew title; its case follows `platform`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    homebrew: Option<static_catalog::HomebrewTitle>,
 }
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -481,6 +484,9 @@ struct Package {
     referer: Option<String>,
     #[serde(default)]
     diagnostics: Vec<String>,
+    /// Format and target of a homebrew row (pkg, folder or payload).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    homebrew: Option<static_catalog::HomebrewPackage>,
 }
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -685,7 +691,8 @@ fn delivery_target(target: Option<&str>) -> Result<&str, String> {
 }
 fn ps4_transport(request: &DeliveryRequest) -> &str { request.transport.as_deref().unwrap_or("inbox") }
 fn delivery_can_package(request: &DeliveryRequest) -> bool {
-    !ps4_title_id(&request.title_id.as_deref().unwrap_or("").to_ascii_uppercase())
+    request.package.homebrew.is_none()
+        && !ps4_title_id(&request.title_id.as_deref().unwrap_or("").to_ascii_uppercase())
         && !request.package.expected_content_id.to_ascii_uppercase()
             .split(|c: char| !c.is_ascii_alphanumeric()).any(ps4_title_id)
 }
@@ -708,6 +715,19 @@ fn ps4_receiver_job(app: &AppHandle, job: &str) -> bool {
 }
 
 fn validate_delivery_target(request: &DeliveryRequest, package_only: bool, dump: bool) -> Result<&'static str, String> {
+    if let Some(homebrew) = &request.package.homebrew {
+        if homebrew.format == "payload" {
+            return Err("This is a payload. Add it to Payloads from its card.".into());
+        }
+        let target = delivery_target(request.target.as_deref())?;
+        if !homebrew.runs_on.is_empty() && !homebrew.runs_on.iter().any(|console| console == target) {
+            let consoles = homebrew.runs_on.iter().map(|console| console.to_ascii_uppercase()).collect::<Vec<_>>().join(" and ");
+            return Err(format!("This homebrew app runs on {consoles} only."));
+        }
+        if homebrew.format == "folder" && target != "ps5" {
+            return Err("Homebrew folders install on a PS5 only.".into());
+        }
+    }
     if package_only { return Ok(""); }
     if delivery_target(request.target.as_deref())? == "ps5" { return Ok("ps5"); }
     if request.title_id.as_deref().unwrap_or("").to_ascii_uppercase().contains("PPSA")
@@ -908,6 +928,7 @@ fn game_from_value(item: &Value) -> Option<Game> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
+        homebrew: None,
     })
 }
 
@@ -1163,6 +1184,7 @@ fn packages_from_value(value: &Value) -> Result<Vec<Package>, String> {
                             .collect()
                     })
                     .unwrap_or_default(),
+                homebrew: None,
             })
         })
         .collect();
@@ -2366,6 +2388,29 @@ mod console_target_tests {
         assert_eq!(validate_delivery_target(&request, false, false).unwrap_err(), "PS5 games can't be installed on a PS4.");
     }
     #[test]
+    fn homebrew_rows_follow_their_console_tags() {
+        let settings = Settings { package_dumps: true, download_package_only: true, ..Default::default() };
+        let mut request = request(Some("ps4"));
+        request.title_id = Some("PPSA99008".into());
+        request.package.homebrew = Some(static_catalog::HomebrewPackage { platform: "ps5".into(), format: "folder".into(), runs_on: vec!["ps5".into()], ..Default::default() });
+        assert!(!delivery_package_only(&request, &settings), "homebrew is never packaged on the PC");
+        assert_eq!(validate_delivery_target(&request, false, false).unwrap_err(), "This homebrew app runs on PS5 only.");
+        request.target = Some("ps5".into());
+        assert_eq!(validate_delivery_target(&request, false, false).unwrap(), "ps5");
+        request.title_id = Some("SSHB00001".into());
+        request.package.homebrew = Some(static_catalog::HomebrewPackage { platform: "ps4".into(), format: "pkg".into(), runs_on: vec!["ps4".into(), "ps5".into()], ..Default::default() });
+        assert_eq!(validate_delivery_target(&request, false, false).unwrap(), "ps5");
+        request.target = Some("ps4".into());
+        assert_eq!(validate_delivery_target(&request, false, false).unwrap(), "ps4");
+        request.package.homebrew.as_mut().unwrap().format = "payload".into();
+        assert!(validate_delivery_target(&request, false, false).unwrap_err().contains("Payloads"));
+        for good in ["PPSA99008", "ezremote-client", "Mednafen"] { assert!(homebrew_install_dir(good).is_ok()); }
+        for bad in ["", ".hidden", "a/b", "a\\b", "..", &"x".repeat(65)] { assert!(homebrew_install_dir(bad).is_err(), "{bad}"); }
+        assert_eq!(homebrew_archive_root("").unwrap(), PathBuf::new());
+        assert_eq!(homebrew_archive_root("PS5SX2/PPSA99203").unwrap(), PathBuf::from("PS5SX2").join("PPSA99203"));
+        for bad in ["../x", "a/../b", "c:/x", "a\\b"] { assert!(homebrew_archive_root(bad).is_err(), "{bad}"); }
+    }
+    #[test]
     fn ps5_defaults_and_package_only_keep_existing_routes() {
         for target in [None, Some("ps5")] {
             let mut request = request(target); request.title_id = Some("PPSA12345".into()); request.package.kind = "backport".into();
@@ -2726,6 +2771,7 @@ async fn search_games(
             source_id: title.source_id,
             source_name: title.source_name,
             source_version: title.source_version,
+            homebrew: title.homebrew,
         }));
         let mut seen = std::collections::HashSet::new();
         merged.retain(|game| seen.insert(format!("{}:{}:{}", game.title_id, game.region, game.source_id)));
@@ -2807,13 +2853,18 @@ async fn load_catalog(
                         source_id: title.source_id,
                         source_name: title.source_name,
                         source_version: title.source_version,
+                        homebrew: title.homebrew,
                     })
                     .collect::<Vec<_>>();
                 let catalog = GameCatalog {
                     sections: [ ("ps4", "PS4 catalog", "CUSA"), ("ps5", "PS5 catalog", "PPSA") ]
                         .into_iter().map(|(id, title, prefix)| CatalogSection {
                             id: id.into(), title: title.into(), games: games.iter()
-                                .filter(|g| if prefix == "CUSA" { ps4_title_id(&g.title_id) } else { g.title_id.starts_with(prefix) }).cloned().collect(),
+                                .filter(|g| match &g.homebrew {
+                                    Some(homebrew) => homebrew.platform == id,
+                                    None if prefix == "CUSA" => ps4_title_id(&g.title_id),
+                                    None => g.title_id.starts_with(prefix),
+                                }).cloned().collect(),
                         }).collect(),
                     cached: false,
                     source: "Package Sources".into(),
@@ -3153,6 +3204,7 @@ async fn resolve_packages(
                     intermediate_url: package.intermediate_url,
                     referer: package.referer,
                     diagnostics: package.diagnostics,
+                    homebrew: package.homebrew,
                     })
                     .collect();
                 if let Some(path) = cache_path.as_ref() {
@@ -4235,6 +4287,32 @@ async fn upload_dump(
         .map(|(path, _)| std::fs::metadata(path).map(|m| m.len()).map_err(redact))
         .collect::<Result<_, _>>()?;
     let overall_total = sizes.iter().copied().sum::<u64>().max(1);
+    let control = preflight_space(endpoint, overall_total, "Dump").await?;
+    create_remote_dir(endpoint, &remote_root).await?;
+    let overall_done = send_tree(app, s, files, sizes, &remote_root, job, tx).await?;
+    // Every file was size-checked, fsynced and released by VERIFY in send_file_once.
+    drop(control);
+    let mounted = mount_with_retries(app, s, job, tx, &remote_root, overall_done, overall_total).await?;
+    emit(
+        app,
+        Progress {
+            job_id: job.into(),
+            stage: "complete".into(),
+            progress: 1.,
+            bytes_done: overall_done,
+            bytes_total: overall_total,
+            speed_bps: 0.,
+            eta_seconds: None,
+            message: mounted,
+            ..Default::default()
+        },
+    );
+    Ok(())
+}
+
+/// Checks free space on /data. The returned control connection stays open
+/// for the transfer, as it did when this lived inside upload_dump.
+async fn preflight_space(endpoint: &ReceiverEndpoint, overall_total: u64, what: &str) -> Result<TcpStream, String> {
     let mut control = connect_receiver(endpoint, "dump preflight").await?;
     let (preflight, body) = frame(&mut control, 0x56, &[]).await?;
     require_preflight(preflight).map_err(|error| {
@@ -4253,13 +4331,26 @@ async fn upload_dump(
     {
         if free > 0 && free < overall_total.saturating_add(1 << 30) {
             return Err(format!(
-                "Dump needs {:.1} GB free on the PS5 and /data has {:.1} GB.",
+                "{what} needs {:.1} GB free on the PS5 and /data has {:.1} GB.",
                 overall_total as f64 / 1_073_741_824.0,
                 free as f64 / 1_073_741_824.0
             ));
         }
     }
-    create_remote_dir(endpoint, &remote_root).await?;
+    Ok(control)
+}
+
+/// Uploads a folder's files below remote_root. Returns the bytes sent.
+async fn send_tree(
+    app: &AppHandle,
+    s: &Settings,
+    files: Vec<(PathBuf, String)>,
+    sizes: Vec<u64>,
+    remote_root: &str,
+    job: &str,
+    tx: &watch::Receiver<bool>,
+) -> Result<u64, String> {
+    let overall_total = sizes.iter().copied().sum::<u64>().max(1);
     let file_count = files.len();
     let transferred = Arc::new(AtomicU64::new(0));
     // Cap total concurrent sockets (~32) so the receiver isn't drowned right
@@ -4349,9 +4440,21 @@ async fn upload_dump(
     for result in join_all(tasks).await {
         result.map_err(redact)??;
     }
-    // Every file was size-checked, fsynced and released by VERIFY in send_file_once.
-    drop(control);
-    let overall_done = transferred.load(Ordering::Relaxed);
+    Ok(transferred.load(Ordering::Relaxed))
+}
+
+/// Registers an uploaded title folder with PS5 AppInst, retrying transient
+/// receiver failures. Returns the receiver's mount message.
+async fn mount_with_retries(
+    app: &AppHandle,
+    s: &Settings,
+    job: &str,
+    tx: &watch::Receiver<bool>,
+    remote_root: &str,
+    overall_done: u64,
+    overall_total: u64,
+) -> Result<String, String> {
+    let endpoint = &ReceiverEndpoint::ps5(s);
     // U3: full-size numbers only with a message that says what they mean.
     begin_console_stage(app, job, tx, "mounting").await?;
     emit(
@@ -4381,7 +4484,7 @@ async fn upload_dump(
     // Mount is idempotent (nullfs is unmounted first), so ride out transient
     // backlog/TIME_WAIT storms after dozens of sockets slam shut at once.
     for attempt in 0..6u32 {
-        match mount_dump(s, &remote_root).await {
+        match mount_dump(s, remote_root).await {
             Ok(text) => {
                 mounted = text;
                 break;
@@ -4426,21 +4529,142 @@ async fn upload_dump(
     if mounted.is_empty() {
         return Err(format!("Mount kept failing ({last_error}). Files are on the PS5 at {remote_root}. Reload the ELF and mount it again."));
     }
-    emit(
-        app,
-        Progress {
-            job_id: job.into(),
-            stage: "complete".into(),
-            progress: 1.,
-            bytes_done: overall_done,
-            bytes_total: overall_total,
-            speed_bps: 0.,
-            eta_seconds: None,
-            message: mounted,
-            ..Default::default()
-        },
-    );
+    Ok(mounted)
+}
+
+/// A homebrew folder name below /data/homebrew.
+fn homebrew_install_dir(name: &str) -> Result<&str, String> {
+    if name.is_empty()
+        || name.len() > 64
+        || name.starts_with('.')
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err("Homebrew folder name is not valid.".into());
+    }
+    Ok(name)
+}
+
+/// The folder inside the archive that holds the app ("" is the archive root).
+fn homebrew_archive_root(root: &str) -> Result<PathBuf, String> {
+    let mut path = PathBuf::new();
+    for part in root.split('/').filter(|part| !part.is_empty()) {
+        if part == "." || part == ".." || part.contains(['\\', ':']) {
+            return Err("Homebrew archive folder is not valid.".into());
+        }
+        path.push(part);
+    }
+    Ok(path)
+}
+
+const MAX_HOMEBREW_UNPACKED: u64 = 8 << 30;
+
+/// Unpacks a homebrew ZIP below `out`, refusing unsafe names and oversized archives.
+fn extract_homebrew_zip(zip_path: &Path, out: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let file = std::fs::File::open(zip_path).map_err(redact)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|error| format!("Homebrew archive could not be read: {error}"))?;
+    let mut total = 0u64;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(redact)?;
+        total = total.saturating_add(entry.size());
+    }
+    if total > MAX_HOMEBREW_UNPACKED {
+        return Err("Homebrew archive is larger than 8 GB unpacked.".into());
+    }
+    std::fs::create_dir_all(out).map_err(redact)?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(redact)?;
+        let Some(relative) = entry.enclosed_name() else {
+            return Err("Homebrew archive contains an unsafe path.".into());
+        };
+        let target = out.join(relative);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&target).map_err(redact)?;
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(redact)?;
+        }
+        let mut writer = std::fs::File::create(&target).map_err(redact)?;
+        std::io::copy(&mut (&mut entry).take(MAX_HOMEBREW_UNPACKED), &mut writer).map_err(redact)?;
+    }
     Ok(())
+}
+
+/// Installs a homebrew folder: the archive's app folder is copied to
+/// /data/homebrew/<installDir>. Title apps (sce_sys/param.json + eboot.bin)
+/// are then registered like a game folder; web apps need no mount.
+async fn homebrew_folder(
+    app: &AppHandle,
+    s: &Settings,
+    job: &str,
+    archive: &Path,
+    homebrew: &static_catalog::HomebrewPackage,
+    tx: &watch::Receiver<bool>,
+) -> Result<(), String> {
+    let install_dir = homebrew_install_dir(&homebrew.install_dir)?.to_string();
+    let inner = homebrew_archive_root(homebrew.archive_root.as_deref().unwrap_or(""))?;
+    let title = homebrew.layout == "title";
+    let unpack = PathBuf::from(&s.download_dir).join("extracted").join(format!("homebrew-{job}"));
+    if unpack.exists() {
+        std::fs::remove_dir_all(&unpack).map_err(redact)?;
+    }
+    emit(app, Progress { job_id: job.into(), stage: "extracting".into(), progress: 0.5, message: "Unpacking homebrew".into(), ..Default::default() });
+    {
+        let archive = archive.to_path_buf();
+        let unpack = unpack.clone();
+        tauri::async_runtime::spawn_blocking(move || extract_homebrew_zip(&archive, &unpack)).await.map_err(redact)??;
+    }
+    let result = async {
+        let root = unpack.join(&inner);
+        if !root.is_dir() {
+            return Err(format!("Homebrew archive has no {} folder.", homebrew.archive_root.as_deref().unwrap_or("app")));
+        }
+        if title && !(root.join("sce_sys").join("param.json").is_file() && root.join("eboot.bin").is_file()) {
+            return Err("Homebrew app is missing sce_sys/param.json or eboot.bin.".into());
+        }
+        let files = dump_files(&root)?;
+        let sizes: Vec<u64> = files
+            .iter()
+            .map(|(path, _)| std::fs::metadata(path).map(|m| m.len()).map_err(redact))
+            .collect::<Result<_, _>>()?;
+        let total = sizes.iter().copied().sum::<u64>().max(1);
+        let endpoint = &ReceiverEndpoint::ps5(s);
+        let _delivery = console_delivery_slot(app, job, tx).await?;
+        test_ps5(s.ps5_host.clone(), s.ps5_port).await?;
+        let remote_root = format!("/data/homebrew/{install_dir}");
+        let control = preflight_space(endpoint, total, "This homebrew app").await?;
+        create_remote_dir(endpoint, &remote_root).await?;
+        let done = send_tree(app, s, files, sizes, &remote_root, job, tx).await?;
+        drop(control);
+        let message = if title {
+            mount_with_retries(app, s, job, tx, &remote_root, done, total).await?
+        } else {
+            format!("Installed to {remote_root}. Open it from the homebrew launcher.")
+        };
+        emit(app, Progress { job_id: job.into(), stage: "complete".into(), progress: 1., bytes_done: done, bytes_total: total, message, ..Default::default() });
+        Ok(())
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(&unpack);
+    result
+}
+
+async fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let actual = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        let mut file = std::fs::File::open(&path).map_err(redact)?;
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut file, &mut hasher).map_err(redact)?;
+        Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+    })
+    .await
+    .map_err(redact)??;
+    if actual.eq_ignore_ascii_case(expected.trim()) {
+        Ok(())
+    } else {
+        Err("The download does not match the catalog checksum. Retry it, or refresh the source.".into())
+    }
 }
 
 async fn mount_dump(s: &Settings, remote_root: &str) -> Result<String, String> {
@@ -5124,6 +5348,22 @@ async fn queue_delivery(app: AppHandle, state: &AppState, mut request: DeliveryR
             }
             let dir = PathBuf::from(&s.download_dir);
             let (primary, consumed_inputs, detected) = download_delivery_inputs(&app2, &s, &http, &job2, &request, parts, resume.as_ref(), &mut rx, 0, "base").await?;
+            if let Some(homebrew) = request.package.homebrew.clone() {
+                // Catalog rows carry their checksum; a mismatch never reaches the console.
+                if !request.package.expected_sha256.trim().is_empty() {
+                    if let Err(error) = verify_sha256(&primary, &request.package.expected_sha256).await {
+                        let _ = fs::remove_file(&primary).await;
+                        return Err(error);
+                    }
+                }
+                if homebrew.format == "folder" {
+                    let result = homebrew_folder(&app2, &s, &job2, &primary, &homebrew, &rx).await;
+                    if result.is_ok() {
+                        let _ = fs::remove_file(&primary).await;
+                    }
+                    return result;
+                }
+            }
             if detected == ArtifactKind::Pkg {
                 if job_store::pairing_before_packaging(&app2, &job2)?.is_some() {
                     return Err("The base download is a prebuilt package. A backport can only be combined with an extracted game folder.".into());
@@ -5680,6 +5920,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             payload_catalog::get_payload_catalog,
             payload_catalog::download_catalog_payload,
+            payload_catalog::add_homebrew_payload,
             payload_autostart::get_payload_autostart,
             payload_autostart::set_payload_autostart,
             payload_autostart::run_payload_autostart,

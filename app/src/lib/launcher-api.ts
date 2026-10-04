@@ -1,6 +1,7 @@
 import { invoke as nativeInvoke } from "@tauri-apps/api/core"
 import type { ConsoleKind } from "@/types"
 import type { PayloadEntry } from "./console-types"
+import type { HomebrewPackage } from "../types"
 
 export const launcherAvailable = (demo: boolean) => demo || (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window)
 function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -163,3 +164,5 @@ export async function getPayloadCatalog(refresh: boolean, demo: boolean): Promis
   } : invoke("get_payload_catalog", { refresh })
 }
 export async function downloadCatalogPayload(filename: string): Promise<PayloadEntry[]> { return invoke("download_catalog_payload", { filename }) }
+/** Imports a payload row of the homebrew source into Payloads (downloaded from GitHub, checksum verified). */
+export async function addHomebrewPayload(request: { url: string; name: string; version?: string; sha256?: string; homebrew: HomebrewPackage }): Promise<PayloadEntry[]> { return invoke("add_homebrew_payload", { request }) }
