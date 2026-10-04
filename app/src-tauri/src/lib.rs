@@ -829,6 +829,12 @@ fn title_id(s: &str) -> bool {
         && (ps4_title_id(s) || s.starts_with("PPSA"))
         && s.as_bytes()[4..].iter().all(u8::is_ascii_digit)
 }
+/// Any catalog ID shaped like a title ID; homebrew uses its own prefixes (SSHB, RMTC, BREW …).
+fn catalog_title_id(s: &str) -> bool {
+    s.len() == 9
+        && s.as_bytes()[..4].iter().all(u8::is_ascii_uppercase)
+        && s.as_bytes()[4..].iter().all(u8::is_ascii_digit)
+}
 
 // Legacy IDs identify PS2 classics packaged for PS4, using the same PKG transport.
 fn ps4_title_id(s: &str) -> bool {
@@ -2404,6 +2410,8 @@ mod console_target_tests {
         assert_eq!(validate_delivery_target(&request, false, false).unwrap(), "ps4");
         request.package.homebrew.as_mut().unwrap().format = "payload".into();
         assert!(validate_delivery_target(&request, false, false).unwrap_err().contains("Payloads"));
+        for id in ["SSHB00004", "RMTC00001", "BREW00179", "CUSA12345"] { assert!(catalog_title_id(id), "{id}"); }
+        for id in ["sshb00004", "SSHB0004", "SSHB000040", "SSH100004", "SSHB0000A"] { assert!(!catalog_title_id(id), "{id}"); }
         for good in ["PPSA99008", "ezremote-client", "Mednafen"] { assert!(homebrew_install_dir(good).is_ok()); }
         for bad in ["", ".hidden", "a/b", "a\\b", "..", &"x".repeat(65)] { assert!(homebrew_install_dir(bad).is_err(), "{bad}"); }
         assert_eq!(homebrew_archive_root("").unwrap(), PathBuf::new());
@@ -3143,7 +3151,7 @@ async fn resolve_packages(
     game_name: Option<String>,
     game_region: Option<String>,
 ) -> Result<Vec<Package>, String> {
-    if !title_id(&game_title_id) {
+    if !title_id(&game_title_id) && !catalog_title_id(&game_title_id) {
         return Err("Enter a valid PS4, PS5, or PS2 classic title ID (for example CUSA12345, PPSA12345, or SLUS12345)".into());
     }
     let cache_path = cache_root(&app)
