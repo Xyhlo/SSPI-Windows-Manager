@@ -1282,6 +1282,9 @@ body.booting .app > * { opacity: 0; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
 }
+/* Spinners report work in progress, so they keep turning (slowly) with reduced motion. */
+.reduce-motion .spinner { animation-duration: 1.4s !important; animation-iteration-count: infinite !important; }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 1.4s !important; animation-iteration-count: infinite !important; } }
 
 /* =====================================================================
    Themes (PS4): a PS4 screen mock beside the Look / Icons / Install tabs

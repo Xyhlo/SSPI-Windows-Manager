@@ -829,6 +829,10 @@ fn title_id(s: &str) -> bool {
         && (ps4_title_id(s) || s.starts_with("PPSA"))
         && s.as_bytes()[4..].iter().all(u8::is_ascii_digit)
 }
+/// Title IDs the PS5 receiver accepts for delivery names (payload/main.c is_tid).
+fn receiver_title_id(s: &str) -> bool {
+    title_id(s) && (s.starts_with("CUSA") || s.starts_with("PPSA"))
+}
 /// Any catalog ID shaped like a title ID; homebrew uses its own prefixes (SSHB, RMTC, BREW …).
 fn catalog_title_id(s: &str) -> bool {
     s.len() == 9
@@ -2411,6 +2415,8 @@ mod console_target_tests {
         request.package.homebrew.as_mut().unwrap().format = "payload".into();
         assert!(validate_delivery_target(&request, false, false).unwrap_err().contains("Payloads"));
         for id in ["SSHB00004", "RMTC00001", "BREW00179", "CUSA12345"] { assert!(catalog_title_id(id), "{id}"); }
+        assert!(receiver_title_id("CUSA12345") && receiver_title_id("PPSA12345"));
+        assert!(!receiver_title_id("SLUS01042") && !receiver_title_id("SSHB00004"));
         for id in ["sshb00004", "SSHB0004", "SSHB000040", "SSH100004", "SSHB0000A"] { assert!(!catalog_title_id(id), "{id}"); }
         for good in ["PPSA99008", "ezremote-client", "Mednafen"] { assert!(homebrew_install_dir(good).is_ok()); }
         for bad in ["", ".hidden", "a/b", "a\\b", "..", &"x".repeat(65)] { assert!(homebrew_install_dir(bad).is_err(), "{bad}"); }
@@ -4245,7 +4251,8 @@ mod image_delivery_tests {
 }
 
 async fn set_receiver_title(app: &AppHandle, endpoint: &ReceiverEndpoint, job: &str, title: Option<&str>, require_fih: bool) -> Result<(), String> {
-    let Some(id) = title.filter(|id| title_id(id)) else { return Ok(()); };
+    // The PS5 receiver names deliveries by CUSA/PPSA only; other IDs (PS1/PS2 classics) skip the label.
+    let Some(id) = title.filter(|id| receiver_title_id(id)) else { return Ok(()); };
     let mut socket = connect_receiver(endpoint, "receiver capabilities").await?;
     let (_, body) = frame(&mut socket, 0x53, &[]).await?;
     let config: Value = serde_json::from_slice(&body).map_err(redact)?;
@@ -4719,7 +4726,9 @@ async fn upload(
     let _delivery = console_delivery_slot(app, job, tx).await?;
     test_ps5(endpoint.host.clone(), endpoint.port).await?;
     let (header, _, _) = file_header(path).await?;
-    set_receiver_title(app, endpoint, job, title, header.starts_with(&[0x7f,b'F',b'I',b'H'])).await?;
+    // A PKG installs under the title ID inside it; catalogs list PS1/PS2 classics by their disc IDs.
+    let packaged = if header.starts_with(&[0x7f, b'C', b'N', b'T']) { pkg_meta::read(path).ok().map(|meta| meta.title_id) } else { None };
+    set_receiver_title(app, endpoint, job, packaged.as_deref().or(title), header.starts_with(&[0x7f,b'F',b'I',b'H'])).await?;
     let n = fs::metadata(path).await.map_err(redact)?.len();
     let total = set_total.max(set_offset + n).max(1);
     let done = set_offset + n;

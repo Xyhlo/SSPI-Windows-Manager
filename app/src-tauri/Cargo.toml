@@ -1,6 +1,6 @@
 [package]
 name = "game-search"
-version = "2.25.1"
+version = "2.25.2"
 edition = "2021"
 
 [lib]

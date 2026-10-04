@@ -46,6 +46,10 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onOpen
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState("")
   const [busy, setBusy] = useState("")
+  // The Start button shows a check for a moment after a successful send instead of a toast.
+  const [started, setStarted] = useState("")
+  const startedTimer = useRef<number>()
+  useEffect(() => () => window.clearTimeout(startedTimer.current), [])
   const [selected, setSelected] = useState("")
   const [editing, setEditing] = useState("")
   const [removing, setRemoving] = useState("")
@@ -126,12 +130,15 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onOpen
   const send = async (entry: PayloadEntry) => {
     if (!endpoint.host || busy) return
     setBusy(entry.id)
+    setStarted("")
     try {
       const result = await sendPayload({ id: entry.id, target, host: endpoint.host, port: endpoint.port, demo })
       setPayloads(old => old.map(item => item.id === entry.id ? { ...item, lastSentAt: Date.now(), lastResult: result.message } : item))
       setHistory(old => [{ id: `${entry.id}-${Date.now()}`, name: entry.name, at: Date.now(), result: result.message, ok: true, totalMs: result.totalMs, bytesPerSecond: result.bytesPerSecond }, ...old].slice(0, 20))
       setTraces(old => ({ ...old, [entry.id]: { ...result, at: Date.now() } }))
-      toast({ tone: "success", title: entry.builtin && result.verified ? `${name} receiver is running` : `${entry.name} sent`, text: result.message })
+      window.clearTimeout(startedTimer.current)
+      setStarted(entry.id)
+      startedTimer.current = window.setTimeout(() => setStarted(""), 2500)
       if (entry.builtin && result.verified) onReceiverLoaded(target)
     } catch (reason) {
       const message = errorText(reason)
@@ -227,7 +234,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onOpen
                   </span>
                 )}
                 <button type="button" className={`btn sm ${isCurrent ? "primary" : ""} pl-send`} disabled={!endpoint.host || !!busy} onClick={event => { event.stopPropagation(); setSelected(entry.id); void send(entry) }}>
-                  {busy === entry.id ? <span className="spinner" /> : <Icon name="play" />}{busy === entry.id ? "Starting" : "Start"}
+                  {busy === entry.id ? <><span className="spinner" />Starting</> : started === entry.id ? <><Icon name="check" />Started</> : <><Icon name="play" />Start</>}
                 </button>
               </div>
               <Collapse open={editing === entry.id} className="pl-drawer">
