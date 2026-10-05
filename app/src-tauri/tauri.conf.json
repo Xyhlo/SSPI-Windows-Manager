@@ -1,6 +1,6 @@
 {
   "productName": "SSPI",
-  "version": "2.25.3",
+  "version": "2.25.4",
   "identifier": "com.simpleps5installer.gamesearch",
   "build": {
     "beforeDevCommand": "npm run dev",

@@ -1097,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "game-search"
-version = "2.25.3"
+version = "2.25.4"
 dependencies = [
  "aes",
  "base64 0.22.1",
