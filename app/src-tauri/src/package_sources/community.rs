@@ -17,6 +17,7 @@ use tauri::AppHandle;
 use url::Url;
 
 const API: &str = "https://amptis.com/SSPI/sources/api/";
+const TRUSTED_HOSTS: &[&str] = &["amptis.com", "www.amptis.com"];
 // Public application identifier and envelope seed; neither is a user credential.
 const APP_IDENTIFIER: &str = "SSPI-community-v1";
 const ENVELOPE_SEED: &str = "SSPI community source envelope v1 · shared directory";
@@ -193,7 +194,7 @@ fn parse_page(bytes: &[u8]) -> Result<(Vec<CommunityEntry>, String, usize), Stri
 
 fn allowed_redirect(url: &Url) -> bool {
     url.scheme() == "https"
-        && url.host_str() == Some("amptis.com")
+        && url.host_str().is_some_and(|host| TRUSTED_HOSTS.contains(&host))
         && url.port_or_known_default() == Some(443)
         && url.username().is_empty()
         && url.password().is_none()
@@ -204,13 +205,7 @@ fn client() -> Result<Client, String> {
         .https_only(true)
         .user_agent("GameSearch/0.1")
         .connect_timeout(Duration::from_secs(10))
-        .redirect(redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 4 || !allowed_redirect(attempt.url()) {
-                attempt.error("Community directory redirect refused")
-            } else {
-                attempt.follow()
-            }
-        }))
+        .redirect(redirect::Policy::none())
         .build()
         .map_err(|_| "Could not initialize the community directory connection".into())
 }
@@ -221,10 +216,19 @@ async fn request(
     maximum: usize,
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
-    let mut response = client
-        .get(format!("{API}{path}"))
+    let started = Instant::now();
+    let mut url = Url::parse(&format!("{API}{path}")).map_err(|_| "Invalid community URL")?;
+    let mut redirects = 0;
+    let mut response = loop {
+        if !allowed_redirect(&url) || redirects > 4 { return Err("Community directory redirect refused".into()); }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() { return Err("Community directory timed out. Try again.".into()); }
+        // Reqwest strips authorization when a hostname changes. Reattach this public
+        // application identifier only after validating each trusted-origin hop.
+        let response = client
+        .get(url.clone())
         .bearer_auth(APP_IDENTIFIER)
-        .timeout(timeout)
+        .timeout(remaining)
         .send()
         .await
         .map_err(|error| {
@@ -234,6 +238,12 @@ async fn request(
                 "Could not connect to the community directory. Check the connection and try again."
             }
         })?;
+        if response.status().is_redirection() {
+            let location = response.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok()).ok_or("Invalid community directory redirect")?;
+            url = url.join(location).map_err(|_| "Invalid community directory redirect")?;
+            redirects += 1;
+        } else { break response; }
+    };
     if !response.status().is_success() {
         return Err(format!(
             "Community directory returned HTTP {}. Try refreshing the list.",
@@ -513,6 +523,7 @@ mod tests {
         .is_err());
         assert!(parse_page(&vec![b' '; MAX_PAGE_BYTES + 1]).is_err());
         assert!(allowed_redirect(&Url::parse(API).unwrap()));
+        assert!(allowed_redirect(&Url::parse("https://www.amptis.com/SSPI/sources/api/").unwrap()));
         for bad in [
             "http://amptis.com/SSPI/sources/api/",
             "https://other.invalid/",

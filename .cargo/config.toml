@@ -3,4 +3,4 @@ target-dir = "../Build-Output/Windows Manager/cargo"
 
 [target.x86_64-pc-windows-msvc]
 # Native C++ dependencies (including UnRAR) must use the same static CRT as Rust.
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "--remap-path-prefix=.=sspi"]

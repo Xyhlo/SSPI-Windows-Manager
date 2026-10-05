@@ -188,7 +188,7 @@ async fn probe(http: &Client, cancel: &watch::Receiver<bool>, url: &str, size_hi
     let content_type = header(&response, reqwest::header::CONTENT_TYPE).unwrap_or_default();
     let filename = header(&response, reqwest::header::CONTENT_DISPOSITION).as_deref().and_then(disposition_filename);
     let ranged = (status == reqwest::StatusCode::PARTIAL_CONTENT).then(|| header(&response, reqwest::header::CONTENT_RANGE).as_deref().and_then(content_range_total)).flatten().filter(|total| *total > 0);
-    let total = ranged.unwrap_or_else(|| if status == reqwest::StatusCode::OK { response.content_length().unwrap_or(0).max(size_hint) } else { size_hint });
+    let total = ranged.unwrap_or_else(|| if status == reqwest::StatusCode::OK { response.content_length().unwrap_or(size_hint) } else { size_hint });
     Ok(Probe { ranged: ranged.is_some(), total, response, content_type, filename })
 }
 
@@ -203,7 +203,8 @@ async fn download(host: &dyn Host, http: &Client, cancel: &watch::Receiver<bool>
         send(http.get(url), cancel, Duration::from_secs(45)).await?
     } else { probe.response };
     if !response.status().is_success() { return Err(format!("Download failed: HTTP {}", response.status())); }
-    single_stream(host, cancel, response, part, probe.total).await
+    let total = response.content_length().unwrap_or(probe.total);
+    single_stream(host, cancel, response, part, total).await
 }
 
 /// Bytes already on disk for `part`: complete pieces from its map, or an earlier version's partial file.

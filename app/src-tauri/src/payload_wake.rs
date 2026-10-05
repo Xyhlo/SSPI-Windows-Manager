@@ -22,9 +22,13 @@ fn parse(bytes: &[u8], version: &str) -> Option<Power> {
     matched.then(|| Power { id: id.to_ascii_lowercase(), standby })
 }
 
+fn validate_ddp_endpoint(host: &str, port: u16) -> Result<(), &'static str> {
+    if host.trim().is_empty() || !matches!(port, 987 | 9302) { Err("Invalid discovery endpoint") } else { Ok(()) }
+}
+
 pub(super) async fn observe(target: &str, host: &str) -> Option<Power> {
     let (port, version) = if target == "ps4" { (987, "00020020") } else { (9302, "00030010") };
-    crate::validate_receiver_candidate(host, port).ok()?;
+    validate_ddp_endpoint(host, port).ok()?;
     tokio::time::timeout(Duration::from_secs(2), async {
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
         socket.connect((host, port)).await.ok()?;
@@ -56,6 +60,14 @@ impl Watch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn win_c_discovery_ports_are_independent_of_receiver_ports() {
+        assert!(validate_ddp_endpoint("console", 987).is_ok());
+        assert!(validate_ddp_endpoint("console", 9302).is_ok());
+        assert!(validate_ddp_endpoint("", 987).is_err());
+        assert!(validate_ddp_endpoint("console", 9114).is_err());
+        assert!(crate::validate_receiver_candidate("console", 987).is_err());
+    }
     fn power(id: &str, standby: bool) -> Option<Power> { Some(Power { id: id.into(), standby }) }
     #[test]
     fn startup_reconnect_and_other_devices_do_not_trigger_a_wake() {

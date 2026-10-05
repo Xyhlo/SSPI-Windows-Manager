@@ -17,6 +17,7 @@
 !/app/src-tauri/src/fpkg.rs
 !/app/src-tauri/src/fpkg_doctor.rs
 !/app/src-tauri/src/ampr_index.rs
+!/app/src-tauri/src/ampr_pack.rs
 !/app/src-tauri/src/job_store.rs
 !/app/src-tauri/src/rar_control.rs
 !/app/src-tauri/src/scheduler.rs

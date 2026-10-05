@@ -739,33 +739,31 @@ pub fn package_magic(header: &[u8]) -> bool {
     header.starts_with(&[0x7f,b'C',b'N',b'T']) || header.starts_with(&[0x7f,b'F',b'I',b'H'])
 }
 
-/// Locate the packaging engine. Order:
-///   1. explicit path in Settings
-///   2. SSPI_FPKG_ENGINE environment variable
-///   3. `resources/fpkg/fpkg-cli.exe` next to the application
-///   4. PATH lookup of `fpkg-cli`
-pub fn locate_engine(explicit: Option<&str>) -> Option<PathBuf> {
-    if let Some(value) = explicit.filter(|v| !v.trim().is_empty()) {
-        let path = PathBuf::from(value);
-        if path.is_file() {
-            return Some(path);
+fn bundled_engine() -> Option<PathBuf> {
+    let path = std::env::current_exe().ok()?.parent()?.join("resources/fpkg/fpkg-cli.exe");
+    path.is_file().then_some(path)
+}
+pub fn validate_engine_setting(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() { return Ok(String::new()); }
+    #[cfg(debug_assertions)] { return Ok(value.to_owned()); }
+    #[cfg(not(debug_assertions))] {
+        let selected = std::fs::canonicalize(value).map_err(|_| "Only the bundled FPKG engine is supported")?;
+        if bundled_engine().and_then(|p| p.canonicalize().ok()).as_ref() != Some(&selected) { return Err("Only the bundled FPKG engine is supported".into()); }
+        Ok(String::new())
+    }
+}
+/// Release builds execute only the bundled engine; debug builds permit explicit overrides.
+pub fn locate_engine(_explicit: Option<&str>) -> Option<PathBuf> {
+    #[cfg(debug_assertions)] {
+        if let Some(value) = _explicit.filter(|v| !v.trim().is_empty()) {
+            let path = PathBuf::from(value); return path.is_file().then_some(path);
+        }
+        if let Ok(value) = std::env::var("SSPI_FPKG_ENGINE") {
+            let path = PathBuf::from(value); return path.is_file().then_some(path);
         }
     }
-    if let Ok(value) = std::env::var("SSPI_FPKG_ENGINE") {
-        let path = PathBuf::from(value);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("resources").join("fpkg").join("fpkg-cli.exe");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    which("fpkg-cli")
+    bundled_engine()
 }
 
 /// The .NET runtime shipped beside the application in `resources/dotnet`, when it is complete.

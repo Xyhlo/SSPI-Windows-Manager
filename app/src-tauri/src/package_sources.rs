@@ -235,32 +235,13 @@ fn registry_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn load_registry(app: &AppHandle) -> Result<Registry, String> {
-    let path = registry_path(app)?;
-    if !path.is_file() {
-        return Ok(Registry::default());
-    }
-    serde_json::from_slice(&fs::read(path).map_err(|error| error.to_string())?)
-        .map_err(|error| format!("Package Source registry is invalid: {error}"))
+    let (registry, warning) = crate::read_json_backup(&registry_path(app)?)?;
+    if let Some(warning) = warning { eprintln!("Package Source registry: {warning}"); }
+    Ok(registry.unwrap_or_default())
 }
 
 fn save_registry(app: &AppHandle, registry: &Registry) -> Result<(), String> {
-    let path = registry_path(app)?;
-    let parent = path
-        .parent()
-        .ok_or("Package Source registry has no parent")?;
-    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let next = parent.join("registry.json.next");
-    fs::write(
-        &next,
-        serde_json::to_vec_pretty(registry).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    if path.exists() {
-        let backup = parent.join("registry.json.bak");
-        let _ = fs::copy(&path, backup);
-        fs::remove_file(&path).map_err(|error| error.to_string())?;
-    }
-    fs::rename(next, path).map_err(|error| error.to_string())
+    crate::write_json_backup(&registry_path(app)?, &serde_json::to_vec_pretty(registry).map_err(|error| error.to_string())?)
 }
 
 fn source_dir(app: &AppHandle, id: &str, version: &str) -> Result<PathBuf, String> {
@@ -268,7 +249,7 @@ fn source_dir(app: &AppHandle, id: &str, version: &str) -> Result<PathBuf, Strin
 }
 
 fn id_value(value: &str, max: usize) -> bool {
-    !value.is_empty()
+    value.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
         && value.len() <= max
         && value
             .bytes()
@@ -624,12 +605,14 @@ fn validate_archive(bytes: Vec<u8>) -> Result<(String, Descriptor, HashMap<Strin
         }
         expanded += entry.size();
         if expanded > MAX_EXPANDED {
-            return Err("Package Source expanded size exceeds 16 MiB".into());
+            return Err("Package Source expanded size exceeds 64 MiB".into());
         }
         let mut content = Vec::with_capacity(entry.size() as usize);
-        entry
+        let declared = entry.size();
+        (&mut entry).take(declared + 1)
             .read_to_end(&mut content)
             .map_err(|error| error.to_string())?;
+        if content.len() as u64 != declared { return Err(format!("Package Source entry size mismatch: {name}")); }
         if executable_magic(&content) {
             return Err(format!("Executable content is forbidden: {name}"));
         }
@@ -800,12 +783,16 @@ pub fn remove(app: &AppHandle, id: &str) -> Result<Vec<SourceSummary>, String> {
     if !registry.sources.iter().any(|item| item.id == id) {
         return Err("Package Source is not installed".into());
     }
-    registry.sources.retain(|item| item.id != id);
-    save_registry(app, &registry)?;
-    let owned = source_root(app)?.join("installed").join(id);
+    let installed = source_root(app)?.join("installed");
+    let owned = installed.join(id);
     if owned.is_dir() {
+        let root = fs::canonicalize(&installed).map_err(|error| error.to_string())?;
+        let canonical = fs::canonicalize(&owned).map_err(|error| error.to_string())?;
+        if canonical == root || !canonical.starts_with(&root) { return Err("Package Source removal escapes installed directory".into()); }
         fs::remove_dir_all(owned).map_err(|error| error.to_string())?;
     }
+    registry.sources.retain(|item| item.id != id);
+    save_registry(app, &registry)?;
     Ok(registry.sources.iter().map(summary).collect())
 }
 
@@ -3277,6 +3264,11 @@ pub fn has_enabled(app: &AppHandle) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn win_c_source_ids_require_an_alphanumeric_start() {
+        for bad in ["..", ".", "../x", ".hidden", "-name", "_name", "+name", ""] { assert!(!id_value(bad, 128), "{bad}"); }
+        for good in ["org.sspi.homebrew", "a", "3rd-party+1"] { assert!(id_value(good, 128), "{good}"); }
+    }
 
     #[test]
     fn github_api_assets_download_from_the_release_url() {

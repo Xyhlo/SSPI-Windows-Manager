@@ -241,7 +241,7 @@ fn record(generation: u64, peer: SocketAddr, method: &str, path: &str, code: u16
 }
 
 fn dns_question(query: &[u8]) -> Option<(String, u16, usize)> {
-    if query.len() < 12 || query.len() > 512 || query[2] & 0x80 != 0 || query[4..6] != [0, 1] { return None; }
+    if query.len() < 12 || query.len() > 4096 || query[2] & 0x80 != 0 || query[4..6] != [0, 1] { return None; }
     let mut cursor = 12; let mut labels = Vec::new();
     loop {
         let length = *query.get(cursor)? as usize; cursor += 1;
@@ -274,8 +274,34 @@ fn record_dns_status(status: &mut WebStatus, peer: SocketAddr, name: &str, kind:
     if status.phase == "ready" { status.phase = "dns".into(); status.message = "DNS traffic received. Open User's Guide on the console to reach SSPI.".into(); }
     if !repeated { log(status, format!("{client} DNS {name} ({kind}) → {}", if name == DNS_NAME { "SSPI host" } else { "blocked" })); }
 }
+#[cfg(windows)]
+fn disable_udp_connreset(socket: &UdpSocket) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn WSAIoctl(socket: usize, code: u32, input: *const std::ffi::c_void, input_len: u32,
+            output: *mut std::ffi::c_void, output_len: u32, returned: *mut u32,
+            overlapped: *mut std::ffi::c_void, completion: *mut std::ffi::c_void) -> i32;
+        fn WSAGetLastError() -> i32;
+    }
+    let disabled = 0u32; let mut returned = 0u32;
+    unsafe {
+        if WSAIoctl(socket.as_raw_socket() as usize, 0x9800000c, &disabled as *const _ as _, 4,
+            std::ptr::null_mut(), 0, &mut returned, std::ptr::null_mut(), std::ptr::null_mut()) != 0 {
+            return Err(std::io::Error::from_raw_os_error(WSAGetLastError()));
+        }
+    }
+    Ok(())
+}
+fn connection_error(generation: u64, message: String) {
+    eprintln!("{message}");
+    let mut svc = service().lock().unwrap_or_else(|p| p.into_inner());
+    if svc.generation == generation { log(&mut svc.status, message); }
+}
 async fn dns_loop(socket: UdpSocket, ip: Ipv4Addr, mut stop: watch::Receiver<bool>, generation: u64) {
-    let mut buffer = [0u8; 512];
+    #[cfg(windows)]
+    if let Err(error) = disable_udp_connreset(&socket) { eprintln!("DNS UDP reset reporting: {error}"); }
+    let mut buffer = [0u8; 4096];
     loop {
         tokio::select! {
             _ = stop.changed() => break,
@@ -288,7 +314,7 @@ async fn dns_loop(socket: UdpSocket, ip: Ipv4Addr, mut stop: watch::Receiver<boo
                         }
                     }
                 },
-                Err(error) => { server_failed(generation, format!("DNS host stopped: {error}")); break; }
+                Err(error) => { connection_error(generation, format!("DNS receive failed: {error}")); tokio::time::sleep(Duration::from_millis(100)).await; }
             }
         }
     }
@@ -317,7 +343,7 @@ async fn http_loop(listener: TcpListener, tls: Option<TlsAcceptor>, assets: Arc<
                         }).await;
                     });
                 }
-                Err(error) => { server_failed(generation, format!("Web host stopped: {error}")); break; }
+                Err(error) => { connection_error(generation, format!("Web connection failed: {error}")); tokio::time::sleep(Duration::from_millis(100)).await; }
             }
         }
     }

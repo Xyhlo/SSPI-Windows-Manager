@@ -781,11 +781,81 @@ fn write_cache_json<T: Serialize>(path: &Path, payload: &T) -> Result<(), String
     std::fs::write(path, serde_json::to_vec(&body).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())
 }
+fn read_json_backup<T: serde::de::DeserializeOwned>(path: &Path) -> Result<(Option<T>, Option<String>), String> {
+    let primary = std::fs::read(path);
+    match &primary {
+        Ok(bytes) => if let Ok(value) = serde_json::from_slice(bytes) { return Ok((Some(value), None)); },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !path.with_extension("json.bak").exists() => return Ok((None, None)),
+        _ => {}
+    }
+    let backup = path.with_extension("json.bak");
+    if let Ok(bytes) = std::fs::read(&backup) {
+        if let Ok(value) = serde_json::from_slice(&bytes) {
+            return Ok((Some(value), Some(format!("{} could not be read; its backup was restored.", path.file_name().unwrap_or_default().to_string_lossy()))));
+        }
+    }
+    // Both settings and the source registry use this reader during startup.
+    // Preserve damaged files and let each caller use its existing default value.
+    let stamp = now_secs();
+    let mut details = Vec::new();
+    for damaged in [path.to_path_buf(), backup] {
+        match std::fs::symlink_metadata(&damaged) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                details.push(format!("Could not inspect {}; it was left in place: {error}", damaged.display()));
+                continue;
+            }
+            Ok(_) => {}
+        }
+        let name = damaged.file_name().unwrap_or_default().to_string_lossy();
+        let mut kept = damaged.with_file_name(format!("{name}.corrupt-{stamp}"));
+        if kept.exists() {
+            kept = damaged.with_file_name(format!("{name}.corrupt-{stamp}-{}", Uuid::new_v4()));
+        }
+        match std::fs::rename(&damaged, &kept) {
+            Ok(()) => details.push(format!("Damaged copy kept as {}", kept.display())),
+            Err(error) => details.push(format!("Could not rename {}; the original was left in place: {error}", damaged.display())),
+        }
+    }
+    let subject = if path.file_name().is_some_and(|name| name == CONFIG_NAME) { "Settings were" } else { "The source registry was" };
+    Ok((None, Some(format!("{subject} reset to defaults because the saved file could not be read or parsed and no valid backup was available.\n{}", details.join("\n")))))
+}
+fn write_json_backup(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    static WRITES: Mutex<()> = Mutex::new(());
+    let _guard = WRITES.lock().map_err(|_| "Persistence lock unavailable")?;
+    let parent = path.parent().ok_or("Missing configuration directory")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let temp = parent.join(format!(".{}.tmp", Uuid::new_v4()));
+    let backup_temp = parent.join(format!(".{}.bak.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp).map_err(|e| e.to_string())?;
+        file.write_all(bytes).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?; drop(file);
+        if let Ok(previous) = std::fs::read(path) {
+            // Never replace a valid recovery copy with a damaged primary file.
+            if serde_json::from_slice::<Value>(&previous).is_ok() {
+                let mut backup = std::fs::OpenOptions::new().write(true).create_new(true).open(&backup_temp).map_err(|e| e.to_string())?;
+                backup.write_all(&previous).and_then(|_| backup.sync_all()).map_err(|e| e.to_string())?; drop(backup);
+                std::fs::rename(&backup_temp, path.with_extension("json.bak")).map_err(|e| e.to_string())?;
+            }
+        }
+        std::fs::rename(&temp, path).map_err(|e| e.to_string())
+    })();
+    let _ = std::fs::remove_file(&temp); let _ = std::fs::remove_file(&backup_temp);
+    result
+}
+fn startup_message(message: &str) {
+    eprintln!("{message}");
+    #[cfg(windows)] {
+        #[link(name = "user32")]
+        extern "system" { fn MessageBoxW(window: *mut std::ffi::c_void, text: *const u16, caption: *const u16, flags: u32) -> i32; }
+        let text: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+        let title: Vec<u16> = "SSPI settings".encode_utf16().chain(Some(0)).collect();
+        unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), 0x30); }
+    }
+}
 fn write_settings(app: &AppHandle, s: &Settings) -> Result<(), String> {
-    let p = config_path(app)?;
-    std::fs::create_dir_all(p.parent().ok_or("config parent")?).map_err(|e| e.to_string())?;
-    std::fs::write(p, serde_json::to_vec_pretty(s).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    write_json_backup(&config_path(app)?, &serde_json::to_vec_pretty(s).map_err(|e| e.to_string())?)
 }
 fn secret(name: &str) -> Result<Entry, String> {
     Entry::new(SECRET_SERVICE, name).map_err(|e| e.to_string())
@@ -795,7 +865,9 @@ fn redact(error: impl ToString) -> String {
 }
 fn redact_delivery_error(error: impl ToString, target: &str) -> String {
     let s = error.to_string();
-    let s = s.replace("Bearer ", "Bearer [redacted]");
+    static BEARER: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let s = BEARER.get_or_init(|| Regex::new(r#"(?i)\bBearer[\t ]+[^\s\"'<>;,]+"#).unwrap())
+        .replace_all(&s, "Bearer [redacted]").into_owned();
     if target == "ps5" && (s.to_ascii_lowercase().contains("early eof")
         || s.contains("UnexpectedEof")
         || s.contains("connection reset"))
@@ -2340,7 +2412,7 @@ mod console_target_tests {
         for cause in ["early eof", "UnexpectedEof", "connection reset"] {
             let error = format!("FTP: {cause}; Bearer test-token");
             let ps4 = redact_delivery_error(&error, "ps4");
-            assert_eq!(ps4, error.replace("Bearer ", "Bearer [redacted]"));
+            assert_eq!(ps4, error.replace("Bearer test-token", "Bearer [redacted]"));
             assert!(!ps4.contains("PS5")); assert!(!ps4.contains("ELF"));
             let ps5 = redact_delivery_error(&error, "ps5");
             assert_eq!(ps5, format!("PS5 closed the socket (receiver timed out or died). Reload the ELF and retry. [{ps4}]"));
@@ -2553,7 +2625,7 @@ fn save_settings(
             3 => 3,
             _ => 2,
         },
-        fpkg_engine_path: input.fpkg_engine_path.unwrap_or_default().trim().to_string(),
+        fpkg_engine_path: fpkg::validate_engine_setting(input.fpkg_engine_path.as_deref().unwrap_or(""))?,
         target_fw: input.target_fw.unwrap_or_default().trim().to_string(),
         fpkg_cleanup_source: input.fpkg_cleanup_source.unwrap_or(false),
         package_format: input.package_format.unwrap_or_else(|| s.package_format.clone()),
@@ -3092,59 +3164,82 @@ fn trim_covers(dir: &Path) {
     }
 }
 
-#[tauri::command]
-async fn fetch_cover(app: AppHandle, state: State<'_, AppState>, url: String) -> Result<String, String> {    if !valid_http(&url) {
-        return Err("Cover URL is invalid".into());
+fn public_cover_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !ip.is_private() && !ip.is_loopback() && !ip.is_link_local() && !ip.is_broadcast()
+                && !ip.is_documentation() && !ip.is_multicast() && octets[0] != 0 && octets[0] < 240
+                && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
+                && !(octets[0] == 198 && (18..=19).contains(&octets[1]))
+        }
+        std::net::IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped() { return public_cover_ip(v4.into()); }
+            // Public unicast, excluding documentation and transition ranges.
+            let segments = ip.segments();
+            segments[0] & 0xe000 == 0x2000 && segments[0] != 0x2002
+                && !(segments[0] == 0x2001 && (segments[1] == 0 || segments[1] == 0xdb8))
+        }
     }
+}
+fn cover_image(mime: &str, bytes: &[u8]) -> bool {
+    mime.starts_with("image/") && image::guess_format(bytes).is_ok()
+}
+async fn cover_response(raw: &str) -> Result<reqwest::Response, String> {
+    let mut url = Url::parse(raw).map_err(|_| "Cover URL is invalid")?;
+    for _ in 0..5 {
+        if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() { return Err("Cover URL is invalid".into()); }
+        let host = match url.host().ok_or("Cover URL has no host")? {
+            url::Host::Domain(host) => host.to_owned(),
+            url::Host::Ipv4(ip) => ip.to_string(),
+            url::Host::Ipv6(ip) => ip.to_string(),
+        };
+        let addresses: Vec<_> = tokio::time::timeout(Duration::from_secs(10), tokio::net::lookup_host((host.as_str(), url.port_or_known_default().ok_or("Invalid cover port")?)))
+            .await.map_err(|_| "Cover host lookup timed out")?.map_err(|_| "Cover host lookup failed")?.collect();
+        if addresses.is_empty() || addresses.iter().any(|address| !public_cover_ip(address.ip())) { return Err("Cover URLs cannot use private or loopback hosts".into()); }
+        // Pin the checked addresses for this request and revalidate every redirect.
+        let client = Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&host, &addresses).timeout(Duration::from_secs(30)).build().map_err(redact)?;
+        let response = client.get(url.clone()).send().await.map_err(|_| network_error("Cover request"))?;
+        if response.status().is_redirection() {
+            let location = response.headers().get(reqwest::header::LOCATION).and_then(|value| value.to_str().ok()).ok_or("Invalid cover redirect")?;
+            url = url.join(location).map_err(|_| "Invalid cover redirect")?;
+            continue;
+        }
+        return Ok(response);
+    }
+    Err("Too many cover redirects".into())
+}
+#[tauri::command]
+async fn fetch_cover(app: AppHandle, _state: State<'_, AppState>, url: String) -> Result<String, String> {
+    if !valid_http(&url) { return Err("Cover URL is invalid".into()); }
     let hash = sha256_hex(url.as_bytes());
     let cover_dir = cache_root(&app).map(|root| root.join("covers"));
     if let Ok(dir) = &cover_dir {
-        let meta = dir.join(format!("{hash}.json"));
-        let bin = dir.join(format!("{hash}.bin"));
-        if let (Ok(meta), Ok(bytes)) = (std::fs::read(&meta), std::fs::read(&bin)) {
+        if let (Ok(meta), Ok(bytes)) = (std::fs::read(dir.join(format!("{hash}.json"))), std::fs::read(dir.join(format!("{hash}.bin")))) {
             if let Ok(value) = serde_json::from_slice::<Value>(&meta) {
                 if let Some(mime) = value.get("mime").and_then(Value::as_str) {
-                    if !bytes.is_empty() && bytes.len() as u64 <= MAX_COVER_BYTES {
-                        return Ok(format!("data:{mime};base64,{}", BASE64.encode(bytes)));
-                    }
+                    if bytes.len() as u64 <= MAX_COVER_BYTES && cover_image(mime, &bytes) { return Ok(format!("data:{mime};base64,{}", BASE64.encode(bytes))); }
                 }
             }
         }
     }
-    let response = state
-        .http
-        .get(&url)
-        .send()
-        .await
-        .map_err(|_| network_error("Cover request"))?;
-    if !response.status().is_success() {
-        return Err(format!("Cover service returned HTTP {}", response.status()));
+    let mut response = cover_response(&url).await?;
+    if !response.status().is_success() { return Err(format!("Cover service returned HTTP {}", response.status())); }
+    if response.content_length().unwrap_or(0) > MAX_COVER_BYTES { return Err("Cover image is larger than 10 MiB".into()); }
+    let mime = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next()).map(str::trim).filter(|value| value.starts_with("image/"))
+        .ok_or("Cover response is not an image")?.to_owned();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| network_error("Cover response"))? {
+        if (bytes.len() + chunk.len()) as u64 > MAX_COVER_BYTES { return Err("Cover image is larger than 10 MiB".into()); }
+        bytes.extend_from_slice(&chunk);
     }
-    if response.content_length().unwrap_or(0) > MAX_COVER_BYTES {
-        return Err("Cover image is larger than 10 MiB".into());
-    }
-    let mime = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .filter(|value| value.starts_with("image/"))
-        .unwrap_or("image/webp")
-        .to_owned();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| network_error("Cover response"))?;
-    if bytes.len() as u64 > MAX_COVER_BYTES {
-        return Err("Cover image is larger than 10 MiB".into());
-    }
+    if !cover_image(&mime, &bytes) { return Err("Cover response has invalid image magic".into()); }
     if let Ok(dir) = &cover_dir {
         let _ = std::fs::create_dir_all(dir);
         let _ = std::fs::write(dir.join(format!("{hash}.bin")), &bytes);
-        let _ = std::fs::write(
-            dir.join(format!("{hash}.json")),
-            serde_json::to_vec(&json!({"mime": mime, "url": url})).unwrap_or_default(),
-        );
+        let _ = std::fs::write(dir.join(format!("{hash}.json")), serde_json::to_vec(&json!({"mime": mime, "url": url})).unwrap_or_default());
         trim_covers(dir);
     }
     Ok(format!("data:{mime};base64,{}", BASE64.encode(bytes)))
@@ -5553,7 +5648,7 @@ fn system_drive_prefix() -> Option<String> {
         })
 }
 #[tauri::command]
-async fn scan_local_packages(path: String) -> Result<Vec<LocalPackage>, String> {
+async fn scan_local_packages(app: AppHandle, path: String) -> Result<Vec<LocalPackage>, String> {
     let supplied = PathBuf::from(&path);
     if supplied.is_file() {
         let (b, n, _size) = file_header(&supplied).await?;
@@ -5562,11 +5657,13 @@ async fn scan_local_packages(path: String) -> Result<Vec<LocalPackage>, String> 
             || b[..n].starts_with(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C])
         {
             let source = supplied.clone();
-            let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../Build-Output/Windows Manager/local-import-cache");
+            let cache = app.path().app_cache_dir().map_err(redact)?
+                .join("local-import-cache").join(Uuid::new_v4().to_string());
             let kind = artifact_kind(&b[..n], &source.display().to_string(), "");
             let extracted = tokio::task::spawn_blocking(move || {
-                extract_any_archive(&source, &cache, kind, |_, _, _| {})
+                let result = extract_any_archive(&source, &cache, kind, |_, _, _| {});
+                if result.is_err() { let _ = std::fs::remove_dir_all(&cache); }
+                result
             })
             .await
             .map_err(redact)??;
@@ -5883,7 +5980,67 @@ pub fn child_process() -> Option<i32> {
     (std::env::args().nth(1).as_deref() == Some(rar_control::CHILD_FLAG)).then(rar_control::child_main)
 }
 
+// Scans return paths used later by the selection UI. Keep resumable jobs' inputs;
+// remove unused/completed imports at startup and after the UI has closed.
+fn cleanup_local_imports(app: &AppHandle, store: &job_store::Store) {
+    fn references(value: &Value, path: &Path) -> bool {
+        match value {
+            Value::String(s) => Path::new(s).starts_with(path),
+            Value::Array(a) => a.iter().any(|v| references(v, path)),
+            Value::Object(o) => o.values().any(|v| references(v, path)),
+            _ => false,
+        }
+    }
+    let Ok(base) = app.path().app_cache_dir() else { return; };
+    let root = base.join("local-import-cache");
+    let Ok(entries) = std::fs::read_dir(&root) else { return; };
+    let retained: Vec<Value> = store.records.values()
+        .filter(|r| !r.progress.removed && !matches!(r.progress.stage.as_str(), "complete" | "delivered"))
+        .filter_map(|r| serde_json::to_value(r).ok()).collect();
+    for entry in entries.flatten() {
+        if Uuid::parse_str(&entry.file_name().to_string_lossy()).is_err() { continue; }
+        let path = entry.path();
+        if path.parent() != Some(root.as_path()) || retained.iter().any(|v| references(v, &path)) { continue; }
+        if let Err(error) = std::fs::remove_dir_all(&path) { eprintln!("Local import cleanup: {error}"); }
+    }
+}
+
+#[cfg(windows)]
+struct SingleInstance(*mut std::ffi::c_void);
+#[cfg(windows)]
+impl SingleInstance {
+    fn acquire() -> Result<Option<Self>, String> {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreateMutexW(attributes: *mut std::ffi::c_void, owner: i32, name: *const u16) -> *mut std::ffi::c_void;
+            fn GetLastError() -> u32;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+        let name: Vec<u16> = "Local\\SSPI-Desktop-Instance".encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            let handle = CreateMutexW(std::ptr::null_mut(), 1, name.as_ptr());
+            if handle.is_null() { return Err(std::io::Error::last_os_error().to_string()); }
+            if GetLastError() == 183 { CloseHandle(handle); return Ok(None); }
+            Ok(Some(Self(handle)))
+        }
+    }
+}
+#[cfg(windows)]
+impl Drop for SingleInstance {
+    fn drop(&mut self) {
+        #[link(name = "kernel32")]
+        extern "system" { fn CloseHandle(handle: *mut std::ffi::c_void) -> i32; }
+        unsafe { CloseHandle(self.0); }
+    }
+}
+
 pub fn run() {
+    #[cfg(windows)]
+    let _instance = match SingleInstance::acquire() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return,
+        Err(error) => { startup_message(&format!("SSPI could not acquire its instance lock: {error}")); return; }
+    };
     if let Err(error) = updater::recover_if_needed() {
         let message = format!("SSPI could not restore an interrupted update.\n\n{error}\n\nYour settings and downloads have not been removed.");
         eprintln!("{message}");
@@ -5903,18 +6060,20 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle().clone();
+            if let Err(error) = updater::initialize(&handle) { eprintln!("Update startup: {error}"); }
             if let Err(error) = package_sources::migrate_bundled(&handle) { eprintln!("Source migration: {error}"); }
             let launch_args: Vec<String> = std::env::args().collect();
             for pair in launch_args.windows(2).filter(|pair| pair[0] == "--import-source") {
                 package_sources::install_from_path(&handle, &pair[1]).map_err(std::io::Error::other)?;
                 if let Ok(root) = cache_root(&handle) { let _ = std::fs::remove_file(root.join("catalog-v5.json")); }
             }
-            let settings: Settings = std::fs::read(config_path(&handle)?)
-                .ok()
-                .and_then(|b| serde_json::from_slice(&b).ok())
-                .unwrap_or_default();
+            let (saved, warning) = read_json_backup::<Settings>(&config_path(&handle)?)
+                .unwrap_or_else(|error| (None, Some(format!("Settings were reset to defaults: {error}"))));
+            if let Some(warning) = warning { startup_message(&warning); }
+            let settings = saved.unwrap_or_default();
             let mut retry = job_store::Store::load(handle.path().app_config_dir()?.join("jobs"));
             job_store::recover_legacy(&mut retry, Path::new(&settings.download_dir));
+            cleanup_local_imports(&handle, &retry);
             let restored_jobs: HashMap<String, Progress> = retry.records.iter().filter(|(_, r)| !r.progress.removed).map(|(id, r)| (id.clone(), r.progress.clone())).collect();
             scheduler::configure(settings.scheduler_limits());
             scheduler::set_priority(restored_jobs.values().filter(|p| p.priority).max_by_key(|p| p.created_at).map(|p| p.job_id.clone()));
@@ -6024,13 +6183,91 @@ pub fn run() {
             payloads::remove_payload,
             payloads::send_payload,
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("Tauri error")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(state) = app.try_state::<AppState>() {
+                    if let Ok(store) = state.retry.lock() { cleanup_local_imports(app, &store); }
+                }
+            }
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn win_c_redacts_entire_bearer_token() {
+        assert_eq!(redact_delivery_error("Bearer abc.def-123= failed", "ps4"), "Bearer [redacted] failed");
+        assert_eq!(redact_delivery_error("{\"Authorization\":\"bearer abc\"}", "ps4"), "{\"Authorization\":\"Bearer [redacted]\"}");
+        assert_eq!(redact_delivery_error("Bearer abc, BEARER xyz", "ps4"), "Bearer [redacted], Bearer [redacted]");
+    }
+    #[test]
+    fn win_c_persistence_recovers_backup_without_overwriting_it_with_bad_json() {
+        let root = test_output_root().join(format!("win-c-persistence-{}", Uuid::new_v4()));
+        let path = root.join("settings.json");
+        write_json_backup(&path, br#"{"value":1}"#).unwrap();
+        write_json_backup(&path, br#"{"value":2}"#).unwrap();
+        std::fs::write(&path, b"broken").unwrap();
+        let (value, warning) = read_json_backup::<Value>(&path).unwrap();
+        assert_eq!(value.unwrap()["value"], 1); assert!(warning.is_some());
+        write_json_backup(&path, br#"{"value":3}"#).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&std::fs::read(path.with_extension("json.bak")).unwrap()).unwrap()["value"], 1);
+        assert_eq!(read_json_backup::<Value>(&path).unwrap().0.unwrap()["value"], 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn win_c_corrupt_settings_start_with_defaults_and_preserve_files() {
+        let root = test_output_root().join(format!("win-c-corrupt-settings-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        for damaged_backup in [false, true] {
+            std::fs::write(&path, b"damaged settings").unwrap();
+            if damaged_backup { std::fs::write(path.with_extension("json.bak"), b"damaged backup").unwrap(); }
+            let (saved, warning) = read_json_backup::<Settings>(&path).unwrap();
+            assert!(saved.is_none());
+            assert_eq!(serde_json::to_value(saved.unwrap_or_default()).unwrap(), serde_json::to_value(Settings::default()).unwrap());
+            let warning = warning.unwrap();
+            assert!(warning.contains("Settings were reset to defaults"));
+            assert!(warning.contains("settings.json.corrupt-"));
+            assert!(!path.exists());
+            assert!(!path.with_extension("json.bak").exists());
+            let kept: Vec<_> = std::fs::read_dir(&root).unwrap().map(|entry| entry.unwrap().path()).collect();
+            assert_eq!(kept.len(), if damaged_backup { 3 } else { 1 });
+            for copy in kept {
+                let name = copy.file_name().unwrap().to_string_lossy();
+                if name.starts_with("settings.json.bak.corrupt-") {
+                    assert_eq!(std::fs::read(copy).unwrap(), b"damaged backup");
+                } else {
+                    assert!(name.starts_with("settings.json.corrupt-"));
+                    assert_eq!(std::fs::read(copy).unwrap(), b"damaged settings");
+                }
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn win_c_covers_reject_nonimages_and_private_addresses() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            IpAddr::V6(Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped()),
+        ] {
+            assert!(!public_cover_ip(ip), "{ip}");
+        }
+        assert!(public_cover_ip("8.8.8.8".parse().unwrap()));
+        assert!(!cover_image("image/png", b"<html>"));
+        assert!(!cover_image("text/html", b"\x89PNG\r\n\x1a\n"));
+        assert!(cover_image("image/png", b"\x89PNG\r\n\x1a\n"));
+    }
     #[test]
     fn frame_and_urls() {
         let h = [0x10, 3, 0, 0, 0];

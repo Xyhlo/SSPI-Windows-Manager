@@ -25,6 +25,7 @@ along with this program; see the file COPYING. If not, see
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 
 #include <ps5/kernel.h>
 
@@ -185,7 +186,6 @@ static int
 payload_readhttp(int fd, char* uri, size_t size) {
   const char *headers = ("HTTP/1.1 200 OK\r\n"
 			 "Content-Type: text/plain; charset=utf-8\r\n"
-			 "Access-Control-Allow-Origin: *\r\n"
 			 "Connection: close\r\n"
 			 "\r\n");
   char buf[PATH_MAX+255] = {0};
@@ -212,7 +212,11 @@ payload_readhttp(int fd, char* uri, size_t size) {
   *p = 0;
 
   if((param_uri=uri_get_param(buf+4, "uri"))) {
-    strncpy(uri, param_uri, size);
+    if(strlen(param_uri) >= size) {
+      free(param_uri);
+      return -1;
+    }
+    snprintf(uri, size, "%s", param_uri);
     free(param_uri);
   } else {
     snprintf(uri, size, "file:/%s", buf+4);
@@ -228,7 +232,7 @@ payload_readhttp(int fd, char* uri, size_t size) {
  * Process connection input.
  **/
 static void
-on_connection(int fd) {
+on_connection(int fd, const struct sockaddr_in* peer) {
   char* filename = "payload.elf";
   char uri[PATH_MAX+1] = {0};
   uint8_t* buf = 0;
@@ -237,6 +241,13 @@ on_connection(int fd) {
   char* args = "";
   char* pipe = "";
   int magic = 0;
+  struct timeval timeout = {10, 0};
+
+  if(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
+     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+    LOG_PERROR("setsockopt timeout");
+    return;
+  }
 
   if(setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &optval, sizeof(optval)) < 0) {
     LOG_PERROR("setsockopt");
@@ -256,6 +267,12 @@ on_connection(int fd) {
     }
 
   } else if(magic == PAYLOAD_MAGIC_HTTP_GET) {
+    if((ntohl(peer->sin_addr.s_addr) >> 24) != 127) {
+      static const char forbidden[] =
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+      write(fd, forbidden, sizeof(forbidden)-1);
+      return;
+    }
     if(payload_readhttp(fd, uri, PATH_MAX) || uri_get_content(uri, &buf, &len)) {
       LOG_PERROR("payload_readhttp");
       write(fd, "[elfldr.elf] Error reading HTTP payload\n\r\0", 42);
@@ -354,7 +371,7 @@ serve_elfldr(uint16_t port) {
       break;
     }
 
-    on_connection(connfd);
+    on_connection(connfd, &cliaddr);
     close(connfd);
   }
 

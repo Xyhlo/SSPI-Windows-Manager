@@ -29,8 +29,8 @@ int download_to_file(const char *url, const char *out_path) {
     FILE *fp;
     CURLcode res = CURLE_FAILED_INIT;
 
-    if (!url || !out_path) {
-        pldmgr_log("[PLDMGR] download_to_file: missing url or path\n");
+    if (!url || !out_path || strncasecmp(url, "https://", 8) != 0) {
+        pldmgr_log("[PLDMGR] download_to_file: HTTPS url and output path required\n");
         return -1;
     }
 
@@ -69,20 +69,15 @@ int download_to_file(const char *url, const char *out_path) {
             free(ca_bundle);
         }
 
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-
-        /* Allow redirection */
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        res = curl_easy_perform(curl);
-
-        /* If SSL verification fails (e.g., due to mbedTLS Quirks with Let's Encrypt / Sectigo
-           cross-signed roots, or user's time drift), fallback to insecure download.
-           We verify checksums later anyway for ELFs! */
-        if (res == CURLE_PEER_FAILED_VERIFICATION) {
-            pldmgr_log("[PLDMGR] SSL verification failed. Retrying insecurely: %s\n", url);
-            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+        if (curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L) == CURLE_OK &&
+            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L) == CURLE_OK &&
+            curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https") == CURLE_OK &&
+            curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https") == CURLE_OK) {
+            curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+            curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 8L);
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+            curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+            curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
             res = curl_easy_perform(curl);
         }
 
@@ -100,7 +95,7 @@ int download_to_file(const char *url, const char *out_path) {
         }
     }
 
-    fclose(fp);
+    if (fclose(fp) != 0) res = CURLE_WRITE_ERROR;
 
     if (res != CURLE_OK) {
         remove(out_path);
@@ -111,6 +106,14 @@ int download_to_file(const char *url, const char *out_path) {
 }
 
 /* ── JSON parsing ──────────────────────────────────────────── */
+
+static int valid_checksum(const char *checksum) {
+    if (strlen(checksum) != 64) return 0;
+    for (size_t i = 0; i < 64; i++) {
+        if (!isxdigit((unsigned char)checksum[i])) return 0;
+    }
+    return 1;
+}
 
 int parse_repository_payloads(const char *json, RepoPayload **out_items, size_t *out_count) {
     const char *p = json;
@@ -140,7 +143,14 @@ int parse_repository_payloads(const char *json, RepoPayload **out_items, size_t 
         json_extract_string(p, end, "description", item.description, sizeof(item.description));
         json_extract_string(p, end, "last_update", item.last_update, sizeof(item.last_update));
         json_extract_string(p, end, "version", item.version, sizeof(item.version));
-        json_extract_string(p, end, "checksum", item.checksum, sizeof(item.checksum));
+        char checksum[66];
+        if (json_extract_string(p, end, "checksum", checksum, sizeof(checksum)) != 0 ||
+            !valid_checksum(checksum)) {
+            pldmgr_log("[PLDMGR] Skipping payload without a valid SHA-256: %s\n", item.filename);
+            p = end + 1;
+            continue;
+        }
+        memcpy(item.checksum, checksum, sizeof(item.checksum));
         
         if (json_extract_string(p, end, "category", item.category, sizeof(item.category)) != 0 || strlen(item.category) == 0) {
             strncpy(item.category, "Uncategorized", sizeof(item.category) - 1);
@@ -514,7 +524,13 @@ int repository_install_commit(const char *filename, const char *uploaded_temp_pa
     snprintf(final_path, sizeof(final_path), "%s/%s", payload_dir, items[found].filename);
     snprintf(details_path, sizeof(details_path), "%s/%s.json", payload_dir, items[found].filename);
 
-    if (strlen(items[found].checksum) == 64) {
+    if (!valid_checksum(items[found].checksum)) {
+        free(items);
+        remove(uploaded_temp_path);
+        snprintf(msg_buf, msg_buf_size, "Payload SHA-256 is required");
+        return -1;
+    }
+    {
         char calculated[65];
         if (compute_sha256_file(uploaded_temp_path, calculated) != 0) {
             free(items);
@@ -555,6 +571,26 @@ int repository_install_commit(const char *filename, const char *uploaded_temp_pa
 }
 
 /* ── Self-update ───────────────────────────────────────────── */
+
+/* Do not trust a browser-pushed or previously cached index for auto-launch. */
+static int load_verified_repository(RepoPayload **items, size_t *count) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s.self-update.XXXXXX", REPOSITORY_CACHE_PATH);
+    int fd = mkstemp(path);
+    if (fd < 0) return -1;
+    close(fd);
+    char *json = NULL;
+    size_t size = 0;
+    int result = -1;
+    if (download_to_file(REPOSITORY_SOURCE_URL, path) == 0 &&
+        read_file_text(path, &json, &size) == 0 && size > 0) {
+        result = parse_repository_payloads(json, items, count);
+        if (*count == 0) result = -1;
+    }
+    free(json);
+    remove(path);
+    return result;
+}
 
 int get_elf_pldmgr_version(const char *path, char *out_version, size_t out_size) {
     FILE *f = fopen(path, "rb");
@@ -645,8 +681,13 @@ static int compare_versions(const char *v1, const char *v2) {
 }
 
 int repository_check_self_update(char *out_path, size_t out_size) {
+    if (!out_path || out_size == 0) return -1;
+    out_path[0] = '\0';
     DIR *dir = opendir(PAYLOADS_STORAGE_DIR);
     if (!dir) return -1;
+    RepoPayload *verified_items = NULL;
+    size_t verified_count = 0;
+    int index_loaded = 0;
 
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
@@ -686,7 +727,33 @@ int repository_check_self_update(char *out_path, size_t out_size) {
                                         if (get_elf_pldmgr_version(full_path, version, sizeof(version)) == 0) {
                                             pldmgr_log("[PLDMGR] Found potential update: %s (v%s)\n", full_path, version);
                                             if (compare_versions(version, MENU_VERSION) > 0) {
-                                                strncpy(out_path, full_path, out_size);
+                                                if (!index_loaded) {
+                                                    if (load_verified_repository(&verified_items, &verified_count) != 0) {
+                                                        pldmgr_log("[PLDMGR] Self-update skipped: verified repository unavailable\n");
+                                                        free(verified_items);
+                                                        closedir(sdir);
+                                                        closedir(dir);
+                                                        return -1;
+                                                    }
+                                                    index_loaded = 1;
+                                                }
+                                                char calculated[65];
+                                                int matches = 0;
+                                                if (compute_sha256_file(full_path, calculated) == 0) {
+                                                    for (size_t i = 0; i < verified_count; i++) {
+                                                        if (strcmp(verified_items[i].filename, sentry->d_name) == 0 &&
+                                                            strcasecmp(verified_items[i].checksum, calculated) == 0) {
+                                                            matches = 1;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                if (!matches || strlen(full_path) >= out_size) {
+                                                    pldmgr_log("[PLDMGR] Self-update skipped: repository SHA-256 mismatch for %s\n", sentry->d_name);
+                                                    continue;
+                                                }
+                                                snprintf(out_path, out_size, "%s", full_path);
+                                                free(verified_items);
                                                 closedir(sdir);
                                                 closedir(dir);
                                                 return 0;
@@ -705,6 +772,7 @@ int repository_check_self_update(char *out_path, size_t out_size) {
         }
     }
 
+    free(verified_items);
     closedir(dir);
     return -1;
 }

@@ -30,7 +30,9 @@ pub(super) fn observe(app: &AppHandle, p: &Progress) {
             while let Some(update) = rx.recv().await {
                 if update.progress.speed_bps > 0. { last_speed.insert(update.progress.job_id.clone(), update.progress.speed_bps); }
                 let speed = last_speed.get(&update.progress.job_id).copied().unwrap_or_default();
-                let _ = tokio::time::timeout(Duration::from_secs(8), send(&update, speed, &mut art)).await;
+                if let Err(error) = send(&update, speed, &mut art).await {
+                    eprintln!("{} progress notification failed: {}", update.endpoint.console, update.endpoint.redact(error));
+                }
                 if terminal_stage(&update.progress.stage) { last_speed.remove(&update.progress.job_id); }
             }
         });
@@ -121,6 +123,17 @@ pub(super) async fn prime_ps4(endpoint: &ReceiverEndpoint, progress: Progress, i
 }
 
 async fn send(update: &Update, speed: f64, art: &mut HashMap<String, Vec<u8>>) -> Result<(), String> {
+    match tokio::time::timeout(Duration::from_secs(5), send_attempt(update, speed, art, true)).await {
+        Ok(Ok(())) => return Ok(()),
+        result => {
+            let error = match result { Ok(Err(error)) => error, _ => "Notification timed out".into() };
+            eprintln!("{} artwork notification failed; retrying text only: {}", update.endpoint.console, update.endpoint.redact(error));
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(3), send_attempt(update, speed, art, false)).await
+        .map_err(|_| "Text-only notification timed out".to_string())?
+}
+async fn send_attempt(update: &Update, speed: f64, art: &mut HashMap<String, Vec<u8>>, include_art: bool) -> Result<(), String> {
     let endpoint = &update.endpoint; let p = &update.progress;
     let mut socket = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await.map_err(redact)?;
     let (_, reply) = frame(&mut socket, 0x53, &[]).await?;
@@ -130,7 +143,7 @@ async fn send(update: &Update, speed: f64, art: &mut HashMap<String, Vec<u8>>) -
     if endpoint.console == "PS4" {
         if let Some(bytes) = PS4_ART.get_or_init(Default::default).lock().unwrap().get(&p.job_id).cloned() { art.insert(key.clone(), bytes); }
     }
-    if !art.contains_key(&key) {
+    if include_art && !art.contains_key(&key) {
         let source = p.icon.as_deref().unwrap_or("");
         let bytes = if let Some(data) = source.strip_prefix("data:image/png;base64,").or_else(|| source.strip_prefix("data:image/png;sspi-case=1;base64,")).or_else(|| source.strip_prefix("data:image/jpeg;base64,")) {
             image_bytes(BASE64.decode(data).unwrap_or_default())
@@ -144,7 +157,7 @@ async fn send(update: &Update, speed: f64, art: &mut HashMap<String, Vec<u8>>) -
         if art.len() > 32 { art.clear(); }
         art.insert(key.clone(), bytes);
     }
-    let image = &art[&key];
+    let image = if include_art { art.get(&key).map(Vec::as_slice).unwrap_or_default() } else { &[] };
     let json = payload(p, speed, !image.is_empty());
     let mut body = vec![u8::from(p.stage == "complete")];
     body.extend_from_slice(p.title_id.as_bytes()); body.push(0);

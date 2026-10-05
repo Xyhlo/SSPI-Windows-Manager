@@ -6,6 +6,7 @@ use std::{collections::HashSet, fs, io::Read, path::{Path, PathBuf}, sync::{atom
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const BASE: &str = "https://amptis.com/apk/sspi-updates/v1";
+const TRUSTED_HOSTS: &[&str] = &["amptis.com", "www.amptis.com"];
 const HELPER: &str = include_str!("../../../build/sspi-update-helper.ps1");
 const MAX_PACKAGE: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_EXPANDED: u64 = 4 * 1024 * 1024 * 1024;
@@ -52,13 +53,13 @@ impl Drop for InstallHelper {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateFile { pub path: String, pub size: u64, pub sha256: String }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Package { pub url: String, pub size: u64, pub sha256: String, pub format: String }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Manifest {
     pub schema: u32, pub product: String, pub channel: String, pub version: String,
     pub build: u64, pub published_at: String, pub notes: String, pub restart: String,
@@ -89,6 +90,22 @@ fn root(app: &AppHandle) -> Result<PathBuf, String> {
 fn install_root() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| e.to_string())?.parent().map(Path::to_path_buf).ok_or("Application directory is unavailable".into())
 }
+fn prune_stages(root: &Path, keep: Option<&Path>) -> Result<(), String> {
+    no_links(root)?;
+    for entry in fs::read_dir(root).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !entry.file_name().to_string_lossy().starts_with("stage-") || keep == Some(path.as_path()) { continue; }
+        no_links(&path)?;
+        if path.is_dir() { fs::remove_dir_all(&path).map_err(|e| e.to_string())?; }
+    }
+    if keep.is_none() && root.join("ready.json").exists() {
+        no_links(&root.join("ready.json"))?;
+        fs::remove_file(root.join("ready.json")).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+pub fn initialize(app: &AppHandle) -> Result<(), String> { snapshot(app).map(|_| ()) }
 /// Call at the beginning of run(), before Tauri starts jobs. A rollback must run
 /// outside this process because Windows can keep the current executable locked.
 pub fn recover_if_needed() -> Result<(), String> {
@@ -138,6 +155,7 @@ fn new_status(app: &AppHandle) -> Result<UpdateStatus, String> {
             }
         }
     }
+    prune_stages(&dir, s.stage_dir.as_deref())?;
     Ok(s)
 }
 fn snapshot(app: &AppHandle) -> Result<UpdateStatus, String> {
@@ -177,10 +195,21 @@ pub(crate) fn application_path(path: &str) -> bool {
 }
 fn trusted_url(url: &str, product: &str, channel: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else { return false; };
-    parsed.scheme() == "https" && parsed.host_str() == Some("amptis.com") && parsed.port_or_known_default() == Some(443)
+    parsed.scheme() == "https" && parsed.host_str().is_some_and(|host| TRUSTED_HOSTS.contains(&host)) && parsed.port_or_known_default() == Some(443)
         && parsed.username().is_empty() && parsed.password().is_none() && parsed.query().is_none() && parsed.fragment().is_none()
         && parsed.path().starts_with(&format!("/apk/sspi-updates/v1/{product}/{channel}/"))
         && !url.contains('%') && !url.contains('\\') && !url.split('/').any(|s| s == ".." || s == ".")
+}
+fn update_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder().https_only(true).user_agent("GameSearch/0.1").connect_timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let url = attempt.url();
+            if attempt.previous().len() >= 4 || url.scheme() != "https" || url.port_or_known_default() != Some(443)
+                || !url.host_str().is_some_and(|host| TRUSTED_HOSTS.contains(&host))
+                || !url.username().is_empty() || url.password().is_some() {
+                attempt.error("Untrusted update redirect")
+            } else { attempt.follow() }
+        })).build().map_err(|e| e.to_string())
 }
 fn validate_manifest(m: &Manifest, channel: &str) -> Result<(), String> {
     if m.schema != 1 || m.product != "windows" || m.channel != channel || !valid_channel(channel) || m.build == 0
@@ -235,17 +264,9 @@ fn extract(zip: &Path, target: &Path, manifest: &Manifest) -> Result<(), String>
     Ok(())
 }
 
-#[tauri::command]
-pub fn get_update_status(app: AppHandle) -> Result<UpdateStatus, String> { snapshot(&app) }
-
-#[tauri::command]
-pub async fn check_for_updates(app: AppHandle, state: State<'_, crate::AppState>) -> Result<UpdateStatus, String> {
-    let Ok(_guard) = OPERATION.try_lock() else { return snapshot(&app); };
-    let mut s = snapshot(&app)?; if s.stage == "installing" { return Ok(s); }
-    s.stage = "checking".into(); s.message = "Checking for updates…".into(); publish(&app, &s);
-    let result = async {
+async fn fetch_manifest(http: &reqwest::Client, s: &UpdateStatus) -> Result<Option<Manifest>, String> {
         let endpoint = format!("{BASE}/windows/{}/manifest.json", s.channel);
-    let response = state.http.get(&endpoint).query(&[("t", crate::now_secs())]).header("Cache-Control", "no-cache").timeout(Duration::from_secs(30)).send().await.map_err(|_| "Could not reach the update server. Try again later.")?;
+    let response = http.get(&endpoint).query(&[("t", crate::now_secs())]).header("Cache-Control", "no-cache").timeout(Duration::from_secs(30)).send().await.map_err(|_| "Could not reach the update server. Try again later.")?;
         if response.status() == reqwest::StatusCode::NOT_FOUND { return Ok(None); }
         let mut final_url = response.url().clone(); final_url.set_query(None);
         if !response.status().is_success() || !trusted_url(final_url.as_str(), "windows", &s.channel) { return Err("The update server returned an unexpected response".to_string()); }
@@ -254,7 +275,17 @@ pub async fn check_for_updates(app: AppHandle, state: State<'_, crate::AppState>
         let manifest: Manifest = serde_json::from_slice(&body).map_err(|_| "The update manifest could not be read")?;
         validate_manifest(&manifest, &s.channel)?;
         Ok::<_, String>(Some(manifest))
-    }.await;
+}
+
+#[tauri::command]
+pub fn get_update_status(app: AppHandle) -> Result<UpdateStatus, String> { snapshot(&app) }
+
+#[tauri::command]
+pub async fn check_for_updates(app: AppHandle, _state: State<'_, crate::AppState>) -> Result<UpdateStatus, String> {
+    let Ok(_guard) = OPERATION.try_lock() else { return snapshot(&app); };
+    let mut s = snapshot(&app)?; if s.stage == "installing" { return Ok(s); }
+    s.stage = "checking".into(); s.message = "Checking for updates…".into(); publish(&app, &s);
+    let result = fetch_manifest(&update_client()?, &s).await;
     s.last_checked = crate::now_secs();
     match result {
         Err(e) => Err(fail(&app, s, e)),
@@ -265,37 +296,73 @@ pub async fn check_for_updates(app: AppHandle, state: State<'_, crate::AppState>
             s.message = if ready { "Update ready. Restart SSPI to install." } else { "A new SSPI update is available." }.into(); publish(&app, &s); Ok(s)
         },
         Ok(_) => {
-            // A temporarily absent feed must not invalidate an already verified download.
-            if s.stage_dir.is_some() { s.stage = "ready".into(); s.message = "Update ready. Restart SSPI to install.".into(); }
-            else { s.available = None; s.stage = "current".into(); s.message = "You're up to date on this channel.".into(); }
+            s.stage_dir = None; s.available = None; s.downloaded = 0; s.total = 0;
+            s.stage = "current".into(); s.message = "You're up to date on this channel.".into();
+            prune_stages(&root(&app)?, None)?;
             publish(&app, &s); Ok(s)
         }
     }
 }
 
 #[tauri::command]
-pub async fn download_update(app: AppHandle, state: State<'_, crate::AppState>) -> Result<UpdateStatus, String> {
+pub async fn download_update(app: AppHandle, _state: State<'_, crate::AppState>) -> Result<UpdateStatus, String> {
     let _guard = OPERATION.try_lock().map_err(|_| "An update operation is already running")?;
     let mut s = snapshot(&app)?; let m = s.available.clone().ok_or("Check for updates first")?;
     validate_manifest(&m, &s.channel)?;
     if !newer(&m, &s) { return Err("This update is not newer than the installed version".into()); }
-    let dir = root(&app)?.join(format!("stage-{}", uuid::Uuid::new_v4()));
-    fs::create_dir(&dir).map_err(|e| e.to_string())?; no_links(&dir)?;
+    let dir = root(&app)?.join(format!("stage-{}-{}", m.build, m.package.sha256.to_ascii_lowercase()));
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?; no_links(&dir)?;
     s.stage = "downloading".into(); s.downloaded = 0; s.total = m.package.size; s.stage_dir = None; s.message = "Downloading update…".into(); publish(&app, &s);
     let result = async {
-        let response = state.http.get(&m.package.url).timeout(Duration::from_secs(1800)).send().await.map_err(|_| "Update download failed. Check your connection and retry.")?;
-        if response.status() != reqwest::StatusCode::OK || !trusted_url(response.url().as_str(), "windows", &s.channel)
-            || response.content_length().is_some_and(|n| n != m.package.size) { return Err("Unexpected update download response or length".into()); }
-        let zip = dir.join("package.zip"); let mut out = tokio::fs::File::create(&zip).await.map_err(|e| e.to_string())?;
-        let mut stream = response.bytes_stream(); let mut sha = Sha256::new(); let mut last = std::time::Instant::now();
-        while let Some(chunk) = tokio::time::timeout(Duration::from_secs(60), stream.next()).await.map_err(|_| "Update download timed out")? {
-            let chunk = chunk.map_err(|_| "Update download was interrupted. Retry to start a fresh download.")?;
-            s.downloaded += chunk.len() as u64; if s.downloaded > m.package.size { return Err("Update download exceeds its declared length".into()); }
-            sha.update(&chunk); tokio::io::AsyncWriteExt::write_all(&mut out, &chunk).await.map_err(|e| e.to_string())?;
-            if last.elapsed() >= Duration::from_millis(150) { publish(&app, &s); last = std::time::Instant::now(); }
+        let zip = dir.join("package.zip"); no_links(&zip)?;
+        let mut retries = 0u32;
+        loop {
+            let offset = fs::metadata(&zip).map(|m| m.len()).unwrap_or(0);
+            if offset > m.package.size { fs::remove_file(&zip).map_err(|e| e.to_string())?; continue; }
+            if offset == m.package.size { s.downloaded = offset; break; }
+            let attempt = async {
+                let mut request = update_client()?.get(&m.package.url).header("Accept-Encoding", "identity");
+                if offset > 0 { request = request.header("Range", format!("bytes={offset}-")); }
+                let response = tokio::time::timeout(Duration::from_secs(60), request.send()).await
+                    .map_err(|_| "Update connection timed out")?.map_err(|_| "Update download connection failed")?;
+                if !trusted_url(response.url().as_str(), "windows", &s.channel) { return Err("Untrusted update download redirect".to_string()); }
+                let resumed = response.status() == reqwest::StatusCode::PARTIAL_CONTENT && offset > 0;
+                let start = if resumed { offset } else { 0 };
+                if resumed {
+                    let expected = format!("bytes {}-{}/{}", offset, m.package.size - 1, m.package.size);
+                    if response.headers().get("content-range").and_then(|h| h.to_str().ok()) != Some(expected.as_str()) {
+                        return Err("Invalid update resume range".into());
+                    }
+                } else if response.status() != reqwest::StatusCode::OK { return Err("Unexpected update download response".into()); }
+                if response.content_length().is_some_and(|n| n != m.package.size - start) { return Err("Unexpected update download length".into()); }
+                let mut out = tokio::fs::OpenOptions::new().write(true).create(true).append(resumed).truncate(!resumed)
+                    .open(&zip).await.map_err(|e| e.to_string())?;
+                s.downloaded = start;
+                let mut stream = response.bytes_stream(); let mut last = Instant::now();
+                while let Some(chunk) = tokio::time::timeout(Duration::from_secs(60), stream.next()).await.map_err(|_| "Update download idle timeout")? {
+                    let chunk = chunk.map_err(|_| "Update download was interrupted")?;
+                    if chunk.len() as u64 > m.package.size - s.downloaded { return Err("Update download exceeds its declared length".into()); }
+                    tokio::io::AsyncWriteExt::write_all(&mut out, &chunk).await.map_err(|e| e.to_string())?;
+                    s.downloaded += chunk.len() as u64;
+                    if last.elapsed() >= Duration::from_millis(150) { publish(&app, &s); last = Instant::now(); }
+                }
+                out.sync_all().await.map_err(|e| e.to_string())?;
+                if s.downloaded != m.package.size { return Err("Update download ended early".into()); }
+                Ok::<_, String>(())
+            }.await;
+            match attempt {
+                Ok(()) => break,
+                Err(error) if retries >= 3 => return Err(format!("{error}. Retry to resume the download.")),
+                Err(_) => { retries += 1; tokio::time::sleep(Duration::from_secs(1 << retries)).await; }
+            }
         }
-        out.sync_all().await.map_err(|e| e.to_string())?; drop(out);
-        if s.downloaded != m.package.size || !format!("{:x}", sha.finalize()).eq_ignore_ascii_case(&m.package.sha256) { return Err("Update checksum or length mismatch. Nothing was installed; retry the download.".into()); }
+        let hash_path = zip.clone();
+        let hash = tokio::task::spawn_blocking(move || file_hash(&hash_path)).await.map_err(|e| e.to_string())??;
+        if !hash.eq_ignore_ascii_case(&m.package.sha256) {
+            fs::remove_file(&zip).map_err(|e| e.to_string())?;
+            return Err("Update checksum mismatch. Nothing was installed; retry the download.".into());
+        }
+        if dir.join("files").exists() { no_links(&dir.join("files"))?; fs::remove_dir_all(dir.join("files")).map_err(|e| e.to_string())?; }
         s.stage = "verifying".into(); s.message = "Verifying and staging application files…".into(); publish(&app, &s);
         let staged = dir.join("files"); let manifest = m.clone();
         tokio::task::spawn_blocking(move || extract(&zip, &staged, &manifest)).await.map_err(|e| e.to_string())??;
@@ -303,8 +370,10 @@ pub async fn download_update(app: AppHandle, state: State<'_, crate::AppState>) 
         fs::write(root(&app)?.join("ready.json"), serde_json::to_vec(&saved).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         Ok::<_, String>(())
     }.await;
-    if let Err(e) = result { if no_links(&dir).is_ok() { let _ = fs::remove_dir_all(&dir); } return Err(fail(&app, s, e)); }
-    s.stage = "ready".into(); s.stage_dir = Some(dir); s.message = "Verified and ready. Restart SSPI to install; your settings and credentials are preserved.".into(); publish(&app, &s); Ok(s)
+    if let Err(e) = result { return Err(fail(&app, s, e)); }
+    s.stage = "ready".into(); s.stage_dir = Some(dir); s.message = "Verified and ready. Restart SSPI to install; your settings and credentials are preserved.".into(); publish(&app, &s);
+    if let Err(error) = prune_stages(&root(&app)?, s.stage_dir.as_deref()) { eprintln!("Update staging cleanup: {error}"); }
+    Ok(s)
 }
 
 #[tauri::command]
@@ -319,6 +388,14 @@ pub async fn install_update(app: AppHandle, state: State<'_, crate::AppState>) -
     let m = s.available.clone().ok_or("Download an update first")?;
     let dir = s.stage_dir.clone().ok_or("Download and verify the update before installing")?;
     validate_manifest(&m, &s.channel)?; no_links(&dir)?;
+    let latest = fetch_manifest(&update_client()?, &s).await.map_err(|e| fail(&app, s.clone(), e))?;
+    if !latest.as_ref().is_some_and(|latest| newer(latest, &s)
+        && serde_json::to_value(latest).ok() == serde_json::to_value(&m).ok()) {
+        s.stage_dir = None; s.available = latest.filter(|latest| newer(latest, &s));
+        s.stage = if s.available.is_some() { "available" } else { "current" }.into();
+        s.downloaded = 0; s.message = "The staged update is no longer offered. Check and download the current update.".into();
+        prune_stages(&root(&app)?, None)?; publish(&app, &s); return Err(s.message);
+    }
     let destination = install_root()?; no_links(&destination)?;
     if !destination.join("SSPI.exe").is_file() { return Err("Automatic updates require a packaged SSPI installation. Build and run the distribution first.".into()); }
     let helper = dir.join("sspi-update-helper.ps1"); fs::write(&helper, HELPER).map_err(|e| e.to_string())?;
@@ -393,11 +470,23 @@ mod tests {
     }
     #[test] fn urls_are_fixed_to_distribution() {
         assert!(trusted_url(&format!("{BASE}/windows/development/123/update.zip"), "windows", "development"));
+        assert!(trusted_url("https://www.amptis.com/apk/sspi-updates/v1/windows/development/123/update.zip", "windows", "development"));
         for url in ["http://amptis.com/apk/sspi-updates/v1/windows/development/a.zip", "https://amptis.com.evil.test/apk/sspi-updates/v1/windows/development/a.zip", "https://amptis.com/apk/sspi-updates/v1/windows/development/%2e%2e/a", "https://amptis.com/apk/sspi-updates/v1/windows/stable/a.zip", "https://amptis.com/apk/sspi-updates/v1/windows/development/../a.zip"] { assert!(!trusted_url(url, "windows", "development")); }
     }
     #[test] fn development_builds_and_downgrades() {
-        let mut m: Manifest = serde_json::from_value(serde_json::json!({"schema":1,"product":"windows","channel":"development","version":"2.23.0","build":12,"publishedAt":"", "notes":"", "restart":"", "package":{"url":"", "size":1,"sha256":"","format":"zip"},"files":[]})).unwrap();
+        let mut m: Manifest = serde_json::from_value(serde_json::json!({"schema":1,"product":"windows","channel":"development","version":"2.23.0","build":12,"publishedAt":"", "notes":"", "restart":"", "signature":"future-field", "package":{"url":"", "size":1,"sha256":"","format":"zip","future":true},"files":[]})).unwrap();
         let s = UpdateStatus { stage:"idle".into(), current_version:"2.23.0".into(),current_build:11, channel:"development".into(),available:None,downloaded:0,total:0,message:String::new(),last_checked:0,stage_dir:None };
         assert!(newer(&m,&s)); m.build=11; assert!(!newer(&m,&s)); m.build=13; m.version="2.22.9".into(); assert!(!newer(&m,&s));
+    }
+    #[test] fn win_c_prunes_only_obsolete_stages() {
+        let root = crate::test_output_root().join(format!("win-c-update-stages-{}", uuid::Uuid::new_v4()));
+        for dir in ["stage-old", "stage-ready", "user-data"] { fs::create_dir_all(root.join(dir)).unwrap(); }
+        fs::write(root.join("ready.json"), b"{}").unwrap();
+        let keep = root.join("stage-ready");
+        prune_stages(&root, Some(&keep)).unwrap();
+        assert!(!root.join("stage-old").exists()); assert!(keep.exists()); assert!(root.join("user-data").exists());
+        prune_stages(&root, None).unwrap();
+        assert!(!keep.exists()); assert!(!root.join("ready.json").exists()); assert!(root.join("user-data").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }
