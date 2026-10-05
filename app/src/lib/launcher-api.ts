@@ -1,6 +1,7 @@
 import { invoke as nativeInvoke } from "@tauri-apps/api/core"
 import type { ConsoleKind } from "@/types"
 import type { PayloadEntry } from "./console-types"
+import type { HomebrewPackage } from "../types"
 
 export const launcherAvailable = (demo: boolean) => demo || (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window)
 function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -9,7 +10,7 @@ function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> 
 }
 
 export type AutostartStepState = "pending" | "waiting" | "sending" | "sent" | "verified" | "failed" | "skipped"
-export type AutostartStep = { payloadId: string; delayMs: number; state: AutostartStepState; message: string }
+export type AutostartStep = { payloadId: string; delayMs: number; processName?: string; state: AutostartStepState; message: string }
 export type AutostartPhase = "off" | "ready" | "waiting" | "unavailable" | "sending" | "done" | "failed" | "stopped"
 export type AutostartStatus = {
   target: ConsoleKind; enabled: boolean; steps: AutostartStep[]
@@ -17,7 +18,7 @@ export type AutostartStatus = {
   attempts: number; lastAttemptAt: number | null; nextAttemptAt: number | null
 }
 /** The saved order: each payload waits `delayMs` after the previous one (or after the start). */
-export type AutostartOrder = Array<{ payloadId: string; delayMs: number }>
+export type AutostartOrder = Array<{ payloadId: string; delayMs: number; processName?: string }>
 export const AUTOSTART_MAX_STEPS = 16
 export const AUTOSTART_MAX_DELAY_MS = 120_000
 export const autostartRunning = (status?: AutostartStatus) => !!status && ["waiting", "unavailable", "sending"].includes(status.phase)
@@ -89,14 +90,13 @@ export async function getAutostart(demo: boolean): Promise<AutostartStatus[]> {
 }
 export async function setAutostart(target: ConsoleKind, enabled: boolean, order: AutostartOrder, demo: boolean): Promise<AutostartStatus[]> {
   if (demo) {
-    const touched = previewAuto.find(item => item.target === target)?.steps.some(step => ["sending", "sent", "verified", "failed"].includes(step.state))
+    for (const timer of previewTimers[target] || []) window.clearTimeout(timer)
     previewUpdate(target, () => ({
       ...off(target), enabled,
       steps: order.map(step => ({ ...step, state: "pending" as const, message: "" })),
       phase: enabled && order.length ? "ready" : "off",
-      message: enabled && order.length ? "Runs the next time SSPI starts." : "Autostart is off.",
+      message: enabled && order.length ? "Ready for Run now or a confirmed console wake with a fresh process list." : "Autostart is off.",
     }))
-    if (enabled && order.length && !touched) previewRun(target)
     return clone(previewAuto)
   }
   return invoke("set_payload_autostart", { target, enabled, steps: order })
@@ -164,3 +164,5 @@ export async function getPayloadCatalog(refresh: boolean, demo: boolean): Promis
   } : invoke("get_payload_catalog", { refresh })
 }
 export async function downloadCatalogPayload(filename: string): Promise<PayloadEntry[]> { return invoke("download_catalog_payload", { filename }) }
+/** Imports a payload row of the homebrew source into Payloads (downloaded from GitHub, checksum verified). */
+export async function addHomebrewPayload(request: { url: string; name: string; version?: string; sha256?: string; homebrew: HomebrewPackage }): Promise<PayloadEntry[]> { return invoke("add_homebrew_payload", { request }) }

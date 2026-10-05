@@ -4,7 +4,7 @@
 
 SSPI Windows Manager is the desktop side of SSPI. It finds packages, downloads and extracts them on your PC, turns extracted PS5 dumps into installable packages, and installs the result on a PS5 or PS4 through a small receiver payload. It also looks after the console itself: installed titles and covers, payloads, system information, kernel logs, processes and game icons.
 
-**Version 2.24.4 · Windows 10 and 11 (x64) · Tauri 2, React and Rust**
+**Version 2.25.3 · Windows 10 and 11 (x64) · Tauri 2, React and Rust**
 
 This is a private development repository with a selected source export. Starting with 2.24.4, the only uploaded release asset is the Windows installer on the [Releases](../../releases) page.
 
@@ -21,6 +21,7 @@ This is a private development repository with a selected source export. Starting
 - Imports a PKG, scans a folder, or adds extracted game folders from this PC.
 - Extracts RAR and ZIP sets, including multipart and old-style `.rar`/`.r00` volumes.
 - Tracks every job by stage (download, extract, package, install), with pause, cancel and retry.
+- Downloads each file over several connections and resumes from the finished pieces. By default four games download and two extract at once, sharing the connections so they finish together. **Prioritize** (or T) puts one game first for downloading, extracting, packaging and installing.
 
 **Packaging for PS5**
 - Builds a finalized FPKG from an extracted dump, with Kraken compression and PFS v2 or v3.
@@ -37,7 +38,7 @@ This is a private development repository with a selected source export. Starting
 - **Payloads:** sends ELF and BIN payloads to the console's loader, including the built-in receivers.
 - **System:** shows firmware, model, temperatures, storage and mounts, and reads the kernel log with panic detection plus a live relay from a klog server. It also lists processes with Stop and End, and lists payload logs and crash reports. Everything exports to `.txt` or `.csv`.
 - **Game icons:** masks every game's icon to a shape with an optional border, glow or glass, the way Icon Mask does. The originals are kept, and the new icons appear after a restart.
-- **Themes (PS4, experimental):** builds a system theme with a wallpaper and replacement system icons.
+- **Themes (PS4):** temporarily disabled behind a blurred Coming soon preview.
 
 ## Requirements
 
@@ -46,6 +47,7 @@ This is a private development repository with a selected source export. Starting
 - **PS4:** GoldHEN 2.4b18.5 or newer, with BinLoader enabled.
 - The PC and the console on the same local network. Allow SSPI through Windows Firewall when asked.
 - Nothing else to install: the packaging engines and the .NET runtime they run on come with SSPI.
+- The repaired 2.24.4 installer also includes the required Microsoft C++ runtime support, so a separate Visual C++ Redistributable install is not required.
 
 ## Getting started
 
@@ -72,7 +74,7 @@ Want to look around first? Choose **Try the offline preview** on the welcome scr
 
 This is development software, tested by a small group. A host build that passes its tests doesn't prove compatibility with every firmware, loader or package.
 
-- PS4 themes install, but the console currently reports themes built by SSPI as corrupted. Leave them alone for now.
+- PS4 theme creation and installation controls are disabled while compatibility is being fixed.
 - Game icon masks, PS4 kernel log access and the install confirmation after a receiver restart are new in this build and are still being verified on consoles.
 - PS5 package installs depend on the console's firmware and loader. When AppInst rejects a package, SSPI shows its error code.
 

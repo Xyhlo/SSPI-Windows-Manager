@@ -1034,7 +1034,9 @@ static void *client_thread(void *argument) {
             if (handle_upload_chunk(fd, size, &lane, upload_buffer)) break;
             continue;
         }
-        if (size > (header[0]==CMD_TITLE_ICON_SET ? CT_MAX_PNG+10 : MAX_PATH_BYTES+25)) { text_reply(fd, RESP_ERROR, "control frame too large"); break; }
+        uint32_t control_limit = header[0]==CMD_PROGRESS_NOTIFICATION ? 512u*1024u+16400u :
+            header[0]==CMD_TITLE_ICON_SET ? CT_MAX_PNG+10 : MAX_PATH_BYTES+25;
+        if (size > control_limit) { text_reply(fd, RESP_ERROR, "control frame too large"); break; }
         uint8_t *body = size ? malloc(size + 1) : NULL;
         if (size && (!body || recv_all(fd, body, size))) { free(body); break; }
         if (body) body[size] = 0;

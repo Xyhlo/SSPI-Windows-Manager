@@ -1,11 +1,12 @@
 {
   "productName": "SSPI for Windows",
-  "version": "2.24.4",
+  "version": "2.25.3",
   "releaseChannel": "development",
   "stack": "Tauri 2 / React / Rust",
   "identifier": "com.simpleps5installer.gamesearch",
   "executable": "game-search.exe",
-  "receiverVersion": "1.0.12",
+  "receiverVersion": "1.0.14",
+  "ps4ReceiverVersion": "1.0.13",
   "receiverPort": 9114,
   "sourceOrigin": "Simple-PS5-Installer; latest debug source snapshot",
   "outputRoot": "../Build-Output/Windows Manager"

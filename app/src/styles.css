@@ -587,6 +587,10 @@ body.booting .app > * { opacity: 0; }
 .dmeta { display: flex; align-items: center; gap: 10px; margin-top: 5px; min-width: 0; }
 .dcard.large .dmeta { margin-top: 7px; }
 .dcount { font-size: 12px; color: var(--faint); white-space: nowrap; }
+.dprio { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 7px 0 5px; border-radius: 5px; background: rgba(var(--accent-rgb), .14); color: var(--accent); font-size: 11px; font-weight: 600; letter-spacing: .02em; white-space: nowrap; }
+.dprio .i { width: 12px; height: 12px; }
+.btn.prio-on { border-color: rgba(var(--accent-rgb), .5); background: rgba(var(--accent-rgb), .12); color: var(--ink); }
+.btn.prio-on .i { color: var(--accent); }
 .dline { display: block; margin-top: 6px; font-size: 13px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
 .dcard.large .dline { font-size: 13.5px; margin-top: 8px; }
 .dline.muted { color: var(--muted); }
@@ -1278,6 +1282,9 @@ body.booting .app > * { opacity: 0; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
 }
+/* Spinners report work in progress, so they keep turning (slowly) with reduced motion. */
+.reduce-motion .spinner { animation-duration: 1.4s !important; animation-iteration-count: infinite !important; }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 1.4s !important; animation-iteration-count: infinite !important; } }
 
 /* =====================================================================
    Themes (PS4): a PS4 screen mock beside the Look / Icons / Install tabs
@@ -1476,3 +1483,13 @@ body.booting .app > * { opacity: 0; }
 .imk-fail { margin: 0; font-size: 12px; color: var(--warn-ink); line-height: 1.45; }
 .imk-fail b { font-weight: 500; color: var(--ink); margin-right: 4px; }
 @media (max-width: 1000px) { .imk { grid-template-columns: 1fr; } }
+/* Themes stay visible as a preview without mounting their console controls. */
+.themes-coming-soon { position: relative; min-height: 360px; overflow: hidden; border-radius: 16px; border: 1px solid var(--line); }
+.themes-coming-soon-preview { padding: 28px; filter: blur(7px); opacity: .3; user-select: none; pointer-events: none; }
+.themes-coming-soon-wallpaper { height: 190px; border-radius: 12px; background: radial-gradient(ellipse at 70% 25%, #64748b66, transparent 60%), linear-gradient(135deg, #192128, #3b3f49 55%, #15171c); }
+.themes-coming-soon-options { display: flex; gap: 18px; margin-top: 20px; }
+.themes-coming-soon-options > div { flex: 1; padding: 16px; border: 1px solid var(--line); border-radius: 10px; }
+.themes-coming-soon-options i { display: block; height: 18px; margin-top: 14px; border-radius: 5px; background: #ffffff22; }
+.themes-coming-soon-message { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 24px; }
+.themes-coming-soon-message strong { font-size: 26px; font-weight: 600; }
+.themes-coming-soon-message p { margin-top: 9px; color: var(--muted); }

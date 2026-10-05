@@ -13,10 +13,15 @@
 //!                                     hoster,version,groupId,accessType,
 //!                                     sourcePageUrl,archivePassword,...}]}}
 //!
+//! A global source can also carry `catalog.json.platformCatalog`: titles for
+//! several platforms (PS4 and PS5 homebrew) with their package rows inline and
+//! icons packed into `artworkFiles`. The legacy index stays PS4-only for the
+//! PS4 application; this reader prefers the platform catalog when present.
+//!
 //! Search reads only the index (~2.3 MB for 7k titles), so queries are
 //! in-memory and instant; package shards are read lazily with a small cache.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,6 +31,8 @@ const MAX_META: u64 = 2 * 1024 * 1024;
 const MAX_SHARD: u64 = 2 * 1024 * 1024;
 const MAX_TITLES: usize = 60_000;
 const SHARD_CACHE: usize = 2;
+const MAX_ARTWORK: u64 = 4 * 1024 * 1024;
+const MAX_ART_SLICE: u64 = 512 * 1024;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -39,7 +46,84 @@ struct CatalogFile {
     #[serde(default)]
     package_files: Vec<String>,
     #[serde(default)]
+    artwork_files: Vec<String>,
+    #[serde(default)]
     counts: Counts,
+    #[serde(default)]
+    platform_catalog: Option<PlatformCatalog>,
+}
+
+/// Multi-platform title list with inline package rows (global homebrew).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PlatformCatalog {
+    #[serde(default)]
+    titles: Vec<IndexTitle>,
+    #[serde(default)]
+    packages: HashMap<String, Vec<PackageRow>>,
+}
+
+/// A JPEG slice inside one of the catalog's artwork pack files.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtRef {
+    file: String,
+    offset: u64,
+    size: u64,
+    #[serde(default)]
+    sha256: String,
+}
+
+/// Platform tags for a homebrew title. `runsOn` lists the consoles the app
+/// is known to run on; `unverifiedOn` the ones it may run on untested.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HomebrewTitle {
+    pub platform: String,
+    #[serde(default)]
+    pub runs_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unverified_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub category: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub developer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+}
+
+/// How a homebrew package is installed: `pkg` (PS4 package), `folder` (a
+/// ZIP whose `archiveRoot` goes to /data/homebrew/<installDir>) or `payload`
+/// (an ELF, optionally `archiveMember` inside a ZIP, added to Payloads).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HomebrewPackage {
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub format: String,
+    #[serde(default)]
+    pub runs_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_root: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub install_dir: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub layout: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub archive_member: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub member_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub payload_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpacked_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_count: Option<u64>,
 }
 
 /// Catalog counts from `catalog.json`; returned by install validation so the
@@ -63,7 +147,7 @@ struct IndexShard {
     titles: Vec<IndexTitle>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct IndexTitle {
     title_id: String,
@@ -83,6 +167,40 @@ struct IndexTitle {
     release_count: u64,
     #[serde(default)]
     packages_file: String,
+    #[serde(default)]
+    art: Option<ArtRef>,
+    #[serde(default)]
+    platform: String,
+    #[serde(default)]
+    runs_on: Vec<String>,
+    #[serde(default)]
+    unverified_on: Vec<String>,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    developer: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    version: String,
+}
+
+impl IndexTitle {
+    fn homebrew(&self) -> Option<HomebrewTitle> {
+        (!self.platform.is_empty()).then(|| HomebrewTitle {
+            platform: self.platform.clone(),
+            runs_on: if self.runs_on.is_empty() {
+                vec![self.platform.clone()]
+            } else {
+                self.runs_on.clone()
+            },
+            unverified_on: self.unverified_on.clone(),
+            category: self.category.clone(),
+            developer: self.developer.clone(),
+            description: self.description.clone(),
+            version: self.version.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -147,6 +265,32 @@ struct PackageRow {
     expected_size: Value,
     #[serde(default)]
     diagnostics: Vec<String>,
+    #[serde(default)]
+    sha256: String,
+    #[serde(default)]
+    content_id: String,
+    #[serde(default)]
+    platform: String,
+    #[serde(default)]
+    format: String,
+    #[serde(default)]
+    archive_root: Option<String>,
+    #[serde(default)]
+    install_dir: String,
+    #[serde(default)]
+    layout: String,
+    #[serde(default)]
+    archive_member: String,
+    #[serde(default)]
+    member_sha256: String,
+    #[serde(default)]
+    member_size: Option<u64>,
+    #[serde(default)]
+    payload_name: String,
+    #[serde(default)]
+    unpacked_size: Option<u64>,
+    #[serde(default)]
+    file_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -171,6 +315,7 @@ pub struct CatalogTitle {
     pub icon: Option<String>,
     #[allow(dead_code)]
     pub release_count: u64,
+    pub homebrew: Option<HomebrewTitle>,
     rank: i32,
 }
 
@@ -197,6 +342,9 @@ pub struct CatalogPackage {
     pub intermediate_url: Option<String>,
     pub expected_size: Option<u64>,
     pub diagnostics: Vec<String>,
+    pub sha256: String,
+    pub content_id: String,
+    pub homebrew: Option<HomebrewPackage>,
 }
 
 pub struct Catalog {
@@ -206,6 +354,8 @@ pub struct Catalog {
     shards: Mutex<Vec<(String, Arc<PackageShard>)>>,
     index_files: Vec<String>,
     package_files: Vec<String>,
+    artwork_files: Vec<String>,
+    platform: Option<PlatformCatalog>,
     pub counts: Counts,
     #[allow(dead_code)]
     pub format: String,
@@ -245,9 +395,27 @@ pub fn load_source(root: &Path) -> Result<Catalog> {
             catalog.format
         ));
     }
-    if catalog.index_files.is_empty() || catalog.package_files.is_empty() {
+    let platform = catalog
+        .platform_catalog
+        .filter(|platform| !platform.titles.is_empty());
+    if platform.is_none()
+        && (catalog.index_files.is_empty() || catalog.package_files.is_empty())
+    {
         return Err("catalog declares no index or package files".into());
     }
+    if catalog.artwork_files.len() > 16
+        || !catalog.artwork_files.iter().all(|file| safe_relative(file))
+    {
+        return Err("catalog declares invalid artwork files".into());
+    }
+    let counts = match &platform {
+        Some(platform) => Counts {
+            titles: platform.titles.len() as u64,
+            ready_titles: platform.titles.len() as u64,
+            releases: platform.packages.values().map(|rows| rows.len() as u64).sum(),
+        },
+        None => catalog.counts,
+    };
     Ok(Catalog {
         root: root.to_path_buf(),
         titles: Vec::new(),
@@ -255,7 +423,9 @@ pub fn load_source(root: &Path) -> Result<Catalog> {
         shards: Mutex::new(Vec::new()),
         index_files: catalog.index_files,
         package_files: catalog.package_files,
-        counts: catalog.counts,
+        artwork_files: catalog.artwork_files,
+        platform,
+        counts,
         format: catalog.format,
     })
 }
@@ -263,7 +433,14 @@ pub fn load_source(root: &Path) -> Result<Catalog> {
 impl Catalog {
     pub fn load(&mut self) -> Result<()> {
         let mut titles = Vec::new();
-        for file in &self.index_files {
+        if let Some(platform) = &self.platform {
+            titles = platform.titles.clone();
+            if titles.len() > MAX_TITLES {
+                return Err("catalog exceeds the title limit".into());
+            }
+            self.attach_art(&mut titles);
+        }
+        for file in self.index_files.iter().filter(|_| self.platform.is_none()) {
             let bytes = self.read_contained(file)?;
             let shard: IndexShard = serde_json::from_slice(&bytes)
                 .map_err(|error| format!("catalog json invalid: {file}: {error}"))?;
@@ -281,14 +458,49 @@ impl Catalog {
         Ok(())
     }
 
+    /// Turn each title's artwork slice into a JPEG data URL. Art is
+    /// decoration: a missing file or a slice that fails its hash is skipped.
+    fn attach_art(&self, titles: &mut [IndexTitle]) {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let mut packs: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+        for title in titles.iter_mut() {
+            let Some(art) = &title.art else { continue };
+            if !self.artwork_files.contains(&art.file) || art.size == 0 || art.size > MAX_ART_SLICE {
+                continue;
+            }
+            let pack = packs
+                .entry(art.file.clone())
+                .or_insert_with(|| self.read_limited(&art.file, MAX_ARTWORK).ok());
+            let Some(pack) = pack else { continue };
+            let (start, end) = (art.offset as usize, (art.offset + art.size) as usize);
+            let Some(slice) = pack.get(start..end) else { continue };
+            let digest: String = Sha256::digest(slice)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            if !art.sha256.is_empty() && !digest.eq_ignore_ascii_case(&art.sha256) {
+                continue;
+            }
+            title.icon = format!(
+                "data:image/jpeg;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(slice)
+            );
+        }
+    }
+
     fn read_contained(&self, file: &str) -> Result<Vec<u8>> {
+        self.read_limited(file, MAX_SHARD)
+    }
+
+    fn read_limited(&self, file: &str, limit: u64) -> Result<Vec<u8>> {
         if !safe_relative(file) {
             return Err(format!("catalog references an invalid path: {file}"));
         }
         let path = self.root.join(file);
         let metadata =
             std::fs::metadata(&path).map_err(|_| format!("catalog file missing: {file}"))?;
-        if metadata.len() > MAX_SHARD {
+        if metadata.len() > limit {
             return Err(format!("catalog file too large: {file}"));
         }
         std::fs::read(path).map_err(|error| error.to_string())
@@ -337,6 +549,7 @@ impl Catalog {
                 region: title.region.clone(),
                 icon: (!title.icon.is_empty()).then(|| title.icon.clone()),
                 release_count: title.release_count,
+                homebrew: title.homebrew(),
                 rank,
             });
         }
@@ -359,15 +572,23 @@ impl Catalog {
             None => return Ok(Vec::new()),
         };
         let title = &self.titles[index];
-        if title.packages_file.is_empty() {
-            return Err("index entry has no packagesFile".into());
-        }
-        let file = title.packages_file.clone();
+        let homebrew = title.homebrew();
         let region = normalize_region(region);
-        let shard = self.shard(&file)?;
-        let rows = match shard.titles.get(&normalized) {
-            Some(rows) => rows,
-            None => return Ok(Vec::new()),
+        let shard;
+        let rows = if let Some(platform) = &self.platform {
+            match platform.packages.get(&normalized) {
+                Some(rows) => rows,
+                None => return Ok(Vec::new()),
+            }
+        } else {
+            if title.packages_file.is_empty() {
+                return Err("index entry has no packagesFile".into());
+            }
+            shard = self.shard(&title.packages_file.clone())?;
+            match shard.titles.get(&normalized) {
+                Some(rows) => rows,
+                None => return Ok(Vec::new()),
+            }
         };
         Ok(rows
             .iter()
@@ -400,6 +621,9 @@ impl Catalog {
                 intermediate_url: row.intermediate_url.clone(),
                 expected_size: json_size(&row.expected_size),
                 diagnostics: row.diagnostics.clone(),
+                sha256: row.sha256.clone(),
+                content_id: row.content_id.clone(),
+                homebrew: homebrew_package(row, homebrew.as_ref()),
                 };
                 expand_volumes(package, &row.volumes)
             })
@@ -429,6 +653,32 @@ impl Catalog {
         cache.truncate(SHARD_CACHE);
         Ok(shard)
     }
+}
+
+fn homebrew_package(row: &PackageRow, title: Option<&HomebrewTitle>) -> Option<HomebrewPackage> {
+    let title = title?;
+    Some(HomebrewPackage {
+        platform: if row.platform.is_empty() {
+            title.platform.clone()
+        } else {
+            row.platform.clone()
+        },
+        format: if row.format.is_empty() {
+            "pkg".into()
+        } else {
+            row.format.to_ascii_lowercase()
+        },
+        runs_on: title.runs_on.clone(),
+        archive_root: row.archive_root.clone(),
+        install_dir: row.install_dir.clone(),
+        layout: row.layout.clone(),
+        archive_member: row.archive_member.clone(),
+        member_sha256: row.member_sha256.clone(),
+        member_size: row.member_size,
+        payload_name: row.payload_name.clone(),
+        unpacked_size: row.unpacked_size,
+        file_count: row.file_count,
+    })
 }
 
 fn json_size(value: &Value) -> Option<u64> {
@@ -561,12 +811,17 @@ pub fn validate_installed(root: &Path, declared: &[(String, u64, String)]) -> Re
     for (path, size, hash) in declared {
         declared_map.insert(path.as_str(), (*size, hash.as_str()));
     }
-    let mut all = catalog.index_files.iter().chain(catalog.package_files.iter());
-    for file in all.by_ref() {
+    let all = catalog
+        .index_files
+        .iter()
+        .chain(catalog.package_files.iter())
+        .map(|file| (file, MAX_SHARD))
+        .chain(catalog.artwork_files.iter().map(|file| (file, MAX_ARTWORK)));
+    for (file, limit) in all {
         let (size, hash) = declared_map
             .get(file.as_str())
             .ok_or_else(|| format!("catalog references an undeclared file: {file}"))?;
-        let bytes = catalog.read_contained(file)?;
+        let bytes = catalog.read_limited(file, limit)?;
         if bytes.len() as u64 != *size {
             return Err(format!("file size mismatch: {file}"));
         }
@@ -585,6 +840,61 @@ pub fn validate_installed(root: &Path, declared: &[(String, u64, String)]) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn platform_catalog_loads_art_tags_and_inline_packages() {
+        use sha2::{Digest, Sha256};
+        let root = std::env::temp_dir().join(format!("sspi-platform-catalog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("artwork")).unwrap();
+        let art = b"\xff\xd8 not really a jpeg \xff\xd9";
+        let mut pack = b"pad".to_vec();
+        pack.extend_from_slice(art);
+        std::fs::write(root.join("artwork/000.bin"), &pack).unwrap();
+        let art_sha: String = Sha256::digest(art).iter().map(|b| format!("{b:02x}")).collect();
+        std::fs::write(root.join("source.json"), r#"{"id":"org.sspi.homebrew"}"#).unwrap();
+        let catalog = serde_json::json!({
+            "format": "embedded-catalog-v1",
+            "artworkFiles": ["artwork/000.bin"],
+            "platformCatalog": {
+                "titles": [
+                    {"titleId": "PPSA99008", "name": "Eden", "kinds": ["base"], "releaseCount": 1, "searchText": "eden",
+                     "platform": "ps5", "category": "Emulators",
+                     "art": {"file": "artwork/000.bin", "offset": 3, "size": art.len(), "sha256": art_sha}},
+                    {"titleId": "SSHB00001", "name": "Bad art", "kinds": ["base"], "releaseCount": 1, "searchText": "bad art",
+                     "platform": "ps4", "runsOn": ["ps4", "ps5"],
+                     "art": {"file": "artwork/000.bin", "offset": 0, "size": 4, "sha256": "00"}}
+                ],
+                "packages": {
+                    "PPSA99008": [{"titleId": "PPSA99008", "kind": "base", "platform": "ps5", "format": "folder", "name": "Eden.zip",
+                        "url": "https://api.github.com/repos/o/r/releases/assets/1", "accessType": "Direct", "hoster": "GitHub",
+                        "version": "1.0", "size": 10, "sha256": "ab", "archiveRoot": "PPSA99008", "installDir": "PPSA99008", "layout": "title"}],
+                    "SSHB00001": [{"titleId": "SSHB00001", "kind": "base", "name": "x.pkg", "url": "https://example.test/x.pkg",
+                        "accessType": "Direct", "contentId": "UP0000-SSHB00001_00-HOMEBREW00000000"}]
+                }
+            }
+        });
+        std::fs::write(root.join("catalog.json"), catalog.to_string()).unwrap();
+        let mut loaded = load_source(&root).unwrap();
+        assert_eq!((loaded.counts.titles, loaded.counts.releases), (2, 2));
+        loaded.load().unwrap();
+        let eden = loaded.search("eden", "", 5);
+        assert_eq!(eden[0].icon.as_deref().map(|icon| icon.starts_with("data:image/jpeg;base64,")), Some(true));
+        let tags = eden[0].homebrew.clone().unwrap();
+        assert_eq!((tags.platform.as_str(), tags.runs_on.clone(), tags.category.as_str()), ("ps5", vec!["ps5".to_string()], "Emulators"));
+        let bad = loaded.search("bad art", "", 5);
+        assert!(bad[0].icon.as_deref().unwrap_or("").is_empty(), "a slice that fails its hash is skipped");
+        assert_eq!(bad[0].homebrew.as_ref().unwrap().runs_on, ["ps4", "ps5"]);
+        let rows = loaded.resolve("PPSA99008", "").unwrap();
+        let folder = rows[0].homebrew.clone().unwrap();
+        assert_eq!((folder.format.as_str(), folder.layout.as_str(), folder.install_dir.as_str()), ("folder", "title", "PPSA99008"));
+        assert_eq!(rows[0].sha256, "ab");
+        let pkg = loaded.resolve("SSHB00001", "").unwrap();
+        let pkg_tags = pkg[0].homebrew.clone().unwrap();
+        assert_eq!((pkg_tags.format.as_str(), pkg_tags.platform.as_str()), ("pkg", "ps4"));
+        assert_eq!(pkg[0].content_id, "UP0000-SSHB00001_00-HOMEBREW00000000");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn embedded_volumes_keep_all_files_and_parent_release_metadata() {
@@ -635,6 +945,7 @@ mod tests {
                     kinds: vec![],
                     release_count: 1,
                     packages_file: "packages/00.json".into(),
+                    ..IndexTitle::default()
                 },
                 IndexTitle {
                     title_id: "CUSA00002".into(),
@@ -645,12 +956,15 @@ mod tests {
                     kinds: vec![],
                     release_count: 2,
                     packages_file: "packages/00.json".into(),
+                    ..IndexTitle::default()
                 },
             ],
             by_id: HashMap::new(),
             shards: Mutex::new(vec![]),
             index_files: vec![],
             package_files: vec![],
+            artwork_files: vec![],
+            platform: None,
             counts: Counts::default(),
             format: String::new(),
         };
@@ -681,6 +995,44 @@ mod tests {
         assert!(!safe_relative("../escape.json"));
         assert!(!safe_relative("/absolute.json"));
         assert!(!safe_relative("dir\\win.json"));
+    }
+
+    /// Checks a built homebrew source, run manually:
+    ///   set SSPI_HOMEBREW_FIXTURE=<extracted .gssource dir>
+    ///   cargo test --lib static_catalog::tests::homebrew_fixture -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn homebrew_fixture_loads_every_title_and_row() {
+        let Some(root) = std::env::var_os("SSPI_HOMEBREW_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let manifest: Value = read_json(&root.join("source.json")).unwrap();
+        let declared: Vec<(String, u64, String)> = manifest["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| (row["path"].as_str().unwrap().into(), row["size"].as_u64().unwrap(), row["sha256"].as_str().unwrap().into()))
+            .collect();
+        let counts = validate_installed(&root, &declared).unwrap();
+        let mut catalog = load_source(&root).unwrap();
+        catalog.load().unwrap();
+        let mut art = 0;
+        let mut rows = 0;
+        for title in catalog.titles.clone() {
+            let hit = catalog.search(&title.title_id, "", 3);
+            let hit = hit.iter().find(|hit| hit.title_id == title.title_id).unwrap();
+            assert!(hit.homebrew.is_some(), "{} has no platform tags", title.title_id);
+            art += usize::from(hit.icon.as_deref().is_some_and(|icon| icon.starts_with("data:image/jpeg")));
+            for row in catalog.resolve(&title.title_id, "").unwrap() {
+                let tags = row.homebrew.unwrap();
+                assert!(matches!(tags.format.as_str(), "pkg" | "folder" | "payload"), "{}", row.url);
+                assert!(!row.sha256.is_empty(), "{} has no checksum", row.url);
+                rows += 1;
+            }
+        }
+        println!("homebrew fixture: titles={} releases={} rows={rows} art={art}", counts.titles, counts.releases);
+        assert_eq!(rows as u64, counts.releases);
     }
 
     /// End-to-end check against a real community catalog, run manually:

@@ -84,7 +84,7 @@ export function DetailsPage(props: Props) {
   const packageDumps = packageTitle(settings, titleId)
   const packageOnly = packageDumps && settings.downloadPackageOnly
   const includeBackports = autoBackports && target === "ps5"
-  const installBlock = packageOnly ? undefined : sendBlockReason(target, { titleId })
+  const installBlock = packageOnly ? undefined : sendBlockReason(target, { titleId, homebrew: game.homebrew })
   const raw = metadata?.game
 
   /* ---------------------------------------------------------------- package rows */
@@ -96,18 +96,18 @@ export function DetailsPage(props: Props) {
   const selectedCandidates = groups.filter(group => checked.includes(group.key)).map(group => groupParts(group, hostByKey[group.key])[0]).filter(Boolean)
   const selection = planPackages(selectedCandidates, selectedMirrors, titleId, { packageDumps, autoBackports: includeBackports, targetFw: settings.targetFw, catalog: packages })
   const included = new Set(selection.added.map(packageReleaseKey))
-  const selectionBlock = packageOnly ? undefined : selectedCandidates.map(candidate => sendBlockReason(target, { titleId, backport: packageKind(candidate) === "backport" })).find(Boolean)
+  const selectionBlock = packageOnly ? undefined : selectedCandidates.map(candidate => sendBlockReason(target, { titleId, backport: packageKind(candidate) === "backport", homebrew: candidate.homebrew })).find(Boolean)
 
   const rowState = (group: PackageGroup): RowState => {
     const parts = groupParts(group, hostByKey[group.key])
     const candidate = parts[0]
     const pairing = packageDumps && group.kind === "backport"
-    const block = packageOnly ? undefined : sendBlockReason(target, { titleId, backport: group.kind === "backport" })
+    const block = packageOnly ? undefined : sendBlockReason(target, { titleId, backport: group.kind === "backport", homebrew: candidate?.homebrew })
     let problem = candidate ? packageProblem(candidate, packages, pairing) : "No package is available."
     if (!problem && isSevenZip(parts)) problem = "7z extraction is unavailable in this build. Choose a RAR or ZIP mirror."
     if (!problem && block) problem = block
     const providers = candidate ? compatibleProviders(candidate, inventories) : []
-    const status = problem || (demo ? "Preview package" : candidate && directCandidate(candidate) ? "Direct link" : providers.length ? `${providers.map(providerName).join(" or ")} supported` : "Host support unknown")
+    const status = problem || (candidate?.homebrew?.format === "payload" ? "Adds to Payloads" : demo ? "Preview package" : candidate && directCandidate(candidate) ? "Direct link" : providers.length ? `${providers.map(providerName).join(" or ")} supported` : "Host support unknown")
     const auto = !!candidate && included.has(packageReleaseKey(candidate))
     return { group, parts, candidate, problem, tone: problem ? "fail" : "good", status, size: partsSize(parts), auto, checked: checked.includes(group.key) || auto }
   }

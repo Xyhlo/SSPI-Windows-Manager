@@ -21,7 +21,7 @@ import { toast } from "./toasts"
 import type { CardSize, CardStyle } from "@/lib/appearance"
 import { consoleAddress, jobTarget, packageTitle, sendBlockReason } from "@/lib/consoles"
 import {
-  activeTransfer, errorContext, groupDownloads, honestPercent, kindLabel, kindOf, phaseDetail, phaseState, stageLabel,
+  activeTransfer, errorContext, groupDownloads, honestPercent, kindLabel, kindOf, phaseDetail, phaseState, slotWait, stageLabel,
   stagingLocations, systemDriveWarning, transferPhases, transferStats, UploadTracker, type DownloadGroup, type UploadState,
 } from "@/lib/downloads"
 import { displayText } from "@/lib/display"
@@ -95,7 +95,7 @@ function barPercent(job: DeliveryJob, upload?: UploadState | null) {
 function barIndeterminate(job: DeliveryJob) {
   const active = activeTransfer(job)
   if (job.stage === "unlocking" && job.providerPreparation) return !job.paused && job.providerPreparation.progress == null
-  if (job.stage === "queued" || /^waiting for another extraction/i.test(job.message || "")) return false
+  if (job.stage === "queued" || slotWait(job.message)) return false
   if (job.stage === "packaging") return !job.paused && active && stageProgress(job.packaging) == null
   if (phaseDetail(job).indeterminate) return !job.paused && active
   return !job.paused && active && !job.bytesTotal && job.progress === 0
@@ -137,6 +137,7 @@ function jobLine(job: DeliveryJob, group: DownloadGroup, downloadDir: string): {
   if (job.stage === "delivered") return { text: `Delivered to SSPI on the ${target}. The PC can't confirm this install.`, cls: "done" }
   if (consoleOwned(job)) return { text: jobTarget(job) === "ps4" ? "Installation is managed on the PS4. Follow it in the PS4's download queue." : "Installation is managed by the PS5. Follow it on the console.", cls: "" }
   if (job.stage === "queued") return { text: job.message ? displayText(job.message) : "Queued. Starts when a download slot is free.", cls: "muted" }
+  if (slotWait(job.message)) return { text: displayText(job.message), cls: "muted" }
   if (job.stage === "packaging") return { text: job.packaging ? packHeadline(job.packaging) : phaseDetail(job).label, cls: "" }
   return { text: displayText(job.message || phaseDetail(job).label), cls: /^waiting/i.test(job.message || "") ? "muted" : "" }
 }
@@ -398,6 +399,7 @@ export function DownloadsPage(props: Props) {
     if (k === "n" || k === "N") { event.preventDefault(); setStatsForNerds(!statsForNerds); return }
     if (!primary || demo) return
     if (k === "p" || k === "P") { if (actions.controls.pause) { event.preventDefault(); void actions.run("pause") } return }
+    if (k === "t" || k === "T") { if (actions.controls.priority) { event.preventDefault(); void actions.run("priority") } return }
     if (k === "r" || k === "R") { if (actions.controls.retry) { event.preventDefault(); void actions.run("retry") } return }
     if (k === "Delete") { event.preventDefault(); if (actions.controls.cancel) cancel(); else if (actions.controls.remove) actions.setRemoving(true); return }
     if (k === "f" || k === "F") { event.preventDefault(); setDrawer("files") }
@@ -500,8 +502,10 @@ function Card({ group, index, open, onToggle, job, setCurrent, drawer, setDrawer
   const moving = activeTransfer(job) && !job.paused
   // One status line: measured bytes, speed and time left while bytes move; otherwise what's happening.
   const summary = moving && stats.speedBps != null && job.stage !== "packaging"
-    ? [stats.label.replace(" / ", " of "), fmtSpeed(stats.speedBps), stats.etaSeconds ? fmtEta(stats.etaSeconds) : ""].filter(Boolean).join(", ")
+    ? [stats.label.replace(" / ", " of "), fmtSpeed(stats.speedBps), stats.etaSeconds ? fmtEta(stats.etaSeconds) : "",
+      job.stage === "downloading" && job.connections ? plural(job.connections, "connection") : ""].filter(Boolean).join(", ")
     : line.text
+  const prioritized = group.jobs.some(item => item.priority && activeTransfer(item))
   const showBar = !finished && !["failed", "cancelled", "monitoring-ended"].includes(job.stage)
   const showPct = showBar && !barIndeterminate(job) && job.stage !== "queued"
   const engine = packEngine(job.packaging)
@@ -534,6 +538,7 @@ function Card({ group, index, open, onToggle, job, setCurrent, drawer, setDrawer
           <span className="dmeta">
             <span className={`dstatus ${status.cls}`}><span className={`dot ${status.dot}`} />{stageLabel(job)}</span>
             <span className="console-badge">{target.toUpperCase()}</span>
+            {prioritized && <span className="dprio" title="Downloads, extracts and packages before the other games"><Icon name="bolt" />Priority</span>}
             {group.jobs.length > 1 && <span className="dcount">{plural(group.jobs.length, "package")}</span>}
           </span>
           <span className={`dline ${moving ? "" : line.cls}`}>{summary}</span>
@@ -587,7 +592,7 @@ function Drawer({ group, job, setCurrent, drawer, setDrawer, statsForNerds, setS
                 {state === "done" ? <Icon name="check" /> : state === "failed" ? <Icon name="x" /> : state === "skipped" ? "–" : n + 1}
               </span>
               <span>{name}</span>
-              <small>{state === "skipped" ? job.localPkg && index === 0 ? "Local file" : "Not needed" : state === "done" ? "Done" : state === "current" ? (job.paused ? "Paused" : name === "Package" && engine ? `Stage ${engine.stageIndex} of ${engine.stageCount}` : detail.indeterminate ? detail.label : "In progress") : state === "failed" ? "Stopped" : ""}</small>
+              <small>{state === "skipped" ? job.localPkg && index === 0 ? "Local file" : "Not needed" : state === "done" ? "Done" : state === "current" ? (job.paused ? "Paused" : slotWait(job.message) ? "Waiting" : name === "Package" && engine ? `Stage ${engine.stageIndex} of ${engine.stageCount}` : name === "Download" && job.stage === "downloading" && job.connections ? plural(job.connections, "connection") : detail.indeterminate ? detail.label : "In progress") : state === "failed" ? "Stopped" : ""}</small>
             </li>
           )
         })}
@@ -635,6 +640,9 @@ function Drawer({ group, job, setCurrent, drawer, setDrawer, statsForNerds, setS
       {statsForNerds && <NerdPanels job={job} settings={settings} />}
       {!demo && (
         <div className="focus-actions">
+          {actions.controls.priority && <button type="button" className={`btn sm ${job.priority ? "prio-on" : ""}`} aria-pressed={!!job.priority} disabled={!!actions.busy}
+            title={job.priority ? "Share bandwidth, extraction and packaging evenly again (T)" : "Download, extract and package this game first (T)"} onClick={() => void actions.run("priority")}>
+            <Icon name="bolt" />{actions.busy === "priority" ? "Saving…" : job.priority ? "Priority" : "Prioritize"}</button>}
           {actions.controls.pause && <button type="button" className="btn sm" disabled={!!actions.busy} onClick={() => void actions.run("pause")}><Icon name={job.paused ? "play" : "pause"} />{job.paused ? "Resume" : "Pause"}</button>}
           {actions.controls.cancel && <button type="button" className={`btn sm ${cancelArmed ? "confirm" : "ghost danger"}`} disabled={!!actions.busy} onClick={onCancel}><Icon name={cancelArmed ? "alert" : "x"} />{actions.busy === "cancel" ? "Cancelling…" : cancelArmed ? "Cancel transfer?" : "Cancel"}</button>}
           {actions.controls.retry && <button type="button" className="btn sm primary" disabled={!!actions.busy} onClick={() => void actions.run("retry")}><Icon name="retry" />{actions.busy === "retry" ? "Retrying…" : `Retry from ${pct}%`}</button>}

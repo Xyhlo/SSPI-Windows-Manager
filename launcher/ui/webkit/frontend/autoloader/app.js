@@ -74,7 +74,6 @@
   }
 
   function uiLog(message, type, deferScroll) {
-    if (window.sspiReport) window.sspiReport(message);
     type = type || 'info';
     var entry = document.createElement('div');
     entry.className = 'line ' + type;
@@ -318,7 +317,6 @@
       var lastText = (last.textContent || '').trim();
       if (lastText && lastText !== consoleMirror.lastText) {
         consoleMirror.lastEntry.textContent = '[' + prefix + '] ' + lastText;
-        if (window.sspiReport) window.sspiReport('[' + prefix + '] ' + lastText);
         consoleMirror.lastText = lastText;
         if (prefix === 'relapse' && consoleSeverity(lastText, last.className || '') !== 'error') {
           advanceRelapseProgress(lastText);
@@ -461,7 +459,7 @@
     if (!progressBar) progressBar = document.getElementById('progressBar');
     if (!progressLabel) progressLabel = document.getElementById('progressLabel');
 
-    uiLog('WebKit Autoloader', 'info');
+    uiLog('WebKit Autoloader by PLK', 'success');
     updateProgress(0, 'Waiting to start...');
 
     window.addEventListener('message', function (event) {

@@ -2,7 +2,8 @@
 #define SSPI_PROCESS_CONTROL_H
 /* Stopping processes from the app (`process-control-v1`), shared by both receivers.
    Only two kinds can be stopped: running apps and games, and payloads started by
-   elfldr.elf. System processes, the loader and the receiver itself are refused. */
+   a known loader or identified independent services. Shared GoldHEN threads,
+   system processes, loaders and the receiver itself are refused. */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

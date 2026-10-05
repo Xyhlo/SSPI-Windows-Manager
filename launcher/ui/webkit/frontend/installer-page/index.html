@@ -331,7 +331,6 @@
     <h1>WebKit Autoloader Installer</h1>
     <p id="status">Loading&hellip;</p>
     <p id="detail"></p>
-    <a id="openManager" href="http://127.0.0.1:8084/" hidden>Open Payload Manager</a>
 
     <div id="choiceContainer" hidden>
       <div class="choice-grid">
@@ -368,8 +367,6 @@
         return { str: m[1], num: parseFloat(m[1]) };
       }
 
-      var detectedConsole = detectFirmware();
-      if (document.getElementById('consoleTag')) document.getElementById('consoleTag').textContent = detectedConsole ? 'PS5 / ' + detectedConsole.str : 'Browser / firmware unavailable';
       var statusEl = document.getElementById('status');
       var detailEl = document.getElementById('detail');
       var choiceContainer = document.getElementById('choiceContainer');
@@ -379,6 +376,7 @@
       var progressBar = document.getElementById('progressBar');
       var progressPct = document.getElementById('progressPct');
       var completed = false;
+      var cacheReady = false;
       var isDownloading = false;
       var isRetry = false;
       var currentUid = '';
@@ -429,12 +427,6 @@
       var hasRelapse = isRelapseSupported(fwNum, fwStr);
       var isUnsupported = fwNum > 0 && !hasUmtx2 && !hasPoops && !hasRelapse;
       var isDualSupported = (hasPoops && hasRelapse) || (!fw && !fwParam);
-      // Match the autoloader's firmware default without stopping automatic setup.
-      if (!chosenExploit && fwNum > 0 && !isUnsupported) {
-        var savedExploit = '';
-        try { savedExploit = localStorage.getItem('wkal_exploit') || ''; } catch (e) { }
-        chosenExploit = hasUmtx2 ? 'umtx2' : hasPoops && savedExploit === 'poops' ? 'poops' : hasRelapse ? 'relapse' : 'poops';
-      }
       var needsChoice = isDualSupported && !chosenExploit;
 
       function chooseExploit(choice) {
@@ -448,6 +440,14 @@
         var p = new URLSearchParams(window.location.search);
         p.set('exploit', choice);
         window.location.replace(window.location.pathname + '?' + p.toString());
+      }
+
+      // The native server strips the manifest until it receives the selection.
+      // Choosing only in JavaScript cannot start AppCache on that first page.
+      if (!needsChoice && !isUnsupported && chosenExploit &&
+          !document.documentElement.getAttribute('manifest')) {
+        chooseExploit(chosenExploit);
+        return;
       }
 
       if (btnPoops) {
@@ -524,52 +524,16 @@
       }
 
       function setInstalled() {
-        statusEl.textContent = 'SSPI installed';
-        statusEl.style.color = '#97c4a2';
+        statusEl.textContent = 'Installed successfully';
+        statusEl.style.color = '#22c55e';
         progressBar.style.background = '-webkit-linear-gradient(90deg, #16a34a 0%, #22c55e 100%)';
-        detailEl.textContent = 'Setup saved. Starting Payload Manager and checking the ELF loader…';
+        detailEl.textContent = 'The WebKit Autoloader shortcut is now on your PS5 homescreen. You can close this page.';
         setProgress(100);
-        checkServices();
-      }
-
-      function checkServices() {
-        var deadline = Date.now() + 60000;
-        var managerReady = false;
-        var loaderState = 'unknown';
-        function read(path, done) {
-          var xhr = new XMLHttpRequest();
-          xhr.open('GET', 'http://127.0.0.1:8084' + path, true);
-          xhr.timeout = 2000;
-          xhr.onload = function () {
-            var value = null;
-            try { if (xhr.status === 200) value = JSON.parse(xhr.responseText); } catch (e) { }
-            done(value);
-          };
-          xhr.onerror = xhr.ontimeout = function () { done(null); };
-          xhr.send();
-        }
-        function poll() {
-          read('/sspi/identity', function (identity) {
-            managerReady = !!identity && identity.edition === 'sspi-payload-manager' && identity.protocol === 1 && identity.ready === true;
-            read('/sspi/loader-status', function (loader) {
-              loaderState = loader && loader.ready === true && loader.state === 'listening' && loader.port === 9021 && loader.scope === 'network' && loader.evidence === 'listener-and-process' ? 'listening' : 'unknown';
-              if (managerReady) {
-                statusEl.textContent = 'Payload Manager ready';
-                if (document.getElementById('openManager')) document.getElementById('openManager').hidden = false;
-                detailEl.textContent = loaderState === 'listening' ? 'ELF loader is listening on port 9021. Payload Manager opens according to your saved browser setting.' : 'Payload Manager is running. ELF loader status is unavailable. Your saved browser setting is preserved.';
-              }
-              if (managerReady && loaderState === 'listening') return;
-              if (Date.now() < deadline) { setTimeout(poll, 1500); return; }
-              if (!managerReady) detailEl.textContent = 'SSPI is saved on your home screen. Service readiness could not be confirmed; check the activity before retrying.';
-            });
-          });
-        }
-        poll();
       }
 
       function setFailed() {
         statusEl.textContent = 'Install failed';
-        statusEl.style.color = '#e8a2a5';
+        statusEl.style.color = '#ef4444';
         progressBar.style.background = '-webkit-linear-gradient(90deg, #dc2626 0%, #ef4444 100%)';
         detailEl.textContent = 'The app could not be installed. Close this page and re-run the installer.';
       }
@@ -603,6 +567,7 @@
               if (hdrUid) currentUid = hdrUid;
               probeOk = true;
               setCaching();
+              if (cacheReady) maybeInstall();
             } else {
               goToAutoloader();
             }
@@ -640,7 +605,7 @@
       }
 
       function maybeInstall() {
-        if (completed) {
+        if (completed || !cacheReady || !probeOk) {
           return;
         }
         completed = true;
@@ -778,7 +743,7 @@
 
         if (isUnsupported) {
           statusEl.textContent = 'Unsupported firmware';
-          statusEl.style.color = '#e8a2a5';
+          statusEl.style.color = '#ef4444';
           var fwDisplay = fw ? ('Firmware ' + fw.str) : (fwParam ? ('Firmware ' + fwParam) : 'Your firmware');
           detailEl.textContent = fwDisplay + ' is not supported (supported: 1.00–5.50 via umtx2, 7.00–12.00 via poops, 7.00–13.60 via relapse).';
           return;
@@ -802,6 +767,12 @@
           } catch (e) { }
         }
 
+        if (!window.applicationCache) {
+          progressWrap.hidden = true;
+          statusEl.textContent = 'Offline cache unavailable';
+          detailEl.textContent = 'This browser did not provide its offline cache. Close the page and reopen setup from the console browser.';
+          return;
+        }
         probeServer();
 
         /* The shortcut is created only once the AppCache is current, so the
@@ -813,13 +784,6 @@
             return;
           }
           if (!probeOk) {
-            clearInterval(waitTimer);
-            goToAutoloader();
-            return;
-          }
-          if (!window.applicationCache) {
-            clearInterval(waitTimer);
-            maybeInstall();
             return;
           }
           if (window.applicationCache.status === window.applicationCache.UPDATEREADY) {
@@ -827,6 +791,7 @@
             try {
               window.applicationCache.swapCache();
             } catch (e) { }
+            cacheReady = true;
             maybeInstall();
             return;
           }
@@ -871,16 +836,19 @@
         });
         window.applicationCache.addEventListener('cached', function() {
           isDownloading = false;
+          cacheReady = true;
           appendLog("[AppCache] Caching complete.");
           maybeInstall();
         });
         window.applicationCache.addEventListener('noupdate', function() {
           isDownloading = false;
+          cacheReady = true;
           appendLog("[AppCache] No update needed.");
           maybeInstall();
         });
         window.applicationCache.addEventListener('updateready', function () {
           isDownloading = false;
+          cacheReady = true;
           if (window.applicationCache.status === window.applicationCache.UPDATEREADY) {
             try {
               window.applicationCache.swapCache();

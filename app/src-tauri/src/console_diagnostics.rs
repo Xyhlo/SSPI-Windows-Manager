@@ -76,6 +76,13 @@ pub(super) async fn console_processes(target: String, host: String, port: u16) -
     process_list(&exchange(&mut socket, 0x6a, &[], 512 * 1024).await?)
 }
 
+pub(super) async fn running_process_names(target: &str, host: &str, port: u16) -> Result<Vec<String>, String> {
+    let list = tokio::time::timeout(Duration::from_secs(5),console_processes(target.into(), host.into(), port)).await
+        .map_err(|_| "The receiver process check timed out.".to_string())??;
+    if list.truncated || list.processes.is_empty() { return Err("The receiver did not return a complete process list.".into()); }
+    Ok(list.processes.into_iter().filter(|p| p.state != "zombie").map(|p| p.name).collect())
+}
+
 /* ------------------------------------------------------------------ stopping processes */
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

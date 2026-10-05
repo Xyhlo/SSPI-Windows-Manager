@@ -32,8 +32,29 @@ const loadImage = (url: string) => new Promise<HTMLImageElement>((resolve, rejec
 })
 
 /* ---------------------------------------------------------------- shells */
-type Shell = { img: HTMLImageElement; w: number; h: number; bbox: [number, number, number, number] }
+type Shell = { img: CanvasImageSource; w: number; h: number; bbox: [number, number, number, number] }
 const shells: Partial<Record<Platform, Promise<Shell>>> = {}
+
+/** A drawn stand-in for a shell image that didn't load, so a case never renders without its frame and cover. */
+function paintedShell(platform: Platform): Shell {
+  const w = 1080, h = 1379
+  const canvas = makeCanvas(w, h), ctx = canvas.getContext("2d")!
+  const band = Math.round(h * (platform === "ps4" ? 0.145 : 0.1485))
+  ctx.fillStyle = "#1f4fd1"
+  ctx.fillRect(0, 0, w, h)
+  ctx.clearRect(Math.round(w * 0.0215), band, Math.round(w * 0.9355), h - band - Math.round(h * 0.037))
+  if (platform === "ps4") {
+    const gradient = ctx.createLinearGradient(0, 0, w, 0)
+    gradient.addColorStop(0, "#003b8e"); gradient.addColorStop(1, "#0070cc")
+    ctx.fillStyle = gradient
+  } else ctx.fillStyle = "#fafbff"
+  ctx.fillRect(Math.round(w * 0.0215), Math.round(h * 0.03), Math.round(w * 0.9355), band - Math.round(h * 0.03))
+  ctx.fillStyle = platform === "ps4" ? "#ffffff" : "#111111"
+  ctx.font = `600 ${Math.round(band * 0.42)}px Arial, sans-serif`
+  ctx.textBaseline = "middle"
+  ctx.fillText(platform === "ps4" ? "PS4" : "PS5", Math.round(w * 0.07), Math.round((band + h * 0.03) / 2))
+  return { img: canvas, w, h, bbox: [0, 0, 1, 1] }
+}
 
 /** Loads a shell once and measures its opaque bounds, so the case front maps exactly onto the geometry. */
 function shell(platform: Platform): Promise<Shell> {
@@ -57,7 +78,10 @@ function shell(platform: Platform): Promise<Shell> {
       }
       if (x1 > x0 && y1 > y0) bbox = [x0 / w, y0 / h, Math.min(1, (x1 + 2) / w), Math.min(1, (y1 + 2) / h)]
     }
-    return { img, w, h, bbox }
+    return { img, w, h, bbox } as Shell
+  }).catch(error => {
+    console.warn(`The ${platform.toUpperCase()} case shell didn't load; drawing a plain one.`, error)
+    return paintedShell(platform)
   })
   return shells[platform]!
 }

@@ -739,33 +739,31 @@ pub fn package_magic(header: &[u8]) -> bool {
     header.starts_with(&[0x7f,b'C',b'N',b'T']) || header.starts_with(&[0x7f,b'F',b'I',b'H'])
 }
 
-/// Locate the packaging engine. Order:
-///   1. explicit path in Settings
-///   2. SSPI_FPKG_ENGINE environment variable
-///   3. `resources/fpkg/fpkg-cli.exe` next to the application
-///   4. PATH lookup of `fpkg-cli`
-pub fn locate_engine(explicit: Option<&str>) -> Option<PathBuf> {
-    if let Some(value) = explicit.filter(|v| !v.trim().is_empty()) {
-        let path = PathBuf::from(value);
-        if path.is_file() {
-            return Some(path);
+fn bundled_engine() -> Option<PathBuf> {
+    let path = std::env::current_exe().ok()?.parent()?.join("resources/fpkg/fpkg-cli.exe");
+    path.is_file().then_some(path)
+}
+pub fn validate_engine_setting(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() { return Ok(String::new()); }
+    #[cfg(debug_assertions)] { return Ok(value.to_owned()); }
+    #[cfg(not(debug_assertions))] {
+        let selected = std::fs::canonicalize(value).map_err(|_| "Only the bundled FPKG engine is supported")?;
+        if bundled_engine().and_then(|p| p.canonicalize().ok()).as_ref() != Some(&selected) { return Err("Only the bundled FPKG engine is supported".into()); }
+        Ok(String::new())
+    }
+}
+/// Release builds execute only the bundled engine; debug builds permit explicit overrides.
+pub fn locate_engine(_explicit: Option<&str>) -> Option<PathBuf> {
+    #[cfg(debug_assertions)] {
+        if let Some(value) = _explicit.filter(|v| !v.trim().is_empty()) {
+            let path = PathBuf::from(value); return path.is_file().then_some(path);
+        }
+        if let Ok(value) = std::env::var("SSPI_FPKG_ENGINE") {
+            let path = PathBuf::from(value); return path.is_file().then_some(path);
         }
     }
-    if let Ok(value) = std::env::var("SSPI_FPKG_ENGINE") {
-        let path = PathBuf::from(value);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("resources").join("fpkg").join("fpkg-cli.exe");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    which("fpkg-cli")
+    bundled_engine()
 }
 
 /// The .NET runtime shipped beside the application in `resources/dotnet`, when it is complete.
@@ -868,7 +866,7 @@ pub async fn build(
     on_line: impl Fn(String) + Send + 'static,
     on_progress: impl Fn(f64, String) + Send + 'static,
 ) -> Result<BuildOutcome, String> {
-    build_controlled(engine, options, on_line, on_progress, || Ok(false)).await
+    build_controlled(engine, options, on_line, on_progress, || Ok(false), || false).await
 }
 
 pub async fn build_controlled(
@@ -876,6 +874,7 @@ pub async fn build_controlled(
     on_line: impl Fn(String) + Send + 'static,
     on_progress: impl Fn(f64, String) + Send + 'static,
     paused: impl Fn() -> Result<bool, String> + Send + 'static,
+    yielding: impl Fn() -> bool + Send + 'static,
 ) -> Result<BuildOutcome, String> {
     let source = options.source.clone();
     let pre = tokio::task::spawn_blocking(move || preflight(&source, 2_000_000)).await.map_err(redact)??;
@@ -898,7 +897,7 @@ pub async fn build_controlled(
             .join(format!("sspi-fpkg-{}", uuid::Uuid::new_v4()))
     });
     let temp = TempWorkspace::create(&temp_dir)?;
-    let outcome = build_in_temp(engine, options, &temp.dir, on_line, on_progress, paused).await;
+    let outcome = build_in_temp(engine, options, &temp.dir, on_line, on_progress, paused, yielding).await;
     let cleanup = temp.cleanup().map_err(|error| format!("Cannot clean packaging temp {}: {error}", temp.dir.display()));
     match (outcome, cleanup) {
         (Ok(outcome), Ok(())) => Ok(outcome),
@@ -961,11 +960,25 @@ fn build_command(engine: &Path, options: &PackageOptions, temp: &Path) -> Result
     Ok(cmd)
 }
 
+fn set_engine_priority(child: &tokio::process::Child, below_normal: bool) {
+    #[cfg(windows)]
+    if let Some(handle) = child.raw_handle() {
+        #[link(name = "kernel32")]
+        extern "system" { fn SetPriorityClass(process: *mut std::ffi::c_void, class: u32) -> i32; }
+        const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        unsafe { SetPriorityClass(handle as _, if below_normal { BELOW_NORMAL_PRIORITY_CLASS } else { NORMAL_PRIORITY_CLASS }); }
+    }
+    #[cfg(not(windows))]
+    let _ = (child, below_normal);
+}
+
 async fn build_in_temp(
     engine: &Path, options: &PackageOptions, temp: &Path,
     on_line: impl Fn(String) + Send + 'static,
     on_progress: impl Fn(f64, String) + Send + 'static,
     paused: impl Fn() -> Result<bool, String> + Send + 'static,
+    yielding: impl Fn() -> bool + Send + 'static,
 ) -> Result<BuildOutcome, String> {
     guard_build_space(&options.output_dir, temp)?;
     let mut cmd = build_command(engine, options, temp)?;
@@ -985,6 +998,7 @@ async fn build_in_temp(
 
     let mut input = child.stdin.take().ok_or("Engine control input unavailable")?;
     let mut last_paused = false;
+    let mut below_normal: Option<(bool, Instant)> = None;
     let mut control_tick = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut log_tail: Vec<String> = Vec::new();
     let mut output_path: Option<PathBuf> = None;
@@ -1005,6 +1019,13 @@ async fn build_in_temp(
                     use tokio::io::AsyncWriteExt;
                     let _ = input.write_all(if pause { b"pause\n" } else { b"resume\n" }).await;
                     last_paused = pause;
+                }
+                // While another game has priority the engine runs below normal. Reapplied every
+                // few seconds, because the engine sets its own priority class as it starts.
+                let low = yielding();
+                if below_normal.is_none_or(|(applied, at)| applied != low || (low && at.elapsed() >= std::time::Duration::from_secs(3))) {
+                    set_engine_priority(&child, low);
+                    below_normal = Some((low, Instant::now()));
                 }
             },
             line = out_lines.next_line(), if !out_done => {

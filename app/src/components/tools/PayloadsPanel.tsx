@@ -23,7 +23,7 @@ import { AutostartDialog, Glyph } from "./payloads/AutostartDialog"
 import { CatalogDialog } from "./payloads/CatalogDialog"
 import "./payloads/payloads.css"
 
-type Props = { target: ConsoleKind; settings: Settings; demo: boolean; onReceiverLoaded: (target: ConsoleKind) => void }
+type Props = { target: ConsoleKind; settings: Settings; demo: boolean; onReceiverLoaded: (target: ConsoleKind) => void; onOpenProcesses: () => void }
 type SessionSend = { id: string; name: string; at: number; result: string; ok: boolean; totalMs?: number; bytesPerSecond?: number | null }
 type Traced = PayloadSendResult & { at: number }
 
@@ -38,7 +38,7 @@ const when = (at: number) => {
   return day.toDateString() === today.toDateString() ? time(at) : day.toLocaleDateString([], { month: "short", day: "numeric" })
 }
 
-export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Props) {
+export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onOpenProcesses }: Props) {
   const endpoint = loaderEndpoint(settings, target)
   const name = target.toUpperCase()
   const loader = target === "ps4" ? "GoldHEN BinLoader" : "ELF loader"
@@ -46,6 +46,10 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState("")
   const [busy, setBusy] = useState("")
+  // The Start button shows a check for a moment after a successful send instead of a toast.
+  const [started, setStarted] = useState("")
+  const startedTimer = useRef<number>()
+  useEffect(() => () => window.clearTimeout(startedTimer.current), [])
   const [selected, setSelected] = useState("")
   const [editing, setEditing] = useState("")
   const [removing, setRemoving] = useState("")
@@ -89,7 +93,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
     .sort((a, b) => Number(b.builtin) - Number(a.builtin) || a.name.localeCompare(b.name)), [payloads, target])
   const current = shown.find(payload => payload.id === selected) || shown[0]
   const auto = autostart.find(item => item.target === target)
-  const order = (status?: AutostartStatus): AutostartOrder => (status?.steps || []).map(step => ({ payloadId: step.payloadId, delayMs: step.delayMs }))
+  const order = (status?: AutostartStatus): AutostartOrder => (status?.steps || []).map(step => ({ payloadId: step.payloadId, delayMs: step.delayMs, processName: step.processName || "" }))
   const autoAction = async (action: () => Promise<AutostartStatus[]>, failure: string) => {
     autoGeneration.current += 1; setAutoBusy(true)
     try { setAutostartState(await action()) }
@@ -126,12 +130,15 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
   const send = async (entry: PayloadEntry) => {
     if (!endpoint.host || busy) return
     setBusy(entry.id)
+    setStarted("")
     try {
       const result = await sendPayload({ id: entry.id, target, host: endpoint.host, port: endpoint.port, demo })
       setPayloads(old => old.map(item => item.id === entry.id ? { ...item, lastSentAt: Date.now(), lastResult: result.message } : item))
       setHistory(old => [{ id: `${entry.id}-${Date.now()}`, name: entry.name, at: Date.now(), result: result.message, ok: true, totalMs: result.totalMs, bytesPerSecond: result.bytesPerSecond }, ...old].slice(0, 20))
       setTraces(old => ({ ...old, [entry.id]: { ...result, at: Date.now() } }))
-      toast({ tone: "success", title: entry.builtin && result.verified ? `${name} receiver is running` : `${entry.name} sent`, text: result.message })
+      window.clearTimeout(startedTimer.current)
+      setStarted(entry.id)
+      startedTimer.current = window.setTimeout(() => setStarted(""), 2500)
       if (entry.builtin && result.verified) onReceiverLoaded(target)
     } catch (reason) {
       const message = errorText(reason)
@@ -183,6 +190,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
           <span className={`dot ${endpoint.host ? "good" : ""}`} />
           <span>{endpoint.host ? <>Sends to <strong>{endpoint.host}:{endpoint.port}</strong>, the {loader} on your {name}</> : <>Add your {name}'s address in Options, Consoles to send payloads</>}</span>
         </p>
+        <button type="button" className="btn sm ghost" title="Running payloads, with Stop and End, in System" onClick={onOpenProcesses}><Icon name="cpu" />Processes</button>
         {target === "ps5" && <button type="button" className="btn sm ghost" onClick={() => setCatalogOpen(true)}><Icon name="globe" />Catalog</button>}
         <button type="button" className="btn sm" disabled={busy === "add"} onClick={() => void choose()}>{busy === "add" ? <span className="spinner" /> : <Icon name="plus" />}Add payloads</button>
         <input ref={fileRef} type="file" accept=".elf,.bin" multiple hidden onChange={(event: ChangeEvent<HTMLInputElement>) => { const files = Array.from(event.currentTarget.files || []); event.currentTarget.value = ""; void addPaths(files.map(file => `preview/${file.name}`)) }} />
@@ -216,7 +224,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
                   <span className="pl-tools" onClick={event => event.stopPropagation()}>
                     <ActionMenu label={`Actions for ${entry.name}`} trigger={{ icon: "more", title: "More actions" }} actions={[
                       autostartPlace(entry.id) > 0
-                        ? { id: "autostart", label: "Edit autostart order", description: `Sent ${ordinal(autostartPlace(entry.id))} when SSPI starts`, icon: "bolt", disabled: autoBusy, onSelect: () => setOrdering({}) }
+                        ? { id: "autostart", label: "Edit autostart order", description: `Sent ${ordinal(autostartPlace(entry.id))} after a confirmed console wake`, icon: "bolt", disabled: autoBusy, onSelect: () => setOrdering({}) }
                         : { id: "autostart", label: "Add to autostart", description: "Choose where it goes in the order", icon: "bolt", disabled: autoBusy || !launcherAvailable(demo), onSelect: () => setOrdering({ adding: entry.id }) },
                       ...(!entry.builtin ? [
                         { id: "rename", label: "Rename", description: "Name, console and notes", icon: "pencil" as const, disabled: !!busy, onSelect: () => { setRemoving(""); setEditing(editing === entry.id ? "" : entry.id) } },
@@ -226,7 +234,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded }: Prop
                   </span>
                 )}
                 <button type="button" className={`btn sm ${isCurrent ? "primary" : ""} pl-send`} disabled={!endpoint.host || !!busy} onClick={event => { event.stopPropagation(); setSelected(entry.id); void send(entry) }}>
-                  {busy === entry.id ? <span className="spinner" /> : <Icon name="send" />}{busy === entry.id ? "Sending" : "Send"}
+                  {busy === entry.id ? <><span className="spinner" />Starting</> : started === entry.id ? <><Icon name="check" />Started</> : <><Icon name="play" />Start</>}
                 </button>
               </div>
               <Collapse open={editing === entry.id} className="pl-drawer">

@@ -1,7 +1,7 @@
 {
   "name": "game-search",
   "private": true,
-  "version": "2.24.4",
+  "version": "2.25.3",
   "type": "module",
   "scripts": {
     "dev": "vite",

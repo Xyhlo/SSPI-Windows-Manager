@@ -38,7 +38,7 @@ pub(super) struct WebStatus {
     logs: Vec<String>,
 }
 impl Default for WebStatus {
-    fn default() -> Self { Self { running: false, phase: "idle".into(), version: String::new(), available_version: None, address: String::new(), url: String::new(), message: "Ready to host SSPI Web Launcher.".into(), requests: 0, last_client: None, last_request_at: None, dns_requests: 0, last_dns_client: None, last_dns_at: None, last_dns_name: None, console_client: None, console_last_seen_at: None, manager_ready: false, manager_session: None, manager_checked_at: None, logs: Vec::new() } }
+    fn default() -> Self { Self { running: false, phase: "idle".into(), version: String::new(), available_version: None, address: String::new(), url: String::new(), message: "Ready to host WebKit Autoloader.".into(), requests: 0, last_client: None, last_request_at: None, dns_requests: 0, last_dns_client: None, last_dns_at: None, last_dns_name: None, console_client: None, console_last_seen_at: None, manager_ready: false, manager_session: None, manager_checked_at: None, logs: Vec::new() } }
 }
 struct Assets {
     version: String,
@@ -130,7 +130,7 @@ fn parse_assets(bytes: &[u8]) -> Result<Assets, String> {
 fn ensure_assets(_app: &AppHandle) -> Result<Arc<Assets>, String> {
     let mut svc = service().lock().unwrap_or_else(|p| p.into_inner());
     if let Some(assets) = &svc.assets { return Ok(assets.clone()); }
-    // Older versions downloaded stock hosts here. Always use the SSPI edition
+    // Older versions downloaded stock hosts here. Always use the bundled launcher
     // that was verified and installed together with this Windows application.
     let assets = parse_assets(BUNDLED_HOST)?;
     svc.status.version = assets.version.clone();
@@ -189,7 +189,7 @@ async fn bind_host(ip: Ipv4Addr, assets: Arc<Assets>) -> Result<WebStatus, Strin
     svc.status.console_client = None; svc.status.console_last_seen_at = None; svc.status.logs.clear();
     svc.status.manager_ready = false; svc.status.manager_session = None; svc.status.manager_checked_at = None;
     svc.status.message = "DNS and HTTPS are ready. Open User's Guide on your PS5.".into();
-    log(&mut svc.status, format!("Hosting SSPI {} on DNS 53 / HTTPS 443 at {ip}.", assets.version));
+    log(&mut svc.status, format!("Hosting WebKit Autoloader {} on DNS 53 / HTTPS 443 at {ip}.", assets.version));
     svc.tasks.push(tokio::spawn(dns_loop(dns, ip, receiver.clone(), generation)));
     svc.tasks.push(tokio::spawn(manager_loop(receiver.clone(), generation)));
     svc.tasks.push(tokio::spawn(http_loop(https, Some(TlsAcceptor::from(assets.tls.clone())), assets.clone(), receiver.clone(), generation)));
@@ -241,7 +241,7 @@ fn record(generation: u64, peer: SocketAddr, method: &str, path: &str, code: u16
 }
 
 fn dns_question(query: &[u8]) -> Option<(String, u16, usize)> {
-    if query.len() < 12 || query.len() > 512 || query[2] & 0x80 != 0 || query[4..6] != [0, 1] { return None; }
+    if query.len() < 12 || query.len() > 4096 || query[2] & 0x80 != 0 || query[4..6] != [0, 1] { return None; }
     let mut cursor = 12; let mut labels = Vec::new();
     loop {
         let length = *query.get(cursor)? as usize; cursor += 1;
@@ -274,8 +274,34 @@ fn record_dns_status(status: &mut WebStatus, peer: SocketAddr, name: &str, kind:
     if status.phase == "ready" { status.phase = "dns".into(); status.message = "DNS traffic received. Open User's Guide on the console to reach SSPI.".into(); }
     if !repeated { log(status, format!("{client} DNS {name} ({kind}) → {}", if name == DNS_NAME { "SSPI host" } else { "blocked" })); }
 }
+#[cfg(windows)]
+fn disable_udp_connreset(socket: &UdpSocket) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn WSAIoctl(socket: usize, code: u32, input: *const std::ffi::c_void, input_len: u32,
+            output: *mut std::ffi::c_void, output_len: u32, returned: *mut u32,
+            overlapped: *mut std::ffi::c_void, completion: *mut std::ffi::c_void) -> i32;
+        fn WSAGetLastError() -> i32;
+    }
+    let disabled = 0u32; let mut returned = 0u32;
+    unsafe {
+        if WSAIoctl(socket.as_raw_socket() as usize, 0x9800000c, &disabled as *const _ as _, 4,
+            std::ptr::null_mut(), 0, &mut returned, std::ptr::null_mut(), std::ptr::null_mut()) != 0 {
+            return Err(std::io::Error::from_raw_os_error(WSAGetLastError()));
+        }
+    }
+    Ok(())
+}
+fn connection_error(generation: u64, message: String) {
+    eprintln!("{message}");
+    let mut svc = service().lock().unwrap_or_else(|p| p.into_inner());
+    if svc.generation == generation { log(&mut svc.status, message); }
+}
 async fn dns_loop(socket: UdpSocket, ip: Ipv4Addr, mut stop: watch::Receiver<bool>, generation: u64) {
-    let mut buffer = [0u8; 512];
+    #[cfg(windows)]
+    if let Err(error) = disable_udp_connreset(&socket) { eprintln!("DNS UDP reset reporting: {error}"); }
+    let mut buffer = [0u8; 4096];
     loop {
         tokio::select! {
             _ = stop.changed() => break,
@@ -288,7 +314,7 @@ async fn dns_loop(socket: UdpSocket, ip: Ipv4Addr, mut stop: watch::Receiver<boo
                         }
                     }
                 },
-                Err(error) => { server_failed(generation, format!("DNS host stopped: {error}")); break; }
+                Err(error) => { connection_error(generation, format!("DNS receive failed: {error}")); tokio::time::sleep(Duration::from_millis(100)).await; }
             }
         }
     }
@@ -317,7 +343,7 @@ async fn http_loop(listener: TcpListener, tls: Option<TlsAcceptor>, assets: Arc<
                         }).await;
                     });
                 }
-                Err(error) => { server_failed(generation, format!("Web host stopped: {error}")); break; }
+                Err(error) => { connection_error(generation, format!("Web connection failed: {error}")); tokio::time::sleep(Duration::from_millis(100)).await; }
             }
         }
     }
@@ -480,19 +506,25 @@ mod tests {
         assert_eq!(route("/launch/app.js", &assets).2.as_ref(), assets.files["app.js"].as_ref());
         assert_eq!(route("/app/payloads/payload.elf", &assets).2.as_ref(), assets.files["payloads/payload.elf"].as_ref());
         assert_eq!(route("/document/en/ps5/index.html", &assets).0, 200);
-        assert!(assets.version.contains("-sspi-"));
+        assert!(assets.version.contains("-elfldr-"));
         assert_eq!(route("/", &assets).2.as_ref(), assets.files["index.html"].as_ref());
         assert_eq!(route("/document/en/ps5/style.css", &assets).2.as_ref(), assets.files["style.css"].as_ref());
-        assert_eq!(route("/document/en/ps5/sspi-logo.png", &assets).2.as_ref(), assets.files["sspi-logo.png"].as_ref());
+        assert_eq!(route("/document/en/ps5/logo.svg", &assets).2.as_ref(), assets.files["logo.svg"].as_ref());
+        assert!(!assets.files.contains_key("sspi-logo.png"));
+        assert!(!assets.files.contains_key("entry.js"));
         let page = String::from_utf8_lossy(&assets.files["index.html"]);
-        assert!(page.contains("WebKit Autoloader") && page.contains("src=\"entry.js\""));
+        assert!(page.contains("WebKit Autoloader") && page.contains("src=\"app.js\""));
         assert!(!page.contains("sspi-header"));
         let build: serde_json::Value = serde_json::from_slice(&assets.files["sspi-build.json"]).unwrap();
-        assert_eq!(build["edition"], "sspi");
+        assert_eq!(build["edition"], "webkit-autoloader-elfldr");
+        assert!(build["payloads"].get("pldmgr.elf").is_none());
+        assert!(build["payloads"].get("autoloader.elf").is_none());
         assert_eq!(build["version"], assets.version);
         assert_eq!(build["payloads"]["installer.elf"], crate::sha256_hex(&assets.files["payloads/payload.elf"]));
         assert_eq!(build["payloads"]["elfldr-ps5.elf"], crate::sha256_hex(&assets.files["shared/elfldr-ps5.elf"]));
         assert_eq!(build["sourcesSha256"], crate::sha256_hex(&assets.files["sspi-launcher-sources.zip"]));
+        let sources = zip::ZipArchive::new(Cursor::new(&assets.files["sspi-launcher-sources.zip"])).unwrap();
+        assert!(!sources.file_names().any(|name| name.contains("payload-manager/") || name.contains("unified/")));
     }
     #[test]
     fn traversal_and_ambiguous_paths_cannot_access_files() {

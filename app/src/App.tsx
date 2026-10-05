@@ -16,7 +16,8 @@ import { toast } from "@/components/toasts"
 import { demoGames, demoJobs, demoMetadata, demoPackages } from "@/data/demo"
 import { applyAccentVars, loadAppearance, saveAppearance, type Appearance } from "@/lib/appearance"
 import { notificationCase } from "@/lib/covers"
-import { packageTitle, sendBlockReason } from "@/lib/consoles"
+import { consoleLabel, packageTitle, rememberHomebrew, sendBlockReason } from "@/lib/consoles"
+import { addHomebrewPayload } from "@/lib/launcher-api"
 import { listConsoleLibrary, probeConsoles, sendPayload } from "@/lib/console-api"
 import { hasCapability, loaderEndpoint, receiverEndpoint } from "@/lib/console-helpers"
 import type { ConsoleProbe } from "@/lib/console-types"
@@ -518,6 +519,7 @@ export default function App() {
       } else {
         if (!inTauri()) throw new Error("Search needs the SSPI app. Open the offline preview to explore the interface.")
         games = await invokeCmd<Game[]>("search_games", { query: term })
+        rememberHomebrew(games)
         putCapped(searchCache.current, term.toLowerCase(), { games })
       }
       if (gen !== searchGen.current) return
@@ -680,13 +682,33 @@ export default function App() {
   const deliver = useCallback(async (game: Game, candidates: PackageCandidate[], available: PackageCandidate[], options: { provider?: string; from?: HTMLElement | null; target?: ConsoleKind } = {}): Promise<string[]> => {
     if (deliveryPending.current) return []
     const target = options.target || settings.activeConsole
+    // Homebrew payload rows are added to Payloads instead of being sent as a package.
+    let payloadKeys: string[] = []
+    const payloads = candidates.filter(candidate => candidate.homebrew?.format === "payload")
+    if (payloads.length) {
+      const added: string[] = []
+      for (const row of payloads) {
+        if (!row.homebrew) continue
+        if (demo) { toast({ tone: "info", title: "Offline preview", text: `${row.label} would be added to Payloads.` }); continue }
+        try {
+          await addHomebrewPayload({ url: row.url, name: game.name, version: row.version, sha256: row.expectedSha256, homebrew: row.homebrew })
+          added.push(packageReleaseKey(row))
+          toast({ tone: "success", title: "Added to Payloads", text: `${game.name}${row.version ? ` ${row.version}` : ""} is in Tools > Payloads. Send it to the ${consoleLabel(row.homebrew.platform)} from there.` })
+        } catch (error) {
+          toast({ tone: "warning", title: "Payload not added", text: errorText(error) })
+        }
+      }
+      candidates = candidates.filter(candidate => candidate.homebrew?.format !== "payload")
+      if (!candidates.length) return added
+      payloadKeys = added
+    }
     const packageDumps = packageTitle(settings, game.titleId)
     const packageOnly = packageDumps && settings.downloadPackageOnly
     const plan = planPackages(candidates, available, game.titleId, { packageDumps, autoBackports: autoBackports && target === "ps5", targetFw: settings.targetFw, catalog: available })
     if (plan.problems.length) { toast({ tone: "warning", title: "Check your selection", text: plan.problems.join(" ") }); return [] }
-    if (!packageOnly && target === "ps4") {
-      const reason = plan.items.map(item => sendBlockReason(target, { titleId: game.titleId, backport: !!item.backport || packageKind(item.base) === "backport" })).find(Boolean)
-      if (reason) { toast({ tone: "warning", title: "This can't go to a PS4", text: reason }); return [] }
+    if (!packageOnly) {
+      const reason = plan.items.map(item => sendBlockReason(target, { titleId: game.titleId, backport: !!item.backport || packageKind(item.base) === "backport", homebrew: item.base.homebrew })).find(Boolean)
+      if (reason) { toast({ tone: "warning", title: `This can't go to a ${target === "ps4" ? "PS4" : "PS5"}`, text: reason }); return [] }
     }
     if (!plan.items.length) return []
     const labels = plan.items.map(item => item.backport ? `${item.base.label} with backport` : item.base.label)
@@ -731,7 +753,7 @@ export default function App() {
         })
       }
       if (failures.length) toast({ tone: "error", title: successful.length ? "Some selections didn't start" : "The transfer didn't start", text: failures.slice(0, 3).join(" ") })
-      return successful
+      return [...payloadKeys, ...successful]
     } finally {
       deliveryPending.current = false
       setDeliveryBusy(false)

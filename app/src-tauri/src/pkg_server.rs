@@ -210,12 +210,21 @@ pub(super) fn activity(token: &str) -> Option<Activity> {
     })
 }
 
+struct ServerLifetime;
+impl Drop for ServerLifetime {
+    fn drop(&mut self) { lock_state().port = None; }
+}
 async fn accept_loop(listener: TcpListener) {
+    let _lifetime = ServerLifetime;
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (mut stream, _) = match listener.accept().await {
             Ok(connection) => connection,
-            Err(_) => break,
+            Err(error) => {
+                eprintln!("PKG server connection failed: {error}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
         };
         match permits.clone().try_acquire_owned() {
             Ok(permit) => {

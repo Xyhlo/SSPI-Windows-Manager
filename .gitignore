@@ -17,8 +17,11 @@
 !/app/src-tauri/src/fpkg.rs
 !/app/src-tauri/src/fpkg_doctor.rs
 !/app/src-tauri/src/ampr_index.rs
+!/app/src-tauri/src/ampr_pack.rs
 !/app/src-tauri/src/job_store.rs
 !/app/src-tauri/src/rar_control.rs
+!/app/src-tauri/src/scheduler.rs
+!/app/src-tauri/src/downloader.rs
 !/app/src-tauri/src/storage.rs
 !/app/src-tauri/src/static_catalog.rs
 !/app/src-tauri/src/lib.rs
@@ -206,6 +209,7 @@
 !/app/src/components/tools/system/crash-timeline.css
 !/app/src/lib/crash-timeline.ts
 !/app/src-tauri/src/payload_autostart.rs
+!/app/src-tauri/src/payload_wake.rs
 !/app/src-tauri/src/web_launcher.rs
 !/app/src-tauri/src/payload_catalog.rs
 !/app/src/lib/launcher-api.ts

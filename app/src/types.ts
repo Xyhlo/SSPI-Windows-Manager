@@ -51,6 +51,12 @@ export type Settings = {
   lizardPacking?: boolean
   /** What adding game folders does: ask, or start one batch action right away. */
   folderAction?: FolderAction
+  /** Games that download at once; the priority game downloads beside them. */
+  downloadSlots?: number
+  /** Games that extract at once. */
+  extractionSlots?: number
+  /** Connections shared by every download, split by the bytes each has left. */
+  downloadConnections?: number
 }
 export type FolderAction = "ask" | "package" | "package-send" | "send"
 export type PackageFormat = "fpkg" | "exfat"
@@ -65,6 +71,35 @@ export type Game = {
   sourceId?: string
   sourceName?: string
   sourceVersion?: string
+  /** Console tags of a title from the global homebrew source. */
+  homebrew?: HomebrewTitle
+}
+
+/** `platform` is the console the app was built for; `runsOn` lists every console that can install it. */
+export type HomebrewTitle = {
+  platform: ConsoleKind
+  runsOn: ConsoleKind[]
+  unverifiedOn?: ConsoleKind[]
+  category?: string
+  developer?: string
+  description?: string
+  version?: string
+}
+
+/** pkg: a PS4 package. folder: a ZIP copied to /data/homebrew/<installDir>. payload: an ELF added to Payloads. */
+export type HomebrewPackage = {
+  platform: ConsoleKind
+  format: "pkg" | "folder" | "payload"
+  runsOn: ConsoleKind[]
+  archiveRoot?: string
+  installDir?: string
+  layout?: "title" | "websrv"
+  archiveMember?: string
+  memberSha256?: string
+  memberSize?: number
+  payloadName?: string
+  unpackedSize?: number
+  fileCount?: number
 }
 
 export type PackageSource = {
@@ -117,6 +152,7 @@ export type PackageCandidate = {
   intermediateUrl?: string
   referer?: string
   diagnostics?: string[]
+  homebrew?: HomebrewPackage
 }
 
 export type DeliveryRequest = {
@@ -197,6 +233,10 @@ export type DeliveryJob = {
   createdAt?: number
   stageHistory?: string[]
   paused?: boolean
+  /** The one game that downloads, extracts and packages first. */
+  priority?: boolean
+  /** Connections a segmented download is using now (download events only). */
+  connections?: number | null
   stage: string
   progress: number
   bytesDone?: number
@@ -329,6 +369,9 @@ export const blankSettings: Settings = {
   packageFormat: "fpkg",
   lizardPacking: false,
   folderAction: "ask",
+  downloadSlots: 4,
+  extractionSlots: 2,
+  downloadConnections: 16,
 }
 
 export const isActiveJob = (stage: string) =>

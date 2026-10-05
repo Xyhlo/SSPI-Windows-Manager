@@ -28,12 +28,13 @@ export function useJobActions({ job, demo, onPause, onCancel, onRetry }: JobActi
     catch (error) { setError(String(error)) }
     finally { setBusy(null) }
   }
-  const run = async (action: "pause" | "cancel" | "retry") => {
+  const run = async (action: "pause" | "cancel" | "retry" | "priority") => {
     if (busy || demo) return
     setBusy(action); setError("")
     try {
       if (action === "pause") await onPause(job.jobId, !job.paused)
       else if (action === "cancel") await onCancel(job.jobId)
+      else if (action === "priority") await invoke("set_job_priority", { jobId: job.jobId, priority: !job.priority })
       else await onRetry(job.jobId)
     } catch (error) { setError(String(error)) }
     finally { setBusy(null) }
@@ -48,6 +49,7 @@ export function useJobActions({ job, demo, onPause, onCancel, onRetry }: JobActi
       menu.current = await Menu.new({ items: [
         { text: "Retry from retained files", enabled: controls.retry && !busy, action: () => { void run("retry") } },
         { text: job.paused ? "Resume" : "Pause", enabled: controls.pause && !busy, action: () => { void run("pause") } },
+        { text: job.priority ? "Remove priority" : "Prioritize", enabled: controls.priority && !busy, action: () => { void run("priority") } },
         { text: "Cancel", enabled: controls.cancel && !busy, action: () => { void run("cancel") } },
         { item: "Separator" },
         { text: "Remove entry…", enabled: controls.remove && !busy, action: () => setRemoving(true) },

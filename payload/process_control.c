@@ -14,6 +14,15 @@ static const PcProcess *find(const PcProcess *table, size_t count, int pid) {
     return NULL;
 }
 static bool named(const PcProcess *p, const char *name) { return p && !strcmp(p->name, name); }
+static bool payload_loader(const PcProcess *p) {
+    return named(p,"elfldr.elf") || named(p,"elfldr") || named(p,"binloader.elf") || named(p,"binloader");
+}
+static bool standalone_service(const PcProcess *p) {
+    if (!p || p->ppid!=1 || p->app_id || p->title[0]) return false;
+    const char *names[]={"ftpsrv.elf","ftpsrv","klogsrv.elf","klogsrv","ps4debug.elf","ps4debug","ps4debug.bin"};
+    for (size_t i=0;i<sizeof(names)/sizeof(*names);i++) if (named(p,names[i])) return true;
+    return false;
+}
 static bool game_title(const char *t) {
     if ((strncmp(t, "CUSA", 4) && strncmp(t, "PPSA", 4)) || strlen(t) != 9) return false;
     for (int i = 4; i < 9; i++) if (t[i] < '0' || t[i] > '9') return false;
@@ -26,23 +35,26 @@ PcKind pc_classify(const PcProcess *table, size_t count, int self, int pid, char
     if (!p) { say(reason, cap, "That process is no longer running."); return PC_NONE; }
     if (pid <= 1) { say(reason, cap, "System processes can't be stopped from here."); return PC_NONE; }
     if (pid == self) { say(reason, cap, "This is the SSPI receiver. Use Stop in Tools > Payloads instead."); return PC_NONE; }
-    if (named(p, "elfldr.elf")) { say(reason, cap, "The ELF loader is kept running: without it no payload can be loaded until the console is jailbroken again."); return PC_NONE; }
+    if (payload_loader(p) || named(p,"GoldHEN") || named(p,"goldhen")) { say(reason, cap, "The ELF loader and GoldHEN are kept running so payloads can still be started."); return PC_NONE; }
     const PcProcess *parent = find(table, count, p->ppid);
     /* Apps and games: a CUSA/PPSA title, or eboot.bin started by the system's app launcher. */
     if (game_title(p->title) || (named(p, "eboot.bin") && (named(parent, "SceSysCore.elf") || named(parent, "SceSysCore")) && !(p->title[0] && !game_title(p->title)))) return PC_APP;
     /* Payloads: anything elfldr.elf started (directly or through another payload). */
     const PcProcess *at = parent;
     for (int hops = 0; at && hops < 32; hops++) {
-        if (named(at, "elfldr.elf")) return PC_PAYLOAD;
+        if (payload_loader(at)) return PC_PAYLOAD;
         if (at->pid <= 1 || at->ppid == at->pid) break;
         at = find(table, count, at->ppid);
     }
+    // PS4 does not expose auth IDs. Recognize only known independent services;
+    // never stop the process hosting a GoldHEN BIN thread.
+    if (standalone_service(p)) return PC_PAYLOAD;
     /* A payload whose launcher exited lives on under PID 1 with elfldr's auth ID. */
     if (p->ppid == 1 && p->authid) {
         for (size_t i = 0; i < count; i++)
             if (named(&table[i], "elfldr.elf") && table[i].authid == p->authid) return PC_PAYLOAD;
     }
-    say(reason, cap, "System processes can't be stopped from here. Only apps, games and payloads loaded through elfldr can.");
+    say(reason, cap, "System processes can't be stopped from here. Only apps, games and identified separate payload processes can.");
     return PC_NONE;
 }
 
