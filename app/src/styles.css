@@ -1017,6 +1017,8 @@ body.booting .app > * { opacity: 0; }
 .pl-editor .field { height: 32px; width: 220px; }
 .pl-editor .pl-notes { flex: 1; min-width: 160px; }
 .pl-log { flex: none; margin-top: 6px; }
+/* A long session log scrolls on its own instead of squeezing the payload list. */
+.pl-log .tech-body { max-height: 132px; overflow-y: auto; scrollbar-width: thin; }
 .pl-log .tech-body p { display: flex; gap: 12px; }
 .pl-log .tech-body p span { color: var(--faint); font-variant-numeric: tabular-nums; }
 .pl-log .tech-body p.fail { color: var(--fail-ink); }

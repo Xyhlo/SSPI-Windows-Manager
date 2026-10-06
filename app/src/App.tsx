@@ -121,7 +121,8 @@ export default function App() {
   const [jobs, setJobs] = useState<DeliveryJob[]>([])
   const [systemDrive, setSystemDrive] = useState<string | null>(null)
   const [sources, setSources] = useState<PackageSource[]>([])
-  const [demo, setDemo] = useState(false)
+  // Simulated consoles and catalogs exist only for the browser dev server; the app never offers them.
+  const [demo, setDemo] = useState(() => import.meta.env.DEV && !inTauri())
   const [appearance, setAppearanceState] = useState<Appearance>(loadAppearance)
   const [consoleState, setConsoleState] = useState<Record<ConsoleKind, ConsoleState>>({ ps5: "unknown", ps4: "unknown" })
   const [probes, setProbes] = useState<Partial<Record<ConsoleKind, ConsoleProbe>>>({})
@@ -517,7 +518,7 @@ export default function App() {
         const needle = term.toLowerCase()
         games = demoGames.filter(game => `${game.name} ${game.titleId}`.toLowerCase().includes(needle))
       } else {
-        if (!inTauri()) throw new Error("Search needs the SSPI app. Open the offline preview to explore the interface.")
+        if (!inTauri()) throw new Error("Search needs the SSPI app.")
         games = await invokeCmd<Game[]>("search_games", { query: term })
         rememberHomebrew(games)
         putCapped(searchCache.current, term.toLowerCase(), { games })
@@ -766,18 +767,7 @@ export default function App() {
     void deliver(gameFromEntry(entry), [candidate], available, { from: anchor, target: entry.target })
   }, [pendingUpdates, deliver])
 
-  /* ---------------------------------------------------------------- offline preview */
-  const enterDemo = useCallback(() => {
-    setDemo(true)
-    setResults([])
-    setSearchState("idle")
-    setQuery("")
-    setSnapshots({})
-    setLibrarySync({})
-    syncedOnce.current.clear()
-    setPage("library")
-    toast({ tone: "info", title: "Offline preview", text: "Consoles, titles, packages and transfers are simulated. Nothing is sent to a console until you leave the preview in Options." })
-  }, [])
+  /* ---------------------------------------------------------------- offline preview (dev server only) */
   const leaveDemo = useCallback(() => {
     setDemo(false)
     setResults([])
@@ -833,7 +823,7 @@ export default function App() {
               onConsole={target => void changeConsole(target)} onRefresh={target => void syncConsoleLibrary(target)}
               onOpenGame={(entry, el) => openGame(gameFromEntry(entry), { el, kind: "thumb" })}
               onIconChanged={onIconChanged} onLoadReceiver={target => void loadReceiver(target)} loadingReceiver={loadingReceiver}
-              onOptions={setOptions} onSearch={() => go("search")} onDemo={enterDemo} tintOn={appearance.gameTint}
+              onOptions={setOptions} onSearch={() => go("search")} tintOn={appearance.gameTint}
             />
           )}
           {page === "search" && (
@@ -843,7 +833,7 @@ export default function App() {
               results={results} region={region} setRegion={setRegion} resultsScroll={resultsScroll}
               library={library} recent={recent} onClearRecent={() => { setRecent([]); try { window.localStorage.removeItem(RECENT_KEY) } catch { /* ignore */ } }}
               onOpen={openGame} sources={sources} demo={demo} activeConsole={settings.activeConsole}
-              onOptions={setOptions} onDemo={enterDemo}
+              onOptions={setOptions}
             />
           )}
           {page === "details" && selected && (

@@ -35,7 +35,6 @@ type Props = {
   demo: boolean
   activeConsole: ConsoleKind
   onOptions: (tab: OptionsTab) => void
-  onDemo: () => void
 }
 
 const highlight = (text: string, q: string) => {
@@ -110,7 +109,7 @@ export function SearchPage(props: Props) {
 
 /* ---------------------------------------------------------------- before searching */
 function Idle(props: Props) {
-  const { recent, onOpen, sources, demo, onOptions, onDemo, onClearRecent, activeConsole } = props
+  const { recent, onOpen, sources, demo, onOptions, onClearRecent, activeConsole } = props
   const enabled = sources.filter(source => source.enabled)
   const noSources = !demo && enabled.length === 0
   const owned = new Set(props.library.map(entry => entry.titleId.toUpperCase()))
@@ -142,10 +141,7 @@ function Idle(props: Props) {
         <h3>Search your package sources</h3>
         <p>Type a game's name or its PS4, PS5, or PS2 classic title ID. Results show every region and source, and the packages each one offers.</p>
         <p className="si-sources">{demo ? "Offline preview catalog" : enabled.length ? `Searching ${enabled.map(source => `${displayText(source.name)} ${source.version}`).join(", ")}` : "No package source is enabled yet."}</p>
-        <div className="row">
-          {noSources && <button type="button" className="btn primary sm" onClick={() => onOptions("sources")}><Icon name="plus" />Add a package source</button>}
-          {!demo && <button type="button" className="btn ghost sm" onClick={onDemo}>Try the offline preview</button>}
-        </div>
+        {noSources && <div className="row"><button type="button" className="btn primary sm" onClick={() => onOptions("sources")}><Icon name="plus" />Add a package source</button></div>}
       </div>
     </section>
   )
@@ -153,7 +149,7 @@ function Idle(props: Props) {
 
 /* ---------------------------------------------------------------- results */
 function Results(props: Props & { focusFirst: MutableRefObject<boolean> }) {
-  const { searchState, searchError, searchedFor, results, region, setRegion, resultsScroll, library, onOpen, sources, demo, onOptions, onDemo, onSearch, focusFirst } = props
+  const { searchState, searchError, searchedFor, results, region, setRegion, resultsScroll, library, onOpen, sources, demo, onOptions, onSearch, focusFirst } = props
   const listRef = useRef<HTMLDivElement>(null)
   const grouped = useMemo(() => groupedGames(results), [results])
   const regions = useMemo(() => ["All regions", ...[...new Set(grouped.flatMap(game => (game.variants || [game]).map(v => v.region).filter(Boolean)))].sort()], [grouped])
@@ -187,7 +183,6 @@ function Results(props: Props & { focusFirst: MutableRefObject<boolean> }) {
             <div className="row">
               <button type="button" className="btn sm" onClick={() => onSearch(searchedFor)}><Icon name="retry" />Try again</button>
               {!demo && <button type="button" className="btn ghost sm" onClick={() => onOptions("sources")}>Package sources</button>}
-              {!demo && <button type="button" className="btn ghost sm" onClick={onDemo}>Offline preview</button>}
             </div>
           </div>
         </div>

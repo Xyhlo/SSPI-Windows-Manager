@@ -53,7 +53,6 @@ type Props = {
   loadingReceiver: ConsoleKind | null
   onOptions: (tab: OptionsTab) => void
   onSearch: () => void
-  onDemo: () => void
   tintOn: boolean
 }
 
@@ -335,7 +334,6 @@ export function LibraryPage(props: Props) {
             <p>Add your {name}'s address in Options, then load the SSPI receiver on it. Your library lists everything installed, and you can change each game's cover from here.</p>
             <div className="row">
               <button type="button" className="btn primary sm" onClick={() => props.onOptions("consoles")}><Icon name="monitor" />Console settings</button>
-              <button type="button" className="btn ghost sm" onClick={props.onDemo}>Try the offline preview</button>
             </div>
           </div>
         </section>

@@ -237,13 +237,13 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onOpen
                   {busy === entry.id ? <><span className="spinner" />Starting</> : started === entry.id ? <><Icon name="check" />Started</> : <><Icon name="play" />Start</>}
                 </button>
               </div>
-              <Collapse open={editing === entry.id} className="pl-drawer">
+              <Collapse open={editing === entry.id} className="pl-drawer" reveal>
                 <PayloadEditor entry={entry} busy={busy === entry.id} onCancel={() => setEditing("")} onSave={draft => void save(entry, draft)} />
               </Collapse>
               <Collapse open={isCurrent && editing !== entry.id && removing !== entry.id} className="pl-drawer">
                 <details className="pl-inspect"><summary>Payload details{traces[entry.id] ? " and last send" : ""}</summary><p className="pl-tech">{techLine(entry)}</p><PayloadSheet entry={entry} destination={endpoint.host ? `${endpoint.host}:${endpoint.port}` : ""} loader={loader} trace={traces[entry.id]} sending={busy === entry.id} /></details>
               </Collapse>
-              <Collapse open={removing === entry.id} className="pl-drawer">
+              <Collapse open={removing === entry.id} className="pl-drawer" reveal>
                 <div className="remove-confirm">
                   <span>Remove {entry.name}? The copy the app keeps is deleted; the original file stays where it was.</span>
                   <button type="button" className="btn sm danger" disabled={busy === entry.id} onClick={() => void remove(entry)}>{busy === entry.id ? "Removing" : "Remove"}</button>

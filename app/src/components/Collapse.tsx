@@ -1,19 +1,22 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react"
 import { SPRINGS, motionOK, settle } from "@/lib/motion"
 
-/** Opens and closes its content with a height animation, keeping it mounted until the close finishes. */
-export function Collapse({ open, children, className }: { open: boolean; children: ReactNode; className?: string }) {
+/** Opens and closes its content with a height animation, keeping it mounted until the close finishes.
+ *  With `reveal`, an opened drawer scrolls into view inside its scrolling list. */
+export function Collapse({ open, children, className, reveal }: { open: boolean; children: ReactNode; className?: string; reveal?: boolean }) {
   const ref = useRef<HTMLDivElement>(null)
   const [mounted, setMounted] = useState(open)
   const first = useRef(true)
   useLayoutEffect(() => { if (open) setMounted(true) }, [open])
   useLayoutEffect(() => {
-    const el = ref.current
-    if (!el) return
+    // Only content that is open on the very first render skips the animation; a drawer that starts closed animates every time.
     const skip = first.current
     first.current = false
+    const el = ref.current
+    if (!el) return
     if (skip && open) return
-    if (!motionOK()) { if (!open) setMounted(false); return }
+    const show = () => { if (open && reveal) el.scrollIntoView({ block: "nearest", behavior: motionOK() ? "smooth" : "auto" }) }
+    if (!motionOK()) { if (!open) setMounted(false); show(); return }
     const height = (el.firstElementChild as HTMLElement | null)?.offsetHeight || 0
     el.style.overflow = "hidden"
     const animation = el.animate(open
@@ -26,6 +29,7 @@ export function Collapse({ open, children, className }: { open: boolean; childre
       animation.cancel()
       el.style.overflow = ""
       if (!open) setMounted(false)
+      show()
     })
     return () => { live = false }
   }, [open, mounted])
