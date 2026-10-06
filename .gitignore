@@ -1,18 +1,11 @@
 # Public source allowlist. Unlisted local files must stay private.
 *
 !*/
-!/.cargo/config.toml
 !/.gitattributes
 !/.gitignore
 !/LICENSE
 !/README.md
 !/THIRD_PARTY_NOTICES.md
-!/app/index.html
-!/app/package-lock.json
-!/app/package.json
-!/app/src-tauri/Cargo.lock
-!/app/src-tauri/Cargo.toml
-!/app/src-tauri/capabilities/default.json
 !/app/src-tauri/src/archives.rs
 !/app/src-tauri/src/fpkg.rs
 !/app/src-tauri/src/fpkg_doctor.rs
@@ -29,7 +22,6 @@
 !/app/src-tauri/src/package_sources.rs
 !/app/src-tauri/src/package_sources/local_recipe.rs
 !/app/src-tauri/src/package_sources/community.rs
-!/app/src-tauri/tauri.conf.json
 !/app/src/App.tsx
 !/app/src/components/JobActions.tsx
 !/app/src/components/ui/badge.tsx
@@ -50,11 +42,8 @@
 !/app/src/styles.css
 !/app/src/types.ts
 !/app/src/vite-env.d.ts
-!/app/tsconfig.json
-!/app/tsconfig.node.json
 !/docs/banner.png
 !/payload/main.c
-!/product.json
 
 /SDK/
 /Build-Output/
@@ -82,7 +71,6 @@
 !/app/src-tauri/src/ps4_receiver.rs
 !/app/src-tauri/src/pkg_meta.rs
 !/app/src-tauri/src/pkg_server.rs
-!/app/src-tauri/windows-app-manifest.xml
 !/payload-ps4/install.c
 !/payload-ps4/install.h
 !/payload-ps4/io.c
@@ -115,7 +103,6 @@
 !/payload-ps4/imports.inc
 !/payload-ps4/imports.S
 !/payload-ps4/start.S
-!/payload-ps4/payload.ld
 
 # SSPI Windows 2.20 interface
 !/app/src/components/CaseAnchor.tsx
@@ -263,10 +250,8 @@
 !/launcher/ui/payload-manager/frontend/src/utils/controllerFocus.js
 !/launcher/ui/payload-manager/frontend/src/utils/payloadLibrary.js
 !/launcher/ui/payload-manager/frontend/src/utils/serviceStatus.js
-!/launcher/ui/payload-manager/frontend/tailwind.config.js
 !/launcher/ui/webkit/frontend/autoloader/app.js
 !/launcher/ui/webkit/frontend/autoloader/entry.js
-!/launcher/ui/webkit/assets/param.json.template
 !/launcher/ui/webkit/frontend/autoloader/index.html
 !/launcher/ui/webkit/frontend/autoloader/style.css
 !/launcher/ui/webkit/frontend/installer-page/index.html

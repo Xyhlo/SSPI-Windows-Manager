@@ -27,7 +27,7 @@ See `docs/PKG_PROVENANCE.json` for the machine-readable inventory and hashes.
 
 ### suppaftp — Rust FTP client
 
-- Version: 12.1.0, pinned in `app/src-tauri/Cargo.lock`.
+- Version: 12.1.0, pinned in the application's Cargo lockfile.
 - Source: https://github.com/veeso/suppaftp (crates.io package `suppaftp`).
 - Author: Christian Visintin, as stated in the crate metadata.
 - License: MIT OR Apache-2.0, verified from the crate metadata and README.
@@ -140,7 +140,7 @@ or add verified provenance and notices.
 
 ### image — Rust artwork decoding and normalization
 
-- Version: 0.25.10, pinned in `app/src-tauri/Cargo.lock`.
+- Version: 0.25.10, pinned in the application's Cargo lockfile.
 - Source: https://github.com/image-rs/image (crates.io package `image`).
 - License: MIT OR Apache-2.0. Upstream license texts are `LICENSE-MIT`
   and `LICENSE-APACHE` in the source repository.
@@ -150,7 +150,7 @@ or add verified provenance and notices.
 
 ### three.js — interface rendering
 
-- Version: 0.170.0, pinned in `app/package-lock.json`.
+- Version: 0.170.0, pinned in the application's npm lockfile.
 - Source: https://github.com/mrdoob/three.js (npm package `three`).
 - Copyright © 2010-2024 three.js authors. License: MIT, verified from the
   package's `LICENSE` file.
@@ -160,7 +160,7 @@ or add verified provenance and notices.
 
 ### Geist — interface typeface
 
-- Version: 5.3.0 of `@fontsource-variable/geist`, pinned in `app/package-lock.json`.
+- Version: 5.3.0 of `@fontsource-variable/geist`, pinned in the application's npm lockfile.
 - Source: https://github.com/vercel/geist-font, packaged by Fontsource.
 - Copyright 2024 The Geist Project Authors. License: SIL Open Font License 1.1,
   verified from the package's `LICENSE` file.
@@ -170,14 +170,14 @@ or add verified provenance and notices.
 
 ### lz4 / lz4-sys — Lizard asset-pack compression
 
-- Versions: lz4 1.28.1 and lz4-sys 1.11.1+lz4-1.10.0, pinned in `app/src-tauri/Cargo.lock`.
+- Versions: lz4 1.28.1 and lz4-sys 1.11.1+lz4-1.10.0, pinned in the application's Cargo lockfile.
 - Source: https://github.com/10xGenomics/lz4-rs. License: MIT (crate metadata and `LICENSE`).
 - lz4-sys compiles the bundled LZ4 library 1.10.0, Copyright (c) 2011-2020 Yann Collet,
   BSD 2-Clause (`liblz4/LICENSE`). Ship both notices with binary distributions.
 
 ### crc32fast — Lizard block checksums
 
-- Version: 1.5.1, pinned in `app/src-tauri/Cargo.lock`.
+- Version: 1.5.1, pinned in the application's Cargo lockfile.
 - Source: https://github.com/srijs/rust-crc32fast. License: MIT OR Apache-2.0 (crate metadata).
 
 ### ampr_emu — Lizard pack format and pack-capable runtime

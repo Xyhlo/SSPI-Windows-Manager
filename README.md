@@ -4,9 +4,9 @@
 
 SSPI Windows Manager is the desktop side of SSPI. It finds packages, downloads and extracts them on your PC, turns extracted PS5 dumps into installable packages, and installs the result on a PS5 or PS4 through a small receiver payload. It also looks after the console itself: installed titles and covers, payloads, system information, kernel logs, processes and game icons.
 
-**Version 2.25.3 · Windows 10 and 11 (x64) · Tauri 2, React and Rust**
+**Version 2.25.5 · Windows 10 and 11 (x64) · Tauri 2, React and Rust**
 
-This is a private development repository with a selected source export. Starting with 2.24.4, the only uploaded release asset is the Windows installer on the [Releases](../../releases) page.
+> **Source preview.** This repository is a preview of selected SSPI Windows Manager source, published for reference. It does not contain the build configuration, package manifests, lockfiles or build scripts, so it cannot be built into the application. To use SSPI, download the installer from the [Releases](../../releases) page.
 
 ## What it does
 
@@ -58,8 +58,6 @@ This is a private development repository with a selected source export. Starting
 5. Choose a download folder with plenty of free space in **Options → Downloads**. For large games, a drive other than the Windows drive is best.
 6. Search for a title, or import your own files from **Downloads**.
 
-Want to look around first? Choose **Try the offline preview** on the welcome screen. It simulates consoles, titles and transfers, and nothing is sent anywhere.
-
 ## Troubleshooting
 
 | Problem | What to check |
@@ -82,29 +80,13 @@ This is development software, tested by a small group. A host build that passes 
 
 The Windows installer contains the application, packaging engines, Lizard runtime, PS4 theme packager and the .NET runtime they run on. It installs for your Windows user and adds SSPI to the Start menu. Settings and jobs are kept when you install a newer version over it.
 
-Starting with 2.24.4, releases upload only the `-setup.exe`: no portable archive, updater archive or console application packages. GitHub's automatically generated source archives contain only the selected source export and are not installation packages.
+Releases upload only the `-setup.exe`: no portable archive, updater archive or console application packages. GitHub's automatically generated source archives contain only the source preview. They are not installation packages and cannot be built.
 
-The in-app updater uses the Amptis development feed. GitHub installers and the in-app update feed are published separately.
+The in-app updater uses a separate development feed. GitHub installers and in-app updates are published separately.
 
-## Building from source
+## Source preview
 
-**A plain clone is not a complete build.** This repository holds selected production source, manifests, lockfiles and license notices. The complete build environment is maintained locally by the project owner.
-
-The Tauri build entry point (`app/src-tauri/build.rs`) and Vite build configuration (`app/vite.config.ts`) are excluded from the current export and kept in the local workspace. Internal build scripts, SDKs, packaging-engine inputs, runtime artwork and tests are also local-only. GitHub's source archives cannot reproduce the distributed installer without these inputs. Removing files from the current export does not remove them from older Git history.
-
-The full build environment needs:
-
-- Windows with Node.js and npm, and the Rust MSVC toolchain.
-- Visual Studio C++ build tools, WebView2, LLVM, Python 3 and the .NET 9 SDK.
-- The PS5 payload SDK and the OpenOrbis PS4 toolchain under the ignored `SDK/` folder.
-
-From the product folder in the complete workspace:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
-```
-
-The script builds both receivers, the packaging engine and the application, then writes a timestamped distribution to `../Build-Output/Windows Manager/`.
+This repository is a read-only preview of the application's production source:
 
 | Path | Contents |
 | --- | --- |
@@ -112,6 +94,9 @@ The script builds both receivers, the packaging engine and the application, then
 | [`app/src-tauri/src/`](app/src-tauri/src) | Rust back end: sources, downloads, archives, packaging, delivery and console tools |
 | [`payload/`](payload) | PS5 receiver |
 | [`payload-ps4/`](payload-ps4) | PS4 receiver |
+| [`launcher/`](launcher) | Console launcher and payload manager |
+
+The preview leaves out everything needed to compile it: the npm and Cargo manifests and lockfiles, the Tauri, Vite and TypeScript configuration, linker scripts, build scripts, SDKs, packaging-engine inputs, runtime artwork and tests. Releases are built by the project owner.
 
 ## License
 
