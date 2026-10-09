@@ -115,7 +115,7 @@ pub(super) async fn run(app: &AppHandle, settings: &Settings, http: &Client, job
         let existing = if is_overlay { &combined.overlay } else { &combined.base };
         if existing.as_ref().is_some_and(|path| path.is_dir()) {
             if let Some(retained_archive) = if is_overlay { combined.backport_archive.as_ref() } else { combined.base_archive.as_ref() } {
-                if !settings.keep_archives { archives::remove_consumed_inputs(&retained_archive.inputs, &combined.cleanup)?; }
+                if !settings.keep_archives { release_archive(retained_archive.inputs.clone(), combined.cleanup.clone()).await?; }
             }
             continue;
         }
@@ -166,14 +166,14 @@ pub(super) async fn run(app: &AppHandle, settings: &Settings, http: &Client, job
         }).await.map_err(redact)?;
         let found = match result {
             Ok(path) => path,
-            Err(error) => { let _ = fpkg::cleanup_extracted(&destination, Path::new(&settings.download_dir));
+            Err(error) => { discard(destination, &settings.download_dir).await;
                 return Err(if error == "cancelled" { error } else { format!("extraction/{label}: {error}; archive retained for retry") }); }
         };
         combined.cleanup.push(destination);
         if is_overlay { combined.overlay = Some(found); } else { combined.base = Some(found); }
         save(app, job, &combined)?;
         // Persist the extracted root before releasing downloaded archive space.
-        if !settings.keep_archives { archives::remove_consumed_inputs(&archive.inputs, &combined.cleanup)?; }
+        if !settings.keep_archives { release_archive(archive.inputs.clone(), combined.cleanup.clone()).await?; }
     }
     if combined.merged.as_ref().is_none_or(|path| !path.is_dir()) {
         let base = combined.base.clone().ok_or("Base dump is missing")?;
@@ -187,12 +187,22 @@ pub(super) async fn run(app: &AppHandle, settings: &Settings, http: &Client, job
             &|| job_store::blocking_checkpoint(&app_event, &job_event, &worker_cancel),
             &|done, total, name| emit(&app_event, Progress { job_id: job_event.clone(), stage: "packaging".into(),
                 bytes_done: done, bytes_total: total, message: format!("Applying backport {done}/{total}: {name}"), ..Default::default() }))).await.map_err(redact)?;
-        if let Err(error) = result { let _ = fpkg::cleanup_extracted(&destination, Path::new(&settings.download_dir)); return Err(format!("packaging/backport: {error}")); }
+        if let Err(error) = result { discard(destination, &settings.download_dir).await; return Err(format!("packaging/backport: {error}")); }
         combined.merged = Some(destination);
         save(app, job, &combined)?;
     }
     package_and_install_dump(app, settings, combined.merged.as_ref().unwrap(), job, request.title_id.as_deref(),
         "base", &request.title_name, &request.icon, cancel, true, &combined.cleanup).await
+}
+
+// Deleting a whole dump or several archive volumes can take minutes; keep it off the async workers.
+async fn discard(path: PathBuf, download_dir: &str) {
+    let root = PathBuf::from(download_dir);
+    let _ = tokio::task::spawn_blocking(move || fpkg::cleanup_extracted(&path, &root)).await;
+}
+
+async fn release_archive(inputs: Vec<PathBuf>, outputs: Vec<PathBuf>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || archives::remove_consumed_inputs(&inputs, &outputs)).await.map_err(redact)?
 }
 
 fn extract_tree(source: &Path, dest: &Path, kind: ArtifactKind, password: Option<&str>,

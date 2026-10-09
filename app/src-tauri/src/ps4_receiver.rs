@@ -390,9 +390,20 @@ pub(super) async fn load_ps4_receiver(host: String, loader_port: u16, receiver_p
 }
 
 #[derive(Clone, Copy)]
-struct Timing { poll: Duration, idle: Duration }
+struct Timing { poll: Duration, idle: Duration, silent: Duration, confirm: Duration }
 impl Default for Timing {
-    fn default() -> Self { Self { poll: Duration::from_secs(2), idle: Duration::from_secs(15 * 60) } }
+    fn default() -> Self {
+        Self { poll: Duration::from_secs(2), idle: Duration::from_secs(15 * 60), silent: Duration::from_secs(45), confirm: Duration::from_secs(60) }
+    }
+}
+// File checks stay off the async workers that downloads share.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    tokio::task::spawn_blocking(work).await.unwrap_or_else(|_| Err("PS4: The local package check stopped unexpectedly".into()))
+}
+// Resolves once cancellation is requested; never if the sender is gone, so no loop can spin on it.
+async fn cancelled(cancel: &watch::Receiver<bool>) {
+    let mut cancel = cancel.clone();
+    if cancel.changed().await.is_err() { std::future::pending::<()>().await }
 }
 struct Context<'a> {
     app: Option<&'a AppHandle>,
@@ -439,8 +450,13 @@ fn package_token(job: &str, path: &Path) -> Result<String, String> {
     let mut hash = Sha256::new(); hash.update(job.as_bytes()); hash.update(path.to_string_lossy().as_bytes());
     Ok(format!("{:x}", hash.finalize())[..32].into())
 }
-async fn title_context(socket: &mut TcpStream, meta: &pkg_meta::PkgMeta, title: &str, icon_url: &str) -> Result<(), String> {
+// The receiver stores at most 219 title bytes and refuses a longer INSTALL_URL title outright.
+fn receiver_title(meta: &pkg_meta::PkgMeta, title: &str) -> String {
     let name: String = title.chars().filter(|c| !c.is_control()).scan(0usize, |bytes, c| { *bytes += c.len_utf8(); (*bytes < 210).then_some(c) }).collect();
+    if name.trim().is_empty() { meta.title_id.clone() } else { name }
+}
+async fn title_context(socket: &mut TcpStream, meta: &pkg_meta::PkgMeta, title: &str, icon_url: &str) -> Result<(), String> {
+    let name = receiver_title(meta, title);
     let mut body = Vec::new();
     for value in [meta.title_id.as_str(), name.as_str(), icon_url] { body.extend_from_slice(value.as_bytes()); body.push(0); }
     let (code, reply) = frame(socket, 0x57, &body).await.map_err(|e| error_text(&e))?;
@@ -458,8 +474,10 @@ async fn control_install(endpoint: &ReceiverEndpoint, cmd: u8, cid: &str) -> Res
     Ok(())
 }
 
-async fn monitor(context: &Context<'_>, endpoint: &ReceiverEndpoint, cid: &str, bgft: bool, timing: Timing) -> Result<(), Failure> {
+async fn monitor(context: &Context<'_>, endpoint: &ReceiverEndpoint, cid: &str, bgft: bool, source: Option<(&str, u16)>, timing: Timing) -> Result<(), Failure> {
+    let started = Instant::now();
     let mut changed = Instant::now();
+    let mut unconfirmed_since: Option<Instant> = None;
     let mut previous = None;
     let mut applied_pause = false;
     let mut console_owned = !bgft;
@@ -486,10 +504,9 @@ async fn monitor(context: &Context<'_>, endpoint: &ReceiverEndpoint, cid: &str, 
             let mut socket = connect_receiver(endpoint, "install status").await?;
             frame(&mut socket, 0x51, &endpoint.path_body(cid)).await
         };
-        let mut cancelled = context.cancel.clone();
         let status = tokio::select! {
             status = poll => Some(status),
-            _ = cancelled.changed(), if !console_owned => None,
+            _ = cancelled(context.cancel), if !console_owned => None,
         };
         if status.is_none() { continue; }
         if let Some(Ok((code, body))) = status.filter(|reply| reply.as_ref().is_ok_and(|(code, body)| {
@@ -510,17 +527,32 @@ async fn monitor(context: &Context<'_>, endpoint: &ReceiverEndpoint, cid: &str, 
             }
             console_owned = !bgft || status == "installing" || unconfirmed;
             let paused = status == "paused" || applied_pause;
+            // A PS4 that never asks this PC for the package is usually blocked by Windows Firewall.
+            let unreached = source.filter(|(token, _)| !console_owned && !paused && downloaded == 0 && started.elapsed() >= timing.silent
+                && pkg_server::activity(token).is_some_and(|activity| activity.requests == 0));
+            let message = if unconfirmed { "Waiting for PS4 installation confirmation".to_string() }
+                else if console_owned { "Installing on the PS4".to_string() }
+                else if paused { "PS4 download paused".to_string() }
+                else if let Some((_, port)) = unreached { format!("The PS4 hasn't requested the package from this PC yet. If it doesn't start, allow SSPI through Windows Firewall (TCP port {port}).") }
+                else { "PS4 is downloading from this PC".to_string() };
             context.report(Progress { stage: if console_owned { "installing" } else { "uploading" }.into(),
                 progress: if total > 0 && !console_owned { (downloaded as f64 / total as f64).min(0.99) }
                     else { (parsed["progress"].as_f64().unwrap_or(0.) / 100.).clamp(0., 0.99) },
-                bytes_done: downloaded, bytes_total: total, paused,
-                message: if unconfirmed { "Waiting for PS4 installation confirmation" } else if console_owned { "Installing on the PS4" } else if paused { "PS4 download paused" } else { "PS4 is downloading from this PC" }.into(),
+                bytes_done: downloaded, bytes_total: total, paused, message,
                 ..Default::default() });
-            if unconfirmed { return Err(monitoring_ended(parsed["error"].as_str().unwrap_or(""))); }
+            // The receiver reports one missed BGFT progress query as unconfirmed, and a finished
+            // download after 3 quiet minutes. SSPI PS4 allows a minute of misses and 10 minutes
+            // after the last byte, so only a status that stays unconfirmed ends monitoring.
+            let grace = if total > 0 && downloaded >= total { timing.confirm * 7 } else { timing.confirm };
+            if !unconfirmed { unconfirmed_since = None; }
+            else if unconfirmed_since.get_or_insert_with(Instant::now).elapsed() >= grace {
+                return Err(monitoring_ended(parsed["error"].as_str().unwrap_or("")));
+            }
         }
+        // A download the user paused waits for them, however long that takes.
+        if applied_pause && !console_owned { changed = Instant::now(); }
         if changed.elapsed() >= timing.idle { return Err(MONITORING_ENDED.to_string().into()); }
-        let mut cancel = context.cancel.clone();
-        tokio::select! { _ = sleep(timing.poll) => {}, _ = cancel.changed(), if !console_owned => {} }
+        tokio::select! { _ = sleep(timing.poll) => {}, _ = cancelled(context.cancel), if !console_owned => {} }
     }
 }
 
@@ -544,19 +576,20 @@ fn rejected_before_registration(code: u8, body: &[u8]) -> bool {
 }
 async fn install_url(context: &Context<'_>, settings: &Settings, endpoint: &ReceiverEndpoint, path: &Path,
     meta: &pkg_meta::PkgMeta, title: &str, icon: Option<Vec<u8>>, local_ip: IpAddr, timing: Timing) -> Result<(), Failure> {
-    let token = package_token(context.job, path)?;
+    let token = blocking({ let (job, path) = (context.job.to_string(), path.to_path_buf()); move || package_token(&job, &path) }).await?;
     // A retry may already have an unconfirmed BGFT owner for this same token.
     let mut sent = pkg_server::activity(&token).is_some();
     let mut monitoring = false;
-    pkg_server::ensure_started(settings.ps4_serve_port).await.map_err(|error| if sent { monitoring_ended(&error).message } else { error })?;
-    let served = pkg_server::register(&token, path, icon, local_ip, settings.ps4_serve_port)
+    let port = settings.ps4_serve_port;
+    pkg_server::ensure_started(port).await.map_err(|error| if sent { monitoring_ended(&error).message } else { error })?;
+    let served = blocking({ let (token, path) = (token.clone(), path.to_path_buf()); move || pkg_server::register(&token, &path, icon, local_ip, port) }).await
         .map_err(|error| if sent { monitoring_ended(&error).message } else { error })?;
     let result = async {
         context.checkpoint().await?;
         let mut socket = connect_receiver(endpoint, "URL install").await.map_err(|e| error_text(&e))?;
         title_context(&mut socket, meta, title, served.icon_url.as_deref().unwrap_or("")).await?;
         let mut body = serde_json::to_vec(&json!({"url":served.manifest_url,"content_id":meta.content_id,"kind":meta.kind,
-            "title":title,"title_id":meta.title_id,"icon_url":served.icon_url.as_deref().unwrap_or(""),"size":meta.file_size,
+            "title":receiver_title(meta, title),"title_id":meta.title_id,"icon_url":served.icon_url.as_deref().unwrap_or(""),"size":meta.file_size,
             "declared_size":meta.original_size,"content_type":meta.content_type,"digest":meta.digest_hex,"header_sha256":meta.header_sha256})).map_err(redact)?;
         body.push(0);
         context.report(Progress { stage: "uploading".into(), bytes_total: meta.file_size, message: "PS4 is downloading from this PC".into(), ..Default::default() });
@@ -565,7 +598,7 @@ async fn install_url(context: &Context<'_>, settings: &Settings, endpoint: &Rece
         sent = true;
         let cid = submit(&mut socket, 0x59, &body, &meta.content_id).await?;
         monitoring = true;
-        monitor(context, endpoint, &cid, true, timing).await
+        monitor(context, endpoint, &cid, true, Some((&token, port)), timing).await
     }.await;
     match result {
         Ok(()) => { pkg_server::unregister(&token); Ok(()) },
@@ -590,15 +623,15 @@ async fn install_dlc(context: &Context<'_>, settings: &Settings, endpoint: &Rece
     title_context(&mut socket, meta, title, "").await?;
     let cid = submit(&mut socket, 0x50, &endpoint.path_body(&remote), &meta.content_id).await?;
     context.report(Progress { stage: "installing".into(), message: "Installing DLC on the PS4".into(), ..Default::default() });
-    monitor(context, endpoint, &cid, false, timing).await
+    monitor(context, endpoint, &cid, false, None, timing).await
 }
 
 async fn deliver_packages(context: &Context<'_>, settings: &Settings, pkgs: &[PathBuf], timing: Timing) -> Result<(), String> {
     if pkgs.is_empty() { return Err("PS4: No PKG files to install".into()); }
     let mut packages = Vec::new();
     for path in pkgs {
-        ps4_inbox::validate_pkg(path).map_err(|e| error_text(&e))?;
-        let meta = pkg_meta::read(path).map_err(|e| error_text(&e))?;
+        let meta = blocking({ let path = path.clone(); move || { ps4_inbox::validate_pkg(&path)?; pkg_meta::read(&path) } }).await
+            .map_err(|e| error_text(&e))?;
         if !matches!(meta.kind.as_str(), "base" | "update" | "dlc" | "theme") { return Err("PS4: Could not determine the PKG type from its metadata".into()); }
         packages.push((path, meta));
     }
@@ -642,11 +675,14 @@ pub(super) async fn deliver(app: &AppHandle, settings: &Settings, job: &str, pkg
     if let Some(record) = job_store::record(app, job) {
         if !settings.keep_archives {
             let inputs = match &record.checkpoint { Some(job_store::Checkpoint::Archive { inputs, .. } | job_store::Checkpoint::Extracted { inputs, .. }) => inputs.clone(), _ => vec![] };
-            if archives::remove_consumed_inputs(&inputs, &pkgs).is_err() { message.push_str(". Local archives were kept because cleanup could not finish."); }
+            // Deletes run on the blocking pool, never on an async worker the downloads share.
+            let outputs = pkgs.clone();
+            let removed = tokio::task::spawn_blocking(move || archives::remove_consumed_inputs(&inputs, &outputs)).await.map_err(redact).and_then(|result| result);
+            if removed.is_err() { message.push_str(". Local archives were kept because cleanup could not finish."); }
         }
         if !settings.keep_packages {
             for path in &pkgs {
-                if job_store::cleanup_installed_package(app, job, path).is_err() { message.push_str(". A local package was kept because cleanup could not finish."); }
+                if cleanup_delivered_package(app, job, path).await.is_some() { message.push_str(". A local package was kept because cleanup could not finish."); }
             }
         }
     }
@@ -840,7 +876,7 @@ mod tests {
         let digest = Sha256::digest(&bytes[..0xfe0]); bytes[0xfe0..0x1000].copy_from_slice(&digest);
         let path = test_output_root().join(format!("ps4-receiver-{}.pkg", Uuid::new_v4())); std::fs::write(&path, bytes).unwrap(); path
     }
-    fn timing() -> Timing { Timing { poll: Duration::from_millis(10), idle: Duration::from_secs(3) } }
+    fn timing() -> Timing { Timing { poll: Duration::from_millis(10), idle: Duration::from_secs(3), ..Timing::default() } }
     fn context<'a>(job: &'a str, cancel: &'a watch::Receiver<bool>, events: &'a Mutex<Vec<Progress>>) -> Context<'a> {
         Context { app: None, job, cancel, paused: None, events: Some(events) }
     }
@@ -925,7 +961,7 @@ mod tests {
         let (_tx, rx) = watch::channel(false); let events = Mutex::new(vec![]); let context = context(&job, &rx, &events);
         let settings = fake.settings(port); let ip = "127.0.0.1".parse().unwrap(); let token = package_token(&job, &path).unwrap();
         let result = install_url(&context, &settings, &fake.endpoint, &path, &meta, "Game", None, ip,
-            Timing { poll:Duration::from_millis(5), idle:Duration::from_millis(30) }).await;
+            Timing { poll:Duration::from_millis(5), idle:Duration::from_millis(30), ..Timing::default() }).await;
         assert_eq!(result.unwrap_err().message, MONITORING_ENDED); assert!(pkg_server::activity(&token).is_some());
         let url = fake.peer.lock().unwrap().urls[0]["url"].as_str().unwrap().to_string();
         assert!(Client::builder().no_proxy().build().unwrap().get(&url).send().await.unwrap().status().is_success());
@@ -1014,8 +1050,8 @@ mod tests {
         statuses.push(status("installed",8192));
         let fake = Fake::start(statuses, None).await;
         let (_tx, rx) = watch::channel(false); let events = Mutex::new(vec![]);
-        monitor(&context("percentage", &rx, &events), &fake.endpoint, CID, true,
-            Timing { poll:Duration::from_millis(20), idle:Duration::from_millis(30) }).await.unwrap();
+        monitor(&context("percentage", &rx, &events), &fake.endpoint, CID, true, None,
+            Timing { poll:Duration::from_millis(20), idle:Duration::from_millis(30), ..Timing::default() }).await.unwrap();
         assert_eq!(events.lock().unwrap().len(), 5);
     }
 
@@ -1054,7 +1090,7 @@ mod tests {
         let (cancel_tx, cancel_rx) = watch::channel(false); let (pause_tx, pause_rx) = watch::channel(false);
         let events = Mutex::new(vec![]);
         let mut context = context("controls", &cancel_rx, &events); context.paused = Some(&pause_rx);
-        let monitor = monitor(&context, &fake.endpoint, CID, true, timing());
+        let monitor = monitor(&context, &fake.endpoint, CID, true, None, timing());
         let control = async {
             fake.seen(0x51).await; pause_tx.send(true).unwrap(); fake.seen(0x5C).await;
             pause_tx.send(false).unwrap(); fake.seen(0x5D).await; cancel_tx.send(true).unwrap();
@@ -1065,13 +1101,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_held_pause_outlasts_the_idle_limit() {
+        let fake = Fake::start(vec![], None).await;
+        // Paused before monitoring starts, so no scheduling delay can race the idle limit.
+        let (_cancel_tx, cancel_rx) = watch::channel(false); let (_pause_tx, pause_rx) = watch::channel(true);
+        let events = Mutex::new(vec![]);
+        let mut context = context("held-pause", &cancel_rx, &events); context.paused = Some(&pause_rx);
+        let timing = Timing { poll: Duration::from_millis(5), idle: Duration::from_millis(100), ..Timing::default() };
+        let monitor = monitor(&context, &fake.endpoint, CID, true, None, timing);
+        let control = async {
+            fake.seen(0x5C).await;
+            sleep(Duration::from_millis(600)).await;
+            fake.peer.lock().unwrap().statuses.push_back(status("installed", 8192));
+        };
+        let (result, _) = tokio::join!(monitor, control); result.unwrap();
+        assert!(events.lock().unwrap().iter().all(|p| p.paused && p.message == "PS4 download paused"));
+    }
+
+    #[tokio::test]
+    async fn orphaned_cancel_channel_does_not_read_as_cancel_or_spin() {
+        let (tx, rx) = watch::channel(false); drop(tx);
+        assert!(tokio::time::timeout(Duration::from_millis(50), cancelled(&rx)).await.is_err());
+        let fake = Fake::start(vec![status("downloading", 4096), status("installed", 8192)], None).await;
+        let events = Mutex::new(vec![]);
+        tokio::time::timeout(Duration::from_secs(10), monitor(&context("orphan", &rx, &events), &fake.endpoint, CID, true, None, timing())).await.unwrap().unwrap();
+        let (tx, rx) = watch::channel(false); tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_millis(50), cancelled(&rx)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn silent_pc_server_points_to_windows_firewall() {
+        let port = pkg_server_test_port();
+        let path = package("gd"); let job = Uuid::new_v4().to_string(); let token = package_token(&job, &path).unwrap();
+        let served = pkg_server::register(&token, &path, None, "127.0.0.1".parse().unwrap(), port).unwrap();
+        let statuses = vec![status("queued", 0), status("queued", 0), status("installed", 8192)];
+        let (_tx, rx) = watch::channel(false);
+        // `silent` is either already over or far away, so the outcome doesn't depend on scheduling.
+        let messages = |silent: Duration| { let (rx, statuses, token) = (&rx, statuses.clone(), token.clone()); async move {
+            let fake = Fake::start(statuses, None).await; let events = Mutex::new(vec![]);
+            let timing = Timing { poll: Duration::from_millis(5), silent, ..timing() };
+            monitor(&context("silent", rx, &events), &fake.endpoint, CID, true, Some((&token, port)), timing).await.unwrap();
+            events.into_inner().unwrap().into_iter().map(|p| p.message).collect::<Vec<_>>()
+        } };
+        let hint = format!("The PS4 hasn't requested the package from this PC yet. If it doesn't start, allow SSPI through Windows Firewall (TCP port {port}).");
+        assert_eq!(messages(Duration::ZERO).await, [hint.as_str(), hint.as_str()]);
+        assert_eq!(messages(Duration::from_secs(60)).await, ["PS4 is downloading from this PC"; 2]);
+        // Once the PS4 has asked for the package, the hint is not shown.
+        assert!(Client::builder().no_proxy().build().unwrap().get(&served.manifest_url).send().await.unwrap().status().is_success());
+        assert_eq!(messages(Duration::ZERO).await, ["PS4 is downloading from this PC"; 2]);
+        pkg_server::unregister(&token); std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn long_titles_fit_the_receiver_title_fields() {
+        let port = pkg_server_test_port();
+        let fake = Fake::start(vec![status("installed", 8192)], None).await;
+        let path = package("gd"); let meta = pkg_meta::read(&path).unwrap(); let job = Uuid::new_v4().to_string();
+        let (_tx, rx) = watch::channel(false); let events = Mutex::new(vec![]);
+        let title = format!("{}\u{0}Edition", "ゲーム".repeat(90));
+        install_url(&context(&job, &rx, &events), &fake.settings(port), &fake.endpoint, &path, &meta, &title, None, "127.0.0.1".parse().unwrap(), timing()).await.unwrap();
+        let peer = fake.peer.lock().unwrap();
+        let sent = peer.urls[0]["title"].as_str().unwrap().to_string();
+        assert!(!sent.is_empty() && sent.len() < 210 && title.starts_with(&sent), "{} bytes", sent.len());
+        let (_, context) = peer.bodies.iter().find(|(command, _)| *command == 0x57).unwrap();
+        assert_eq!(context.split(|b| *b == 0).nth(1).unwrap(), sent.as_bytes());
+        assert_eq!(receiver_title(&meta, "\u{1}\u{2}"), "CUSA12345");
+        drop(peer); std::fs::remove_file(&path).unwrap();
+    }
+
+    #[tokio::test]
     async fn idle_monitoring_never_reports_installed_and_installing_is_console_owned() {
         let fake = Fake::start(vec![status("installing", 8192), status("installed", 8192)], None).await;
         let (_tx, rx) = watch::channel(true); let events = Mutex::new(vec![]);
-        monitor(&context("console-owned", &rx, &events), &fake.endpoint, CID, false, timing()).await.unwrap();
+        monitor(&context("console-owned", &rx, &events), &fake.endpoint, CID, false, None, timing()).await.unwrap();
         assert!(!fake.peer.lock().unwrap().commands.contains(&0x5B));
         let (_tx, rx) = watch::channel(false);
-        let error = monitor(&context("idle", &rx, &events), &fake.endpoint, CID, true, Timing { poll: Duration::from_millis(5), idle: Duration::from_millis(30) }).await.unwrap_err();
+        let error = monitor(&context("idle", &rx, &events), &fake.endpoint, CID, true, None, Timing { poll: Duration::from_millis(5), idle: Duration::from_millis(30), ..Timing::default() }).await.unwrap_err();
         assert_eq!(error.message, MONITORING_ENDED); assert_eq!(job_error_stage(&error.message), "monitoring-ended");
         assert!(!events.lock().unwrap().iter().any(|p| p.stage == "complete"));
     }
@@ -1082,9 +1187,13 @@ mod tests {
             let value = json!({"api_code":query_code,"status_api_code":query_code,"error_code":0,"state":"unconfirmed",
                 "status":"awaiting_confirmation","content_id":CID,"progress":99,"downloaded":8192,"total":8192,
                 "error":"Download complete; installed package confirmation is unavailable"});
-            let fake = Fake::start(vec![value], None).await;
+            let fake = Fake::start(vec![value; 400], None).await;
             let (_tx, rx) = watch::channel(false); let events = Mutex::new(vec![]);
-            let failure = monitor(&context("unconfirmed", &rx, &events), &fake.endpoint, CID, true, timing()).await.unwrap_err();
+            // A finished download is given seven confirmation periods.
+            let timing = Timing { confirm: Duration::from_millis(30), ..timing() };
+            let started = Instant::now();
+            let failure = monitor(&context("unconfirmed", &rx, &events), &fake.endpoint, CID, true, None, timing).await.unwrap_err();
+            assert!(started.elapsed() >= timing.confirm * 7);
             assert!(failure.message.starts_with(MONITORING_ENDED));
             assert!(failure.message.contains("Download complete; installed package confirmation is unavailable"));
             assert_eq!(job_error_stage(&failure.message), "monitoring-ended");
@@ -1093,6 +1202,22 @@ mod tests {
             assert_eq!(last.message, "Waiting for PS4 installation confirmation");
             assert!(!reports.iter().any(|p| matches!(p.stage.as_str(), "complete" | "failed")));
         }
+    }
+
+    #[tokio::test]
+    async fn a_brief_unconfirmed_status_does_not_end_monitoring() {
+        let unconfirmed = json!({"api_code":-60,"status_api_code":-60,"error_code":0,"state":"unconfirmed","status":"awaiting_confirmation",
+            "content_id":CID,"progress":30,"downloaded":2048,"total":8192,"error":"PS4 install progress is unavailable; installed content is not yet confirmed"});
+        let fake = Fake::start(vec![status("downloading", 2048), unconfirmed.clone(), unconfirmed.clone(), status("downloading", 4096), status("installed", 8192)], None).await;
+        let (_tx, rx) = watch::channel(false); let events = Mutex::new(vec![]);
+        monitor(&context("brief", &rx, &events), &fake.endpoint, CID, true, None, timing()).await.unwrap();
+        assert!(events.lock().unwrap().iter().any(|p| p.message == "Waiting for PS4 installation confirmation"));
+        // Mid-download, a status that stays unconfirmed still ends after one confirmation period.
+        let fake = Fake::start(vec![unconfirmed; 400], None).await;
+        let timing = Timing { confirm: Duration::from_millis(200), ..timing() };
+        let started = Instant::now();
+        let failure = monitor(&context("stays", &rx, &events), &fake.endpoint, CID, true, None, timing).await.unwrap_err();
+        assert!(failure.message.contains("PS4 install progress is unavailable") && started.elapsed() < timing.confirm * 7);
     }
 
     #[test]

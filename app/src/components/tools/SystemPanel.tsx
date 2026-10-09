@@ -4,7 +4,7 @@
    add the kernel log, processes, and other payloads' logs and crashes.
    Values the receiver can't read are left out and named once.
    ===================================================================== */
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useState } from "react"
 import { Seg } from "../Controls"
 import { Icon } from "../Icon"
 import { KernelLogView, type KernelLogFocus } from "./system/KernelLogView"
@@ -82,19 +82,18 @@ function Overview({ target, host, port, demo, probe }: { target: ConsoleKind; ho
   const [error, setError] = useState("")
   const [updatedAt, setUpdatedAt] = useState(0)
   const [, tick] = useState(0)
-  const fetching = useRef(false)
-
   useEffect(() => {
     setInfo(null); setError("")
-    let live = true
+    // Per endpoint: a request still running for the previous console must not delay this one.
+    let live = true, fetching = false
     const load = async () => {
-      if (fetching.current || document.hidden) return
-      fetching.current = true
+      if (fetching || document.hidden) return
+      fetching = true
       try {
         const next = await consoleSystemInfo({ target, host, port, demo })
         if (live) { setInfo(next); setUpdatedAt(Date.now()); setError("") }
       } catch (reason) { if (live) setError(errorText(reason)) }
-      finally { fetching.current = false }
+      finally { fetching = false }
     }
     void load()
     const timer = window.setInterval(() => void load(), 5000)

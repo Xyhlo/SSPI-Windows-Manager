@@ -18,6 +18,8 @@
 !/app/src-tauri/src/storage.rs
 !/app/src-tauri/src/static_catalog.rs
 !/app/src-tauri/src/lib.rs
+!/app/src-tauri/src/session_log.rs
+!/app/src-tauri/src/power.rs
 !/app/src-tauri/src/main.rs
 !/app/src-tauri/src/package_sources.rs
 !/app/src-tauri/src/package_sources/local_recipe.rs
@@ -44,6 +46,13 @@
 !/app/src/vite-env.d.ts
 !/docs/banner.png
 !/payload/main.c
+!/payload/startup.c
+!/payload/install_protocol.h
+!/payload/install_process.h
+!/payload/install_loader.h
+!/payload/install_common.c
+!/payload/install_helper.c
+!/payload/install_process.c
 
 /SDK/
 /Build-Output/

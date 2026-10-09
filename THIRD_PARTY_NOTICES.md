@@ -12,6 +12,20 @@ See `docs/PKG_PROVENANCE.json` for the machine-readable inventory and hashes.
 
 ## Reviewed components
 
+### PS5 payload SDK — receiver startup runtime
+
+- Source: https://github.com/ps5-payload-dev/sdk, pinned to
+  `f7fd02e6e195902a449b5e664917be8c01888b34` for receiver 1.0.15.
+- Copyright John Törnblom and other upstream contributors; GPL-3.0-or-later.
+  The license text accompanies the distribution at `resources/web-launcher/LICENSE`.
+- `payload/startup.c` is derived from upstream `crt/crt.c`, with bounded socket
+  startup diagnostics, argument validation, and an early return after failed
+  runtime initialization. It retains the upstream optional `payloadout` checks.
+  Other startup runtime sources are unchanged, local SDK build inputs.
+- Installed SDK libraries, runtime data paths, and receiver protocol remain
+  unchanged. Corresponding source for modified startup is in `payload/startup.c`;
+  the remaining CRT sources are at the exact upstream revision above.
+
 ### Microsoft Visual C++ 2022 runtime
 
 - SSPI Windows x64 statically links the C/C++ runtime for the application and
@@ -246,6 +260,22 @@ or add verified provenance and notices.
   downloadable from the local SSPI host at paths matching those filenames.
 - Runtime payloads downloaded from configured repositories retain their own
   attribution and licensing and are not included in the public source export.
+
+### PS5 receiver installation helper — ps5-payload-dev/elfldr
+
+- The PS5 receiver uses the process-spawning code from
+  https://github.com/ps5-payload-dev/elfldr at commit
+  `bb1e117988217a0239679029601e93c7286394d7`.
+- Copyright (C) 2024 John Törnblom. GNU GPL version 3 or, at your option,
+  any later version. The repository's MIT license does not replace this
+  component's license. The GPL text is included at
+  `resources/web-launcher/LICENSE` in the Windows distribution.
+- SSPI's generated adaptation validates the embedded ELF before mapping it,
+  zero-fills its backing allocation, bounds process-start/ptrace waits and
+  exposes child lifecycle hooks to the receiver supervisor. The pinned
+  SDK input remains unchanged. The SSPI helper and IPC source are under
+  `payload/install_*`; the local adaptation recipe is
+  `build/prepare-receiver-loader.py`.
 
 ## Release rule
 

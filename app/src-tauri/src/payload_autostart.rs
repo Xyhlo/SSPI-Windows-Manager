@@ -287,6 +287,12 @@ fn halt(run: &mut Run, index: usize, message: String) {
     status.next_attempt_at = None;
 }
 
+fn loader_connect_failed(message: &str) -> bool {
+    [CONNECT_FAILED, CONNECT_TIMEOUT].into_iter().any(|prefix| {
+        message.strip_prefix(prefix).is_some_and(|detail| detail.is_empty() || detail.starts_with(' '))
+    })
+}
+
 fn finish(map: &mut BTreeMap<String, Run>, target: &str, generation: u64, outcome: Result<(bool, String), String>, at: u64) {
     let Some(run) = map.get_mut(target).filter(|r| r.generation == generation) else { return; };
     let Some(index) = run.status.current else { return; };
@@ -295,7 +301,7 @@ fn finish(map: &mut BTreeMap<String, Run>, target: &str, generation: u64, outcom
         Err(message) => {
             // Retry only failures known to precede payload bytes. A partial write or
             // unverified execution must never result in another automatic send.
-            let unavailable = message == CONNECT_FAILED || message == CONNECT_TIMEOUT;
+            let unavailable = loader_connect_failed(&message);
             let busy = message == SEND_BUSY;
             if busy { run.status.attempts = run.status.attempts.saturating_sub(1); }
             if (unavailable || busy) && run.status.attempts < MAX_ATTEMPTS && !run.stop_after_current {
@@ -315,7 +321,7 @@ fn finish(map: &mut BTreeMap<String, Run>, target: &str, generation: u64, outcom
 }
 
 pub(super) fn record_manual(target: &str, id: &str, result: &Result<payloads::PayloadSendResult, String>) {
-    if result.as_ref().is_err_and(|error| error == CONNECT_FAILED || error == CONNECT_TIMEOUT || error == SEND_BUSY) { return; }
+    if result.as_ref().is_err_and(|error| loader_connect_failed(error) || error == SEND_BUSY) { return; }
     let mut map = runs().lock().unwrap_or_else(|p| p.into_inner());
     let Some(run) = map.get_mut(target) else { return; };
     if !matches!(run.status.phase.as_str(), "waiting" | "unavailable") { return; }
@@ -455,6 +461,32 @@ mod tests {
     }
 
     #[test]
+    fn connection_diagnostics_keep_retries_without_retrying_send_failures() {
+        for prefix in [CONNECT_FAILED, CONNECT_TIMEOUT] {
+            for detail in [" Diagnostic log: C:\\SSPI\\logs\\SSPI.log", " Windows socket error 10061: connection refused. Diagnostic log: C:\\SSPI\\logs\\SSPI.log"] {
+                let message = format!("{prefix}{detail}");
+                let mut map = setup(&[("payload", 0), ("later", 0)]);
+                claim(&mut map, "ps5", START_GRACE_MS);
+                finish(&mut map, "ps5", 1, Err(message.clone()), START_GRACE_MS);
+                assert_eq!(map["ps5"].status.phase, "unavailable");
+                assert_eq!(map["ps5"].status.message, message);
+                assert_eq!(map["ps5"].status.next_attempt_at, Some(START_GRACE_MS + RETRY_DELAYS[1]));
+                assert_eq!(states(&map), ["waiting", "pending"]);
+            }
+        }
+        for message in [
+            format!("Could not send the complete payload. {CONNECT_FAILED}"),
+            format!("{CONNECT_FAILED}Extra text without a separator"),
+        ] {
+            let mut map = setup(&[("payload", 0), ("later", 0)]);
+            claim(&mut map, "ps5", START_GRACE_MS);
+            finish(&mut map, "ps5", 1, Err(message), START_GRACE_MS);
+            assert_eq!(map["ps5"].status.phase, "failed");
+            assert!(claim(&mut map, "ps5", u64::MAX).is_none());
+        }
+    }
+
+    #[test]
     fn payloads_go_in_order_after_their_own_delays() {
         let mut map = setup(&[("a", 0), ("b", 2_000), ("c", 500)]);
         assert_eq!(claim(&mut map, "ps5", START_GRACE_MS).map(|c| c.1), Some("a".into()));
@@ -570,6 +602,12 @@ mod tests {
         runs().lock().unwrap().insert("ps5".into(), armed("ps5", &sequence(&[("first", 0), ("second", 1_000)]), 12, 0));
         record_manual("ps5", "other", &Err("Could not send the complete payload.".into()));
         record_manual("ps5", "first", &Err(SEND_BUSY.into()));
+        for prefix in [CONNECT_FAILED, CONNECT_TIMEOUT] {
+            record_manual("ps5", "first", &Err(format!("{prefix} Windows socket error 10061. Diagnostic log: C:\\SSPI\\logs\\SSPI.log")));
+            let map = runs().lock().unwrap();
+            assert_eq!(map["ps5"].generation, 12);
+            assert_eq!(map["ps5"].status.phase, "waiting");
+        }
         assert_eq!(runs().lock().unwrap()["ps5"].status.current, Some(0));
         record_manual("ps5", "first", &Err("Could not send the complete payload.".into()));
         let mut map = runs().lock().unwrap();

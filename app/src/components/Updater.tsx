@@ -4,6 +4,9 @@
    the installed build, the release waiting and its notes.
    ===================================================================== */
 import { useEffect, useState } from "react"
+import { invoke } from "@tauri-apps/api/core"
+import { errorText } from "@/lib/format"
+import { toast } from "./toasts"
 import logo from "@/assets/sspi-logo.svg"
 import { runUpdateAction, startUpdater, updateBusy, updaterHasUserError, updaterSupported, useUpdater, type UpdateStatus } from "@/lib/updater"
 import { CheckDraw, Icon } from "./Icon"
@@ -89,6 +92,7 @@ export function UpdatePanel({ demo = false }: { demo?: boolean }) {
       {update.stage === "error" && update.message && <p className="up-error" role="alert"><Icon name="alert" />{update.message}</p>}
       {!supported && <p className="opt-note">Update checks run in the installed SSPI app.</p>}
       <p className="opt-note">Installing waits until downloads, packaging and transfers finish or are cancelled. SSPI closes, replaces its files and reopens; settings, saved keys, payloads and downloads stay where they are. Reload the receiver on your consoles afterwards to pick up an updated one.</p>
+      <button type="button" className="btn sm" disabled={demo || !supported} onClick={() => void invoke("show_session_log").catch(error => toast({ tone: "error", title: "The diagnostic log couldn't be opened", text: errorText(error) }))}><Icon name="folder" />Show Windows diagnostic log</button>
     </section>
   )
 }

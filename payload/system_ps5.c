@@ -30,13 +30,18 @@
 #include <unistd.h>
 #include <ps5/kernel.h>
 
-int sceKernelGetHwModelName(char *);
+/* Some loaders run with libkernel_web, which has no model-name export. */
+int sceKernelGetHwModelName(char *) __attribute__((weak));
 long sceKernelGetCpuFrequency(void);
 int sceKernelGetCpuTemperature(int *);
 int sceKernelGetSocSensorTemperature(int, int *);
 typedef struct { uint32_t app_id; uint64_t unknown1; uint32_t app_type; char title_id[10]; char unknown2[0x3c]; } Ps5AppInfo;
 int sceKernelGetAppInfo(pid_t pid, Ps5AppInfo *info);
-int sceSystemServiceKillApp(uint32_t app_id, int32_t option, int32_t method, int32_t reason);
+extern void *sspi_service_symbol(const char *module, const char *symbol);
+static int sceSystemServiceKillApp(uint32_t app_id, int32_t option, int32_t method, int32_t reason) {
+    int (*call)(uint32_t, int32_t, int32_t, int32_t) = sspi_service_symbol("libSceSystemService.sprx", "sceSystemServiceKillApp");
+    return call ? call(app_id, option, method, reason) : -ENOSYS;
+}
 
 /* ------------------------------------------------------------------ diagnostics hooks */
 
@@ -317,7 +322,7 @@ int ps5_system_info(char *out, size_t cap) {
     if (!clock_gettime(CLOCK_UPTIME,&up) && up.tv_sec>=0) snprintf(uptime,sizeof(uptime),"%llu",(unsigned long long)up.tv_sec);
     if (!gethostname(hostname,sizeof(hostname)-1) && hostname[0]) dx_json_string(name,sizeof(name),hostname,sizeof(hostname));
     char model_text[1024]={0}, model[80]="null";
-    if (!sceKernelGetHwModelName(model_text) && model_text[0]) dx_json_string(model,sizeof(model),model_text,64);
+    if (sceKernelGetHwModelName && !sceKernelGetHwModelName(model_text) && model_text[0]) dx_json_string(model,sizeof(model),model_text,64);
     int temperature=0; char cpu[16]="null", soc[16]="null";
     if (!sceKernelGetCpuTemperature(&temperature) && temperature>0 && temperature<150) snprintf(cpu,sizeof(cpu),"%d",temperature);
     if (!sceKernelGetSocSensorTemperature(0,&temperature) && temperature>0 && temperature<150) snprintf(soc,sizeof(soc),"%d",temperature);

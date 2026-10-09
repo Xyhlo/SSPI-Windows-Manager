@@ -4,6 +4,7 @@
    Built-in receivers come first; added files are kept by the app.
    ===================================================================== */
 import { open as openDialog } from "@tauri-apps/plugin-dialog"
+import { invoke } from "@tauri-apps/api/core"
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode } from "react"
 import { Collapse } from "../Collapse"
 import { Seg } from "../Controls"
@@ -142,9 +143,10 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onOpen
       if (entry.builtin && result.verified) onReceiverLoaded(target)
     } catch (reason) {
       const message = errorText(reason)
+      setTraces(old => { const next = { ...old }; delete next[entry.id]; return next })
       setPayloads(old => old.map(item => item.id === entry.id ? { ...item, lastSentAt: Date.now(), lastResult: message } : item))
       setHistory(old => [{ id: `${entry.id}-${Date.now()}`, name: entry.name, at: Date.now(), result: message, ok: false }, ...old].slice(0, 20))
-      toast({ tone: "error", title: `${entry.name} wasn't sent`, text: `${message} Check that ${loader} is running on your ${name}.` })
+      toast({ tone: "error", title: `${entry.name}: start failed`, text: message.split("\n")[0] })
     } finally { setBusy("") }
   }
   const save = async (entry: PayloadEntry, draft: { name: string; target: PayloadTarget; notes: string }) => {
@@ -196,6 +198,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onOpen
         <input ref={fileRef} type="file" accept=".elf,.bin" multiple hidden onChange={(event: ChangeEvent<HTMLInputElement>) => { const files = Array.from(event.currentTarget.files || []); event.currentTarget.value = ""; void addPaths(files.map(file => `preview/${file.name}`)) }} />
       </div>
       {error && <p className="pl-error" role="alert">{error}</p>}
+      <div><button type="button" className="btn ghost sm" disabled={demo} onClick={() => void invoke("show_session_log").catch(reason => toast({ tone: "error", title: "The diagnostic log couldn't be opened", text: errorText(reason) }))}><Icon name="folder" />Show Windows diagnostic log</button></div>
       <AutostartCard status={auto} payloads={shown} loader={loader} busy={autoBusy || loading} available={launcherAvailable(demo)}
         onToggle={toggleAutostart} onEdit={() => setOrdering({})}
         onRun={() => void autoAction(() => runAutostart(target, demo), "Autostart didn't start").catch(() => undefined)}
@@ -204,7 +207,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onOpen
         {loading && Array.from({ length: 3 }, (_, n) => <div key={n} className="skeleton" style={{ height: 68, flex: "none" }} />)}
         {!loading && shown.map((entry, n) => {
           const isCurrent = entry.id === current?.id
-          const failed = !!entry.lastResult && entry.lastSentAt && !/sent|running|loaded|verified|preview/i.test(entry.lastResult)
+          const failed = !!entry.lastResult && entry.lastSentAt && (/^SSPI receiver startup failed:|^The payload loader rejected|^Could not|^Sending the payload timed out|^The payload loader connection timed out/.test(entry.lastResult) || !/sent|running|loaded|verified|preview/i.test(entry.lastResult))
           return (
             <div key={entry.id} className={`pl-item ${isCurrent ? "is-current" : ""}`}>
               <div
@@ -241,6 +244,7 @@ export function PayloadsPanel({ target, settings, demo, onReceiverLoaded, onOpen
                 <PayloadEditor entry={entry} busy={busy === entry.id} onCancel={() => setEditing("")} onSave={draft => void save(entry, draft)} />
               </Collapse>
               <Collapse open={isCurrent && editing !== entry.id && removing !== entry.id} className="pl-drawer">
+                {entry.lastResult && <PayloadDiagnostic text={entry.lastResult} label="Last result — full details" />}
                 <details className="pl-inspect"><summary>Payload details{traces[entry.id] ? " and last send" : ""}</summary><p className="pl-tech">{techLine(entry)}</p><PayloadSheet entry={entry} destination={endpoint.host ? `${endpoint.host}:${endpoint.port}` : ""} loader={loader} trace={traces[entry.id]} sending={busy === entry.id} /></details>
               </Collapse>
               <Collapse open={removing === entry.id} className="pl-drawer" reveal>
@@ -308,7 +312,7 @@ function PayloadSheet({ entry, destination, loader, trace, sending }: { entry: P
                 <li key={n} className={step.ok ? "" : "fail"}>
                   <Icon name={step.ok ? "check" : "x"} />
                   <span className="l">{step.label}</span>
-                  <span className="d">{step.detail}</span>
+                  <div style={{ minWidth: 0 }}><PayloadDiagnostic text={step.detail} label={step.detail.split("\n")[0]} /></div>
                   <span className="t">{fmtMs(step.ms)}</span>
                 </li>
               ))}
@@ -318,6 +322,18 @@ function PayloadSheet({ entry, destination, loader, trace, sending }: { entry: P
       )}
     </div>
   )
+}
+
+function PayloadDiagnostic({ text, label }: { text: string; label: string }) {
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(text); toast({ tone: "success", title: "Details copied", text: "The full diagnostic text is on the clipboard." }) }
+    catch (reason) { toast({ tone: "error", title: "Details weren't copied", text: errorText(reason) }) }
+  }
+  return <details style={{ minWidth: 0 }}>
+    <summary style={{ overflowWrap: "anywhere", cursor: "pointer" }}>{label}</summary>
+    <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", maxHeight: 320, overflowY: "auto", userSelect: "text" }}>{text}</pre>
+    <button type="button" className="btn sm ghost" onClick={() => void copy()}><Icon name="copy" />Copy details</button>
+  </details>
 }
 
 function PayloadEditor({ entry, busy, onCancel, onSave }: { entry: PayloadEntry; busy: boolean; onCancel: () => void; onSave: (draft: { name: string; target: PayloadTarget; notes: string }) => void }) {

@@ -197,6 +197,15 @@ static bool already_running(void) {
     }
     if (close(fd)) diagnostic("duplicate probe close errno=%d",errno); return found;
 }
+/* A failing accept repeats every listener tick: write it at most once a minute
+   with a count of the rest, so the synced log never becomes a busy loop. */
+typedef struct { bool logged; uint64_t at; unsigned repeats; } ListenerNote;
+static void listener_note(ListenerNote *note, const char *event, int code) {
+    uint64_t now=rx_now();
+    if (note->logged && now-note->at<60000) { note->repeats++; return; }
+    log_line("%s errno=%d repeats=%u clients=%u",event,code,note->repeats,atomic_load(&clients));
+    note->logged=true; note->at=now; note->repeats=0;
+}
 int main(void) {
     int result=0;
     for (unsigned i=0;i<MAX_CLIENTS;i++) client_fds[i]=-1;
@@ -223,11 +232,13 @@ int main(void) {
     if (boot_result) snprintf(ready,sizeof(ready),"SSPI receiver: %s failed (0x%08x); inspect GET_CONFIG",!jailbroken?"privilege/data root":"installer initialization",(unsigned)boot_result);
     else snprintf(ready,sizeof(ready),"SSPI receiver ready \xc2\xb7 port %d",port);
     notify_system(ready); diagnostic("listener ready port=%d version=" VERSION,port);
+    ListenerNote accept_note={0};
     while (!atomic_load(&stopping)) {
         reap_clients(false);
         notify_tick(); fd_set readable; FD_ZERO(&readable); FD_SET(listen_fd,&readable); struct timeval wait={0,100000};
         rc=select(listen_fd+1,&readable,NULL,NULL,&wait); if (rc<0) { if (errno==EINTR) continue; diagnostic("listener select failed errno=%d",errno); break; } if (!rc) continue;
-        int fd=accept(listen_fd,NULL,NULL); if (fd<0) { if (errno!=EINTR) log_line("accept failed errno=%d",errno); continue; }
+        int fd=accept(listen_fd,NULL,NULL);
+        if (fd<0) { int code=errno; if (code!=EINTR) { listener_note(&accept_note,"accept failed",code); rx_sleep(100); } continue; }
         if (socket_options(fd,30)) { log_line("client socket options failed errno=%d",errno); if (close(fd)) log_line("client close failed"); continue; }
         rx_lock(&clients_lock); unsigned slot=0; while (slot<MAX_CLIENTS&&(client_fds[slot]>=0||client_threads[slot])) slot++;
         if (slot<MAX_CLIENTS) { client_fds[slot]=fd; atomic_fetch_add(&clients,1); } rx_unlock(&clients_lock);

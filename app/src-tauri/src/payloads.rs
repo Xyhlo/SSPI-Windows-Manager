@@ -5,12 +5,15 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager, State};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{tcp::OwnedReadHalf, TcpStream},
+    sync::Notify,
+    task::JoinHandle,
     time::{sleep, timeout},
 };
 
@@ -22,6 +25,10 @@ pub(super) const MAX_PAYLOAD_SIZE: usize = 256 * 1024 * 1024;
 const MAX_RESPONSE: usize = 1024 * 1024;
 const BUILTIN_PS5: &str = "builtin:ps5-receiver";
 const BUILTIN_PS4: &str = "builtin:ps4-receiver";
+const MAX_LOADER_OUTPUT: usize = 32 * 1024;
+const LOADER_REPLY_WAIT: Duration = Duration::from_secs(2);
+const LOADER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const RECEIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,7 +95,9 @@ struct Trace {
 impl Trace {
     fn new() -> Self { Self { steps: Vec::new(), sent: None } }
     fn step(&mut self, label: impl Into<String>, detail: impl Into<String>, from: Instant, ok: bool) {
-        self.steps.push(SendStep { label: label.into(), detail: detail.into(), ms: from.elapsed().as_millis() as u64, ok });
+        let step = SendStep { label: label.into(), detail: detail.into(), ms: from.elapsed().as_millis() as u64, ok };
+        crate::session_log::write("payload", &format!("{} | {} ms | {} | {}", step.label, step.ms, if ok { "ok" } else { "failed" }, step.detail));
+        self.steps.push(step);
     }
 }
 
@@ -187,7 +196,7 @@ struct Ps5Timing {
 
 const DEFAULT_PS5_TIMING: Ps5Timing = Ps5Timing {
     stop_timeout: Duration::from_secs(6),
-    verify_timeout: Duration::from_secs(12),
+    verify_timeout: Duration::from_secs(30),
     poll_interval: Duration::from_millis(500),
 };
 
@@ -280,7 +289,7 @@ async fn send_autostart_at(root: &Path, settings: &Settings, id: &str, target: &
             Err(_) => {},
         }
         if !current() { return Err("The order or console address changed.".into()); }
-        return send_payload_at(root, id, target, host, port.into(), settings, DEFAULT_PS5_TIMING).await.and_then(|r| if r.verified { Ok((true,r.message)) } else { Err("Receiver sent but not verified. The order stopped without resending.".into()) });
+        return send_payload_at(root, id, target, host, port.into(), settings, DEFAULT_PS5_TIMING).await.and_then(|r| if r.verified { Ok((true,r.message)) } else { Err(format!("{} The order stopped without resending.", r.message)) });
     }
     if process_name.is_empty() {
         if automatic { return Err("Set this payload's exact process name in Edit order, or use Run now. Automatic launch was blocked because its running state is unknown.".into()); }
@@ -507,6 +516,7 @@ async fn send_payload_at(
 
     let started = Instant::now();
     let mut trace = Trace::new();
+    trace.step("Prepare payload", format!("{} | {} | {} bytes | SHA-256 {} | {host}:{port}", entry.name, target, entry.size, entry.sha256), started, true);
     let outcome = async {
         if !(1..=65535).contains(&port) {
             return Err("The loader port must be between 1 and 65535.".into());
@@ -540,9 +550,12 @@ async fn send_payload_at(
             let bytes = fs::read(root.join(file_name))
                 .map_err(|_| "Could not read the stored payload.".to_string())?;
             trace.step("Read stored copy", format!("{} bytes", grouped(bytes.len())), step, true);
-            send_bytes(host.trim(), port as u16, &bytes, &mut trace).await?;
+            if let Some(mut reply) = send_bytes(host.trim(), port as u16, &bytes, target == "ps5", &mut trace).await? {
+                reply.wait(LOADER_REPLY_WAIT).await;
+                if let Some(error) = reply.record(&mut trace) { return Err(error); }
+            }
             Ok(PayloadSendResult::new(
-                format!("Sent {} ({} bytes) to {}:{}.", entry.name, bytes.len(), host.trim(), port),
+                format!("Sent {} ({} bytes) to {}:{}. Console execution was not verified.", entry.name, bytes.len(), host.trim(), port),
                 bytes.len(),
                 port,
                 false,
@@ -551,6 +564,7 @@ async fn send_payload_at(
     }
     .await;
     let outcome = outcome.map(|mut result| {
+        if !result.verified { result.message = with_log_location(result.message); }
         result.total_ms = started.elapsed().as_millis() as u64;
         if let Some((bytes, took)) = trace.sent {
             result.send_ms = Some(took.as_millis() as u64);
@@ -560,7 +574,8 @@ async fn send_payload_at(
         result.host = host.trim().to_string();
         result.sha256 = entry.sha256.clone();
         result
-    });
+    }).map_err(with_log_location);
+    crate::session_log::write("payload-result", match &outcome { Ok(result) => &result.message, Err(error) => error });
 
     // A send can take seconds. Preserve edits/imports made while the socket was active.
     let _index = index_lock().lock().unwrap_or_else(|p| p.into_inner());
@@ -586,6 +601,13 @@ async fn send_payload_at(
     outcome
 }
 
+fn with_log_location(message: String) -> String {
+    match crate::session_log::location() {
+        Some(path) => format!("{message} Diagnostic log: {path}"),
+        None => message,
+    }
+}
+
 async fn send_ps5_receiver(
     host: &str,
     loader_port: u32,
@@ -596,18 +618,18 @@ async fn send_ps5_receiver(
     let step = Instant::now();
     let probed = probe_receiver(host, receiver_port).await;
     let found = match &probed {
-        Ok(Some(config)) => format!("v{} ({}) answered on :{receiver_port}", config.version, config.platform.as_deref().unwrap_or("unknown")),
-        Ok(None) => format!("Nothing on :{receiver_port}"),
+        Ok(ReceiverProbe::Online(config)) => format!("v{} ({}) answered at {host}:{receiver_port}", config.version, config.platform.as_deref().unwrap_or("unknown")),
+        Ok(ReceiverProbe::Unavailable(error)) => error.clone(),
         Err(error) => error.clone(),
     };
-    trace.step("Probe receiver", found, step, probed.is_ok());
+    trace.step("Probe receiver", found, step, matches!(&probed, Ok(ReceiverProbe::Online(_))));
     match probed? {
-        Some(config)
+        ReceiverProbe::Online(config)
             if config.version == RECEIVER_VERSION && config.platform.as_deref() == Some("ps5") =>
         {
             return Ok(PayloadSendResult::new(format!("Receiver already running (v{RECEIVER_VERSION})"), 0, loader_port, true));
         }
-        Some(config) => {
+        ReceiverProbe::Online(config) => {
             if config.platform.as_deref() == Some("ps4") {
                 return Err(
                     "A PS4 receiver answered at the PS5 address. Check the selected console."
@@ -633,50 +655,90 @@ async fn send_ps5_receiver(
             trace.step("Wait for port to close", format!(":{receiver_port}"), step, closed.is_ok());
             closed?;
         }
-        None => {}
+        ReceiverProbe::Unavailable(_) => {}
     }
 
-    send_bytes(host, loader_port as u16, RECEIVER_ELF, trace).await?;
+    let reply = send_bytes(host, loader_port as u16, RECEIVER_ELF, true, trace).await?
+        .expect("PS5 loader capture is enabled");
     let step = Instant::now();
     let deadline = Instant::now() + timing.verify_timeout;
+    let mut last_probe = format!("No SSPI receiver answered at {host}:{receiver_port}.");
     loop {
+        if let Some(error) = reply.failure(true) {
+            reply.record_for_receiver(trace);
+            return Err(error);
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            trace.step("Verify receiver", format!("No answer on :{receiver_port} within {} s", timing.verify_timeout.as_secs()), step, false);
-            return Ok(PayloadSendResult::new(format!("Payload sent to {host}:{loader_port}, but the receiver hasn't answered yet."), RECEIVER_ELF.len(), loader_port, false));
+            if let Some(error) = reply.record_for_receiver(trace) { return Err(error); }
+            trace.step("Verify receiver", format!("Not verified within {} s. {last_probe}", timing.verify_timeout.as_secs()), step, false);
+            return Ok(PayloadSendResult::new(format!("Payload sent to {host}:{loader_port}, but the receiver did not become ready within {} s. {last_probe} The loader accepting bytes does not prove startup; check its output in the send steps or diagnostic log.", timing.verify_timeout.as_secs()), RECEIVER_ELF.len(), loader_port, false));
         }
-        if let Ok(Ok(Some(config))) = timeout(remaining, probe_receiver(host, receiver_port)).await
-        {
-            if config.version == RECEIVER_VERSION && config.platform.as_deref() == Some("ps5") {
+        let probed = tokio::select! {
+            biased;
+            error = reply.wait_for_receiver_failure() => {
+                reply.record_for_receiver(trace);
+                return Err(error);
+            }
+            probed = timeout(remaining, probe_receiver(host, receiver_port)) => probed,
+        };
+        match probed {
+            Ok(Ok(ReceiverProbe::Online(config))) if config.version == RECEIVER_VERSION && config.platform.as_deref() == Some("ps5") => {
+                if let Some(error) = reply.record_for_receiver(trace) { return Err(error); }
                 trace.step("Verify receiver", format!("v{} answered on :{receiver_port}, {} capabilities", config.version, config.capabilities.len()), step, true);
                 return Ok(PayloadSendResult::new(format!("Receiver loaded and verified (v{RECEIVER_VERSION})."), RECEIVER_ELF.len(), loader_port, true));
             }
+            Ok(Ok(ReceiverProbe::Online(config))) => last_probe = format!("Receiver at {host}:{receiver_port} returned {} v{}; expected PS5 v{RECEIVER_VERSION}.", config.platform.as_deref().unwrap_or("unknown platform"), config.version),
+            Ok(Err(error)) => last_probe = error,
+            Ok(Ok(ReceiverProbe::Unavailable(error))) => last_probe = error,
+            Err(_) => last_probe = format!("The receiver probe at {host}:{receiver_port} did not finish before the startup deadline."),
         }
-        sleep(timing.poll_interval).await;
+        tokio::select! {
+            error = reply.wait_for_receiver_failure() => {
+                reply.record_for_receiver(trace);
+                return Err(error);
+            }
+            _ = sleep(timing.poll_interval.min(deadline.saturating_duration_since(Instant::now()))) => {}
+        }
     }
 }
 
-async fn probe_receiver(host: &str, port: u16) -> Result<Option<ReceiverConfig>, String> {
+enum ReceiverProbe {
+    Online(ReceiverConfig),
+    Unavailable(String),
+}
+
+fn receiver_probe_error(host: &str, port: u16, error: String) -> String {
+    let recovery = if error == "Receiver request timed out after 2000 ms" {
+        " The receiver port accepted a connection but did not answer. Restart the PS5, enable its ELF loader, then load the bundled receiver again."
+    } else { "" };
+    format!("PS5 receiver at {host}:{port}: {error}{recovery}")
+}
+
+async fn probe_receiver(host: &str, port: u16) -> Result<ReceiverProbe, String> {
     let mut stream = match timeout(
-        Duration::from_millis(1500),
+        RECEIVER_CONNECT_TIMEOUT,
         TcpStream::connect((host, port)),
     )
     .await
     {
         Ok(Ok(stream)) => stream,
-        Ok(Err(_)) | Err(_) => return Ok(None),
+        Ok(Err(error)) => return Ok(ReceiverProbe::Unavailable(format!("Could not connect to the PS5 receiver at {host}:{port}: {}.", socket_error_detail(&error)))),
+        Err(_) => return Ok(ReceiverProbe::Unavailable(format!("The PS5 receiver connection to {host}:{port} timed out after {} ms.", RECEIVER_CONNECT_TIMEOUT.as_millis()))),
     };
-    let (ping_code, ping_body) = exchange(&mut stream, 0x01, &[]).await?;
+    let (ping_code, ping_body) = exchange(&mut stream, 0x01, &[]).await
+        .map_err(|error| receiver_probe_error(host, port, error))?;
     if ping_code != 1 || ping_body != b"SSPI" {
-        return Err("The service at the PS5 receiver port isn't an SSPI receiver.".into());
+        return Err(format!("The service at {host}:{port} isn't an SSPI receiver (unexpected handshake response code {ping_code}, {} bytes).", ping_body.len()));
     }
-    let (code, body) = exchange(&mut stream, 0x53, &[]).await?;
+    let (code, body) = exchange(&mut stream, 0x53, &[]).await
+        .map_err(|error| receiver_probe_error(host, port, error))?;
     if code != 3 {
-        return Err("The PS5 receiver didn't return its configuration.".into());
+        return Err(format!("The PS5 receiver at {host}:{port} didn't return its configuration (response code {code})."));
     }
     parse_receiver_config(&body)
-        .map(Some)
-        .ok_or_else(|| "The PS5 receiver returned invalid configuration.".into())
+        .map(ReceiverProbe::Online)
+        .ok_or_else(|| format!("The PS5 receiver at {host}:{port} returned invalid configuration."))
 }
 
 async fn send_stop(host: &str, port: u16) -> Result<(), String> {
@@ -715,14 +777,186 @@ async fn wait_for_port_closed(host: &str, port: u16, max_wait: Duration) -> Resu
     }
 }
 
-async fn send_bytes(host: &str, port: u16, bytes: &[u8], trace: &mut Trace) -> Result<(), String> {
+#[derive(Default)]
+struct LoaderOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+    closed: bool,
+    read_error: Option<String>,
+    rejection: Option<String>,
+    startup_failure: Option<String>,
+    startup_line: Vec<u8>,
+    startup_line_overflow: bool,
+    tail: String,
+}
+
+impl LoaderOutput {
+    fn append(&mut self, bytes: &[u8]) {
+        let keep = bytes.len().min(MAX_LOADER_OUTPUT.saturating_sub(self.bytes.len()));
+        self.bytes.extend_from_slice(&bytes[..keep]);
+        self.truncated |= keep < bytes.len();
+        // Arbitrary payload stdout has no status protocol. SSPI markers are acted on only
+        // by the built-in receiver path, never by manual/catalog sends.
+        for &byte in bytes {
+            if byte == b'\n' {
+                if !self.startup_line_overflow && self.startup_failure.is_none() {
+                    let line = String::from_utf8_lossy(&self.startup_line);
+                    if is_receiver_startup_failure(line.trim_end_matches('\r')) {
+                        self.startup_failure = Some(line.trim_end_matches('\r').into());
+                    }
+                }
+                self.startup_line.clear();
+                self.startup_line_overflow = false;
+            } else if self.startup_line.len() < 256 {
+                self.startup_line.push(byte);
+            } else {
+                self.startup_line_overflow = true;
+            }
+        }
+        let text = format!("{}{}", self.tail, String::from_utf8_lossy(bytes));
+        for message in [
+            "[elfldr.elf] Unknown payload format",
+            "[elfldr.elf] Error reading URI payload",
+            "[elfldr.elf] Error reading HTTP payload",
+            "[elfldr.elf] Error reading ELF payload",
+            "[elfldr.elf] Error reading SELF payload",
+            "[elfldr.elf] Error spawning payload",
+        ] {
+            if text.contains(message) { self.rejection = Some(message.into()); }
+        }
+        self.tail = text.chars().rev().take(128).collect::<String>().chars().rev().collect();
+    }
+}
+
+fn is_receiver_startup_failure(line: &str) -> bool {
+    let Some(marker) = line.strip_prefix("[SSPI startup] ") else { return false; };
+    let Some((stage, code)) = marker.rsplit_once(" 0x") else { return false; };
+    code.len() == 8 && code.bytes().all(|byte| byte.is_ascii_hexdigit()) && matches!(stage,
+        "kernel init failed" | "kernel log init failed" | "libc thread symbol missing" |
+        "runtime patch init failed" | "runtime linker init failed" |
+        "payload library allocation failed" | "load libraries failed" |
+        "library constructors failed" | "socket failed" | "bind failed" | "listen failed")
+}
+
+struct LoaderReply {
+    output: Arc<Mutex<LoaderOutput>>,
+    reader: JoinHandle<()>,
+    started: Instant,
+    changed: Arc<Notify>,
+}
+
+impl LoaderReply {
+    fn start(mut stream: OwnedReadHalf) -> Self {
+        let output = Arc::new(Mutex::new(LoaderOutput::default()));
+        let shared = output.clone();
+        let changed = Arc::new(Notify::new());
+        let reader_changed = changed.clone();
+        let reader = tokio::spawn(async move {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match stream.read(&mut buffer).await {
+                    Ok(0) => {
+                        shared.lock().unwrap_or_else(|p| p.into_inner()).closed = true;
+                        return;
+                    }
+                    Ok(count) => {
+                        shared.lock().unwrap_or_else(|p| p.into_inner()).append(&buffer[..count]);
+                        reader_changed.notify_one();
+                    }
+                    Err(error) => {
+                        shared.lock().unwrap_or_else(|p| p.into_inner()).read_error = Some(error.to_string());
+                        return;
+                    }
+                }
+            }
+        });
+        Self { output, reader, started: Instant::now(), changed }
+    }
+
+    async fn wait(&mut self, max_wait: Duration) {
+        let _ = timeout(max_wait, &mut self.reader).await;
+    }
+
+    fn failure(&self, builtin_receiver: bool) -> Option<String> {
+        let output = self.output.lock().unwrap_or_else(|p| p.into_inner());
+        if builtin_receiver {
+            if let Some(marker) = &output.startup_failure {
+                return Some(format!("SSPI receiver startup failed: {marker}. Payload bytes were sent, but the receiver did not start. It was not resent.\nLoader output:\n{}{}",
+                    loader_output_text(&output), if output.truncated { "\n[output truncated at 32 KiB]" } else { "" }));
+            }
+        }
+        output.rejection.as_ref().map(|message| format!("The payload loader rejected the payload: {message}. It was not resent."))
+    }
+
+    async fn wait_for_receiver_failure(&self) -> String {
+        loop {
+            if let Some(error) = self.failure(true) { return error; }
+            self.changed.notified().await;
+        }
+    }
+
+    fn record_for_receiver(&self, trace: &mut Trace) -> Option<String> {
+        self.record_output(trace, true)
+    }
+
+    fn record(&self, trace: &mut Trace) -> Option<String> {
+        self.record_output(trace, false)
+    }
+
+    fn record_output(&self, trace: &mut Trace, builtin_receiver: bool) -> Option<String> {
+        let failure = self.failure(builtin_receiver);
+        let output = self.output.lock().unwrap_or_else(|p| p.into_inner());
+        let text = loader_output_text(&output);
+        let status = if let Some(error) = &output.read_error {
+            format!("Read ended: {error}; this alone does not establish whether the payload started")
+        } else if output.closed {
+            "Loader closed its output stream; this alone does not establish whether the payload started".into()
+        } else {
+            "Capture window ended; this alone does not establish whether the payload started".into()
+        };
+        let detail = format!("{status}. {}{}", if text.trim().is_empty() { "No loader output." } else { text.trim() }, if output.truncated { " [output truncated at 32 KiB]" } else { "" });
+        trace.step("Loader output", detail, self.started, failure.is_none());
+        failure
+    }
+}
+
+fn loader_output_text(output: &LoaderOutput) -> String {
+    String::from_utf8_lossy(&output.bytes).chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect()
+}
+
+impl Drop for LoaderReply {
+    fn drop(&mut self) { self.reader.abort(); }
+}
+
+fn socket_error_detail(error: &io::Error) -> String {
+    let code = error.raw_os_error().map(|code| code.to_string()).unwrap_or_else(|| "unavailable".into());
+    format!("{error} [kind={:?}, os_code={code}]", error.kind())
+}
+
+fn loader_connect_timeout(host: &str, port: u16, duration: Duration) -> String {
+    format!("The payload loader connection timed out. {host}:{port} did not connect within {} ms. No payload bytes were sent.", duration.as_millis())
+}
+
+async fn send_bytes(host: &str, port: u16, bytes: &[u8], capture_output: bool, trace: &mut Trace) -> Result<Option<LoaderReply>, String> {
     let step = Instant::now();
-    let connected = timeout(Duration::from_secs(3), TcpStream::connect((host, port)))
+    let connected = timeout(LOADER_CONNECT_TIMEOUT, TcpStream::connect((host, port)))
         .await
-        .map_err(|_| "The payload loader connection timed out.".to_string())
-        .and_then(|result| result.map_err(|_| "Could not connect to the payload loader.".to_string()));
-    trace.step("Connect to loader", match &connected { Ok(_) => format!("{host}:{port}"), Err(error) => error.clone() }, step, connected.is_ok());
-    let mut stream = connected?;
+        .map_err(|_| loader_connect_timeout(host, port, LOADER_CONNECT_TIMEOUT))
+        .and_then(|result| result.map_err(|error| format!("Could not connect to the payload loader. {host}:{port}: {}. No payload bytes were sent.", socket_error_detail(&error))));
+    let detail = match &connected {
+        Ok(stream) => {
+            let mut detail = format!("{host}:{port}");
+            if let Ok(local) = stream.local_addr() { detail.push_str(&format!(" | local {local}")); }
+            if let Ok(peer) = stream.peer_addr() { detail.push_str(&format!(" | peer {peer}")); }
+            detail
+        }
+        Err(error) => error.clone(),
+    };
+    trace.step("Connect to loader", detail, step, connected.is_ok());
+    let (reader, mut stream) = connected?.into_split();
+    // Drain while uploading too: a rejecting loader can reply before it consumes the whole ELF.
+    let mut reply = capture_output.then(|| LoaderReply::start(reader));
     let step = Instant::now();
     let written = timeout(Duration::from_secs(90), async {
         stream.write_all(bytes).await?;
@@ -731,13 +965,20 @@ async fn send_bytes(host: &str, port: u16, bytes: &[u8], trace: &mut Trace) -> R
     })
     .await
     .map_err(|_| "Sending the payload timed out.".to_string())
-    .and_then(|result| result.map_err(|_| "Could not send the complete payload.".to_string()));
+    .and_then(|result| result.map_err(|error| format!("Could not send the complete payload: {error}.")));
     let took = step.elapsed();
-    trace.step("Send payload", match &written { Ok(_) => format!("{} bytes, connection closed", grouped(bytes.len())), Err(error) => error.clone() }, step, written.is_ok());
-    written?;
+    trace.step("Send payload", match &written { Ok(_) => format!("{} bytes written, upload finished (write EOF)", grouped(bytes.len())), Err(error) => error.clone() }, step, written.is_ok());
+    if let Err(error) = written {
+        drop(stream);
+        if let Some(reply) = &mut reply {
+            reply.wait(Duration::from_millis(250)).await;
+            if let Some(rejection) = reply.record(trace) { return Err(format!("{error} {rejection}")); }
+        }
+        return Err(format!("{error} The payload may have been partially delivered; it was not resent."));
+    }
     trace.sent = Some((bytes.len(), took));
     drop(stream);
-    Ok(())
+    Ok(reply)
 }
 
 async fn exchange(
@@ -755,26 +996,26 @@ async fn exchange(
         stream
             .write_all(&request)
             .await
-            .map_err(|_| "Could not send receiver request".to_string())?;
+            .map_err(|error| format!("Could not send receiver request: {}", socket_error_detail(&error)))?;
         let mut header = [0_u8; 5];
         stream
             .read_exact(&mut header)
             .await
-            .map_err(|_| "Incomplete receiver response".to_string())?;
+            .map_err(|error| format!("Incomplete receiver response header: {}", socket_error_detail(&error)))?;
         let response_len =
             u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
         if response_len > MAX_RESPONSE {
-            return Err("Receiver response too large".into());
+            return Err(format!("The service returned an invalid SSPI response length ({response_len} bytes; header {:02x?}). The receiver port may belong to another service or an incompatible receiver. Check the receiver port in Options, Consoles; it is separate from the ELF loader port.", header));
         }
         let mut response = vec![0; response_len];
         stream
             .read_exact(&mut response)
             .await
-            .map_err(|_| "Incomplete receiver response".to_string())?;
+            .map_err(|error| format!("Incomplete receiver response body: {}", socket_error_detail(&error)))?;
         Ok((header[0], response))
     })
     .await
-    .map_err(|_| "Receiver request timed out".to_string())?
+    .map_err(|_| "Receiver request timed out after 2000 ms".to_string())?
 }
 
 fn parse_receiver_config(body: &[u8]) -> Option<ReceiverConfig> {
@@ -975,7 +1216,8 @@ mod tests {
     use tokio::{net::TcpListener, task::JoinHandle};
 
     fn temp_root() -> PathBuf {
-        std::env::temp_dir().join(format!("sspi-payloads-test-{}", uuid::Uuid::new_v4()))
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../Build-Output/Windows Manager/tests")
+            .join(format!("sspi-payloads-test-{}", uuid::Uuid::new_v4()))
     }
 
     #[test]
@@ -1407,8 +1649,379 @@ mod tests {
         .await
         .unwrap();
         assert!(!result.verified);
-        assert!(result.message.contains("receiver hasn't answered yet"));
+        assert!(result.message.contains("receiver did not become ready"));
+        assert!(result.steps.iter().any(|step| step.label == "Loader output" && step.detail.contains("No loader output")));
         loader_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refused_loader_connection_keeps_native_error_and_never_reaches_upload() {
+        // Reserve a loopback port without listening, so another test cannot claim it.
+        let reservation = tokio::net::TcpSocket::new_v4().unwrap();
+        reservation.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        let mut trace = Trace::new();
+        let error = match send_bytes("127.0.0.1", port, b"must not be sent", true, &mut trace).await {
+            Err(error) => error,
+            Ok(_) => panic!("a non-listening port accepted a payload"),
+        };
+        assert!(error.starts_with("Could not connect to the payload loader. "), "{error}");
+        assert!(error.contains(&format!("127.0.0.1:{port}")), "{error}");
+        assert!(error.contains("kind=ConnectionRefused"), "{error}");
+        assert!(error.contains("os_code=") && !error.contains("os_code=unavailable"), "{error}");
+        #[cfg(windows)]
+        {
+            assert!(error.contains("os_code=10061"), "{error}");
+            assert!(error.contains(&io::Error::from_raw_os_error(10061).to_string()), "{error}");
+        }
+        assert!(error.contains("No payload bytes were sent."));
+        assert!(trace.sent.is_none());
+        assert_eq!(trace.steps.len(), 1);
+        assert_eq!(trace.steps[0].label, "Connect to loader");
+        assert_eq!(trace.steps[0].detail, error);
+        assert!(!trace.steps[0].ok);
+    }
+
+    #[test]
+    fn loader_timeout_identifies_endpoint_deadline_and_unsent_payload() {
+        let message = loader_connect_timeout("192.0.2.7", 9021, LOADER_CONNECT_TIMEOUT);
+        assert!(message.starts_with("The payload loader connection timed out. "));
+        assert!(message.contains("192.0.2.7:9021"));
+        assert!(message.contains("3000 ms"));
+        assert!(message.contains("No payload bytes were sent."));
+    }
+
+    #[tokio::test]
+    async fn ps5_foreign_service_header_identifies_receiver_port_without_sending_payload() {
+        let receiver = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let receiver_port = receiver.local_addr().unwrap().port();
+        let loader = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let loader_port = loader.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = receiver.accept().await.unwrap();
+            let mut request = [0_u8; 5];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, [0x01, 0, 0, 0, 0]);
+            stream.write_all(b"HTTP/").await.unwrap();
+        });
+        let mut trace = Trace::new();
+        let error = send_ps5_receiver("127.0.0.1", loader_port.into(), receiver_port, test_timing(), &mut trace).await.unwrap_err();
+        assert!(error.contains(&format!("127.0.0.1:{receiver_port}")), "{error}");
+        assert!(error.contains("invalid SSPI response length"), "{error}");
+        assert!(error.contains("header [48, 54, 54, 50, 2f]"), "{error}");
+        assert!(error.contains("separate from the ELF loader port"), "{error}");
+        assert!(trace.sent.is_none());
+        assert_eq!(trace.steps.len(), 1);
+        assert!(timeout(Duration::from_millis(50), loader.accept()).await.is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ps5_silent_receiver_requires_restart_without_sending_payload() {
+        for silent_command in [0x01, 0x53] {
+            let receiver = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let receiver_port = receiver.local_addr().unwrap().port();
+            let loader = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let loader_port = loader.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = receiver.accept().await.unwrap();
+                let mut request = [0_u8; 5];
+                stream.read_exact(&mut request).await.unwrap();
+                assert_eq!(request, [0x01, 0, 0, 0, 0]);
+                if silent_command == 0x53 {
+                    stream.write_all(&[1, 4, 0, 0, 0, b'S', b'S', b'P', b'I']).await.unwrap();
+                    stream.read_exact(&mut request).await.unwrap();
+                    assert_eq!(request, [0x53, 0, 0, 0, 0]);
+                }
+                let mut closed = [0_u8; 1];
+                assert_eq!(stream.read(&mut closed).await.unwrap(), 0);
+            });
+            let mut trace = Trace::new();
+            let error = send_ps5_receiver("127.0.0.1", loader_port.into(), receiver_port, test_timing(), &mut trace).await.unwrap_err();
+            assert!(error.contains(&format!("127.0.0.1:{receiver_port}")), "{error}");
+            assert!(error.contains("Receiver request timed out after 2000 ms"), "{error}");
+            assert!(error.contains("Restart the PS5, enable its ELF loader, then load the bundled receiver again"), "{error}");
+            assert!(trace.sent.is_none());
+            assert_eq!(trace.steps.len(), 1);
+            assert!(timeout(Duration::from_millis(50), loader.accept()).await.is_err());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_probe_preserves_connection_and_protocol_socket_errors() {
+        let reservation = tokio::net::TcpSocket::new_v4().unwrap();
+        reservation.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        match probe_receiver("127.0.0.1", port).await {
+            Ok(ReceiverProbe::Unavailable(detail)) => {
+                assert!(detail.contains(&format!("127.0.0.1:{port}")), "{detail}");
+                // Windows can report refusal after the probe's 1500 ms deadline.
+                if detail.contains("kind=ConnectionRefused") {
+                    assert!(detail.contains("os_code=") && !detail.contains("os_code=unavailable"), "{detail}");
+                } else {
+                    assert!(detail.contains("timed out after 1500 ms"), "{detail}");
+                }
+            }
+            _ => panic!("a refused probe should report unavailability without preventing a loader send"),
+        }
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 5];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, [0x01, 0, 0, 0, 0]);
+        });
+        match probe_receiver("127.0.0.1", port).await {
+            Err(error) => {
+                assert!(error.contains(&format!("127.0.0.1:{port}")), "{error}");
+                assert!(error.contains("Incomplete receiver response header"), "{error}");
+                assert!(error.contains("kind=UnexpectedEof"), "{error}");
+                assert!(!error.contains("No payload bytes were sent"));
+            }
+            _ => panic!("a connection closing before its response should preserve the protocol error"),
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loader_output_follows_upload_eof_without_changing_payload_bytes() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected = vec![0x5a; 4 * 1024 * 1024];
+        let server_bytes = expected.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, server_bytes);
+            stream.write_all(b"SSPI payload started\nSSPI ready\n").await.unwrap();
+        });
+        let mut trace = Trace::new();
+        let mut reply = send_bytes("127.0.0.1", port, &expected, true, &mut trace).await.unwrap().unwrap();
+        reply.wait(Duration::from_secs(1)).await;
+        assert!(reply.record(&mut trace).is_none());
+        assert!(trace.steps.last().unwrap().detail.contains("SSPI payload started"));
+        assert!(trace.steps[0].detail.contains("local 127.0.0.1:"));
+        assert!(trace.steps[0].detail.contains(&format!("peer 127.0.0.1:{port}")));
+        assert_eq!(trace.sent.unwrap().0, expected.len());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loader_explicit_rejection_is_a_failure_and_remains_in_history() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("rejected.bin");
+        fs::write(&input, b"payload").unwrap();
+        let entries = add_payloads_at(&root, &[input.to_string_lossy().into_owned()], "ps5").unwrap();
+        let id = &entries.iter().find(|entry| !entry.builtin).unwrap().id;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.read_to_end(&mut Vec::new()).await.unwrap();
+            stream.write_all(b"[elfldr.elf] Error spawning payload\n\r\0").await.unwrap();
+        });
+        let error = send_payload_at(&root, id, "ps5", "127.0.0.1", port.into(), &Settings::default(), test_timing()).await.unwrap_err();
+        assert!(error.contains("Error spawning payload"));
+        assert!(error.contains("not resent"));
+        assert_eq!(read_index(&root).unwrap().entries.iter().find(|entry| &entry.id == id).unwrap().last_result.as_deref(), Some(error.as_str()));
+        server.await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn loader_silence_is_bounded_and_not_mistaken_for_rejection() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.read_to_end(&mut Vec::new()).await.unwrap();
+            sleep(Duration::from_secs(60)).await;
+        });
+        let mut trace = Trace::new();
+        let mut reply = send_bytes("127.0.0.1", port, b"payload", true, &mut trace).await.unwrap().unwrap();
+        let started = Instant::now();
+        reply.wait(Duration::from_millis(60)).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(reply.record(&mut trace).is_none());
+        assert!(trace.steps.last().unwrap().detail.contains("No loader output"));
+        drop(reply);
+        server.abort();
+    }
+
+    #[test]
+    fn loader_capture_is_bounded_and_detects_split_rejections_after_the_limit() {
+        let mut output = LoaderOutput::default();
+        output.append(&vec![b'x'; MAX_LOADER_OUTPUT + 1]);
+        output.append(b"\n[elfldr.elf] Error spa");
+        output.append(b"wning payload\n\r\0");
+        assert_eq!(output.bytes.len(), MAX_LOADER_OUTPUT);
+        assert!(output.truncated);
+        assert_eq!(output.rejection.as_deref(), Some("[elfldr.elf] Error spawning payload"));
+        let mut ordinary = LoaderOutput::default();
+        ordinary.append(b"SSPI loaded; error count 0\n");
+        assert!(ordinary.rejection.is_none());
+    }
+
+    #[test]
+    fn receiver_fatal_markers_are_exact_fragment_safe_and_bounded() {
+        let marker = b"[SSPI startup] load libraries failed 0xffffffff\n";
+        for split in 0..marker.len() {
+            let mut output = LoaderOutput::default();
+            output.append(&vec![b'x'; MAX_LOADER_OUTPUT + 100]);
+            output.append(b"\n");
+            output.append(&marker[..split]);
+            assert!(output.startup_failure.is_none());
+            output.append(&marker[split..]);
+            assert_eq!(output.startup_failure.as_deref(), Some("[SSPI startup] load libraries failed 0xffffffff"));
+            assert!(output.rejection.is_none());
+            assert_eq!(output.bytes.len(), MAX_LOADER_OUTPUT);
+        }
+        for line in [
+            "catalog: [SSPI startup] load libraries failed 0xffffffff",
+            "[SSPI startup] arbitrary failed 0xffffffff",
+            "[SSPI startup] load libraries failed 0xffffffff extra",
+            "[SSPI startup] load libraries failed 0xfffffff",
+            "[SSPI startup] load libraries failed 0xgggggggg",
+            "[SSPI startup] runtime init complete 0x00000000",
+            "[SSPI startup] listener ready 0x0000239a",
+            "[SceLncUtil] getAppStatus: LNC_ISOK::0x80940004",
+        ] {
+            let mut output = LoaderOutput::default();
+            output.append(format!("{line}\n").as_bytes());
+            assert!(output.startup_failure.is_none(), "{line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn builtin_fatal_startup_interrupts_inflight_probe_without_resending() {
+        let root = temp_root();
+        let receiver = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let receiver_port = receiver.local_addr().unwrap().port();
+        drop(receiver);
+        let loader = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = loader.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = loader.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, RECEIVER_ELF);
+            // A listening but silent receiver makes readiness probes block until cancelled.
+            let receiver = TcpListener::bind((Ipv4Addr::LOCALHOST, receiver_port)).await.unwrap();
+            sleep(Duration::from_millis(50)).await;
+            stream.write_all(b"[SSPI startup] runtime init complete 0x00000000\n[SceLncUtil] getAppStatus: LNC_ISOK::0x80940004\n[SSPI startup] load lib").await.unwrap();
+            sleep(Duration::from_millis(20)).await;
+            let fatal_at = Instant::now();
+            stream.write_all(b"raries failed 0xffffffff\n").await.unwrap();
+            assert!(timeout(Duration::from_millis(250), loader.accept()).await.is_err(), "payload must not be resent");
+            drop(receiver);
+            fatal_at
+        });
+        let mut trace = Trace::new();
+        let error = send_ps5_receiver("127.0.0.1", port.into(), receiver_port, Ps5Timing { verify_timeout: Duration::from_secs(30), ..test_timing() }, &mut trace).await.unwrap_err();
+        let finished = Instant::now();
+        let fatal_at = server.await.unwrap();
+        assert!(finished.duration_since(fatal_at) < Duration::from_millis(500));
+        assert!(error.starts_with("SSPI receiver startup failed:"), "{error}");
+        assert!(error.contains("load libraries failed 0xffffffff"));
+        assert!(error.contains("runtime init complete"));
+        assert!(error.contains("not resent"));
+        assert!(trace.steps.iter().any(|step| step.label == "Loader output" && !step.ok));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn manual_payload_startup_text_does_not_claim_execution_or_fail() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("catalog.bin");
+        fs::write(&input, b"payload").unwrap();
+        let entries = add_payloads_at(&root, &[input.to_string_lossy().into_owned()], "ps5").unwrap();
+        let id = &entries.iter().find(|entry| !entry.builtin).unwrap().id;
+        let loader = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = loader.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = loader.accept().await.unwrap();
+            stream.read_to_end(&mut Vec::new()).await.unwrap();
+            stream.write_all(b"[SSPI startup] load libraries failed 0xffffffff\n").await.unwrap();
+        });
+        let result = send_payload_at(&root, id, "ps5", "127.0.0.1", port.into(), &Settings::default(), test_timing()).await.unwrap();
+        assert!(!result.verified);
+        assert!(result.message.contains("Console execution was not verified"));
+        assert!(result.steps.iter().any(|step| step.label == "Loader output" && step.ok && step.detail.contains("load libraries failed")));
+        server.await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn loader_rejection_is_drained_while_large_upload_is_still_in_progress() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0; 64];
+            stream.read_exact(&mut header).await.unwrap();
+            stream.write_all(b"[elfldr.elf] Error reading ELF payload\n").await.unwrap();
+            stream.shutdown().await.unwrap();
+            sleep(Duration::from_millis(30)).await;
+        });
+        let mut trace = Trace::new();
+        let bytes = vec![0x5a; 32 * 1024 * 1024];
+        let result = timeout(Duration::from_secs(5), send_bytes("127.0.0.1", port, &bytes, true, &mut trace)).await.unwrap();
+        let error = match result {
+            Ok(Some(mut reply)) => { reply.wait(Duration::from_secs(1)).await; reply.record(&mut trace).unwrap() },
+            Err(error) => error,
+            _ => panic!("PS5 output capture missing"),
+        };
+        assert!(error.contains("Error reading ELF payload"), "{error}");
+        assert!(!error.contains("No payload bytes were sent"), "{error}");
+        assert!(trace.steps.iter().any(|step| step.label == "Loader output"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ps4_raw_send_does_not_wait_for_or_interpret_loader_output() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, b"ps4 payload");
+            sleep(Duration::from_secs(60)).await;
+        });
+        let mut trace = Trace::new();
+        let reply = timeout(Duration::from_secs(1), send_bytes("127.0.0.1", port, b"ps4 payload", false, &mut trace)).await.unwrap().unwrap();
+        assert!(reply.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ps5_verification_keeps_late_startup_diagnostics_and_stops_at_deadline() {
+        let root = temp_root();
+        let receiver_probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let receiver_port = receiver_probe.local_addr().unwrap().port();
+        drop(receiver_probe);
+        let loader = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let loader_port = loader.local_addr().unwrap().port();
+        let loader_task = tokio::spawn(async move {
+            let (mut stream, _) = loader.accept().await.unwrap();
+            stream.read_to_end(&mut Vec::new()).await.unwrap();
+            sleep(Duration::from_millis(100)).await;
+            stream.write_all(b"SSPI SDK startup: kernel init failed\n").await.unwrap();
+            sleep(Duration::from_secs(60)).await;
+        });
+        let started = Instant::now();
+        let result = send_payload_at(&root, BUILTIN_PS5, "ps5", "127.0.0.1", loader_port.into(), &Settings { ps5_port: receiver_port, ..Settings::default() }, Ps5Timing { verify_timeout: Duration::from_millis(300), ..test_timing() }).await.unwrap();
+        assert!(!result.verified);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(result.steps.iter().any(|step| step.label == "Loader output" && step.detail.contains("kernel init failed")));
+        loader_task.abort();
+        fs::remove_dir_all(root).unwrap();
     }
 
 }

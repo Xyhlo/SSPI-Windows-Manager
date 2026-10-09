@@ -2,7 +2,7 @@
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, fs, io::Read, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, Ordering}, Mutex, OnceLock}, time::{Duration, Instant}};
+use std::{collections::HashSet, fs, io::{Read, Write}, path::{Path, PathBuf}, process::Stdio, sync::{atomic::{AtomicBool, Ordering}, Mutex, OnceLock}, time::{Duration, Instant}};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const BASE: &str = "https://amptis.com/apk/sspi-updates/v1";
@@ -90,6 +90,96 @@ fn root(app: &AppHandle) -> Result<PathBuf, String> {
 fn install_root() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| e.to_string())?.parent().map(Path::to_path_buf).ok_or("Application directory is unavailable".into())
 }
+fn stage_name(manifest: &Manifest) -> String {
+    format!("stage-{}-{}", manifest.build, manifest.package.sha256.chars().take(16).collect::<String>().to_ascii_lowercase())
+}
+fn save_ready(root: &Path, manifest: &Manifest, stage: &Path) -> Result<(), String> {
+    let destination = root.join("ready.json"); no_links(&destination)?;
+    let temp = root.join(format!("ready-{}.tmp", uuid::Uuid::new_v4())); no_links(&temp)?;
+    let saved = Saved { manifest: manifest.clone(), stage_dir: stage.into() };
+    let bytes = serde_json::to_vec(&saved).map_err(|e| e.to_string())?;
+    let result = (|| {
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        file.write_all(&bytes)?; file.sync_all()?; drop(file);
+        fs::rename(&temp, &destination)
+    })();
+    if result.is_err() { let _ = fs::remove_file(&temp); }
+    result.map_err(|e| format!("Could not save the prepared update at {}: {e}", destination.display()))
+}
+fn compact_stage(root: &Path, stage: &mut PathBuf, manifest: &Manifest) -> Result<(), String> {
+    validate_manifest(manifest, &manifest.channel)?;
+    if stage.parent() != Some(root) || !stage.file_name().is_some_and(|name| name.to_string_lossy().starts_with("stage-")) {
+        return Err("The prepared update directory is outside the updater directory".into());
+    }
+    no_links(root)?; no_links(stage)?; no_links(&stage.join("files"))?;
+    if !stage.join("files").is_dir() { return Err("The prepared update files are missing; download the update again".into()); }
+    let compact = root.join(stage_name(manifest)); no_links(&compact)?;
+    if compact == *stage { return save_ready(root, manifest, stage); }
+    match fs::symlink_metadata(&compact) {
+        Ok(_) => return Err(format!("Cannot shorten the update path because {} already exists; no files were replaced", compact.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Could not inspect the compact update directory: {error}")),
+    }
+    let original = stage.clone();
+    fs::rename(&original, &compact).map_err(|e| format!("Could not shorten the prepared update path: {e}"))?;
+    *stage = compact.clone();
+    if let Err(error) = save_ready(root, manifest, &compact) {
+        return match fs::rename(&compact, &original) {
+            Ok(()) => { *stage = original; Err(format!("{error}. The original update directory was restored.")) },
+            Err(rollback) => Err(format!("{error}. Could not restore the original path: {rollback}. Prepared files remain at {}.", compact.display())),
+        };
+    }
+    Ok(())
+}
+fn restore_saved_stage(root: &Path, saved: &mut Saved) -> Result<bool, String> {
+    if validate_manifest(&saved.manifest, &saved.manifest.channel).is_err()
+        || saved.stage_dir.parent() != Some(root)
+        || !saved.stage_dir.file_name().is_some_and(|name| name.to_string_lossy().starts_with("stage-")) {
+        return Ok(false);
+    }
+    no_links(root)?; no_links(&saved.stage_dir)?; no_links(&saved.stage_dir.join("files"))?;
+    match fs::symlink_metadata(&saved.stage_dir) {
+        Ok(_) => return Ok(saved.stage_dir.join("files").is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Could not inspect the prepared update directory: {error}")),
+    }
+    // A crash can leave the rename committed while ready.json still names the old directory.
+    let compact = root.join(stage_name(&saved.manifest));
+    no_links(&compact)?; no_links(&compact.join("files"))?;
+    if compact == saved.stage_dir || !compact.join("files").is_dir() { return Ok(false); }
+    // Persist before pruning. An error must preserve the surviving stage for a later retry.
+    save_ready(root, &saved.manifest, &compact)?;
+    saved.stage_dir = compact;
+    Ok(true)
+}
+fn diagnostic_text(path: &Path, limit: usize) -> Option<String> {
+    let mut bytes = Vec::new();
+    fs::File::open(path).ok()?.take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
+    let truncated = bytes.len() > limit; bytes.truncate(limit);
+    let mut text: String = String::from_utf8_lossy(&bytes).chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect();
+    if truncated { text.push_str(" [truncated]"); }
+    Some(text)
+}
+fn helper_exit_error(result_path: &Path, stderr_path: &Path, exit: &str) -> String {
+    if let Some(result) = diagnostic_text(result_path, 16 * 1024).and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok()) {
+        if result["status"] == "failed" {
+            if let Some(message) = result["message"].as_str().filter(|message| !message.trim().is_empty() && message.len() <= 4096) {
+                let message: String = message.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).collect();
+                return format!("The updater could not prepare the installation: {message} SSPI is still running. Diagnostic result: {}", result_path.display());
+            }
+        }
+    }
+    let detail = diagnostic_text(stderr_path, 4096).filter(|text| !text.trim().is_empty()).unwrap_or_else(|| "No error output was recorded.".into());
+    format!("The updater exited before preparing the installation ({exit}). {} SSPI is still running. Diagnostic output: {}", detail.trim(), stderr_path.display())
+}
+fn remove_previous_file(path: &Path) -> Result<(), String> {
+    no_links(path)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Could not clear previous update state at {}: {error}", path.display())),
+    }
+}
 fn prune_stages(root: &Path, keep: Option<&Path>) -> Result<(), String> {
     no_links(root)?;
     for entry in fs::read_dir(root).map_err(|e| e.to_string())? {
@@ -122,6 +212,8 @@ pub fn recover_if_needed() -> Result<(), String> {
         .arg("-RecoverRoot").arg(target).arg("-WaitPid").arg(std::process::id().to_string()).arg("-RestartRecovered");
     #[cfg(windows)] { use std::os::windows::process::CommandExt; cmd.creation_flags(0x08000000); }
     cmd.spawn().map_err(|e| format!("Could not start update recovery: {e}"))?;
+    crate::session_log::write("update-recovery", "Restoring an interrupted update; SSPI restarts when it finishes");
+    crate::session_log::flush();
     std::process::exit(0)
 }
 fn new_status(app: &AppHandle) -> Result<UpdateStatus, String> {
@@ -145,10 +237,9 @@ fn new_status(app: &AppHandle) -> Result<UpdateStatus, String> {
         }
     }
     if let Ok(bytes) = fs::read(dir.join("ready.json")) {
-        if let Ok(saved) = serde_json::from_slice::<Saved>(&bytes) {
+        if let Ok(mut saved) = serde_json::from_slice::<Saved>(&bytes) {
             if validate_manifest(&saved.manifest, &s.channel).is_ok() && newer(&saved.manifest, &s)
-                && saved.stage_dir.parent() == Some(dir.as_path()) && saved.stage_dir.file_name().is_some_and(|n| n.to_string_lossy().starts_with("stage-"))
-                && no_links(&saved.stage_dir).is_ok() && saved.stage_dir.join("files").is_dir() {
+                && restore_saved_stage(&dir, &mut saved)? {
                 s.total = saved.manifest.package.size; s.downloaded = s.total; s.available = Some(saved.manifest);
                 s.stage_dir = Some(saved.stage_dir); s.stage = "ready".into();
                 s.message = "Update downloaded and verified. Restart SSPI to install.".into();
@@ -168,11 +259,13 @@ fn publish(app: &AppHandle, status: &UpdateStatus) {
     let _ = app.emit("sspi-update", status);
 }
 fn fail(app: &AppHandle, mut status: UpdateStatus, error: String) -> String {
+    crate::session_log::write("updater", &error);
     status.stage = "error".into(); status.message = error.clone(); publish(app, &status); error
 }
 fn valid_channel(s: &str) -> bool { matches!(s, "development" | "stable") }
 fn hash_valid(s: &str) -> bool { s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) }
-fn version(s: &str) -> Vec<u64> { s.split('-').next().unwrap_or("").split('.').map(|v| v.parse().unwrap_or(0)).collect() }
+// Numeric fields, so 2.25.10 follows 2.25.9; pre-release and build suffixes are ignored.
+fn version(s: &str) -> Vec<u64> { s.split(['-', '+']).next().unwrap_or("").split('.').map(|v| v.parse().unwrap_or(0)).collect() }
 fn newer(m: &Manifest, s: &UpdateStatus) -> bool { m.build > s.current_build && version(&m.version) >= version(&s.current_version) }
 
 // Keep this policy aligned with the publisher and helper. No settings, jobs, payload library,
@@ -310,7 +403,7 @@ pub async fn download_update(app: AppHandle, _state: State<'_, crate::AppState>)
     let mut s = snapshot(&app)?; let m = s.available.clone().ok_or("Check for updates first")?;
     validate_manifest(&m, &s.channel)?;
     if !newer(&m, &s) { return Err("This update is not newer than the installed version".into()); }
-    let dir = root(&app)?.join(format!("stage-{}-{}", m.build, m.package.sha256.to_ascii_lowercase()));
+    let dir = root(&app)?.join(stage_name(&m));
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?; no_links(&dir)?;
     s.stage = "downloading".into(); s.downloaded = 0; s.total = m.package.size; s.stage_dir = None; s.message = "Downloading update…".into(); publish(&app, &s);
     let result = async {
@@ -366,8 +459,7 @@ pub async fn download_update(app: AppHandle, _state: State<'_, crate::AppState>)
         s.stage = "verifying".into(); s.message = "Verifying and staging application files…".into(); publish(&app, &s);
         let staged = dir.join("files"); let manifest = m.clone();
         tokio::task::spawn_blocking(move || extract(&zip, &staged, &manifest)).await.map_err(|e| e.to_string())??;
-        let saved = Saved { manifest: m.clone(), stage_dir: dir.clone() };
-        fs::write(root(&app)?.join("ready.json"), serde_json::to_vec(&saved).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        save_ready(&root(&app)?, &m, &dir)?;
         Ok::<_, String>(())
     }.await;
     if let Err(e) = result { return Err(fail(&app, s, e)); }
@@ -398,16 +490,33 @@ pub async fn install_update(app: AppHandle, state: State<'_, crate::AppState>) -
     }
     let destination = install_root()?; no_links(&destination)?;
     if !destination.join("SSPI.exe").is_file() { return Err("Automatic updates require a packaged SSPI installation. Build and run the distribution first.".into()); }
-    let helper = dir.join("sspi-update-helper.ps1"); fs::write(&helper, HELPER).map_err(|e| e.to_string())?;
+    let updater_root = root(&app).map_err(|error| fail(&app, s.clone(), error))?;
+    let mut dir = dir;
+    let compacted = compact_stage(&updater_root, &mut dir, &m);
+    s.stage_dir = Some(dir.clone());
+    compacted.map_err(|error| fail(&app, s.clone(), error))?;
+    publish(&app, &s);
+    let helper_path = dir.join("sspi-update-helper.ps1");
     let progress_path = dir.join("helper-progress.json");
-    let plan = serde_json::json!({"schema":1,"targetRoot":destination,"stageRoot":dir.join("files"),"resultPath":root(&app)?.join("last-result.json"),"readyPath":dir.join("helper-ready"),"progressPath":progress_path,"parentPid":std::process::id(),"manifest":m});
-    let plan_path = dir.join("install-plan.json"); fs::write(&plan_path, serde_json::to_vec(&plan).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    let _ = fs::remove_file(dir.join("helper-ready"));
-    let _ = fs::remove_file(&progress_path);
-    let mut command = std::process::Command::new("powershell.exe");
-    command.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]).arg(&helper).arg("-Plan").arg(&plan_path);
-    #[cfg(windows)] { use std::os::windows::process::CommandExt; command.creation_flags(0x08000000); }
-    let child = command.spawn().map_err(|e| format!("Could not start the updater: {e}"))?;
+    let result_path = updater_root.join("last-result.json");
+    let stderr_path = dir.join("helper-stderr.log");
+    let stdout_path = dir.join("helper-stdout.log");
+    let plan_path = dir.join("install-plan.json");
+    let plan = serde_json::json!({"schema":1,"targetRoot":destination,"stageRoot":dir.join("files"),"resultPath":result_path,"readyPath":dir.join("helper-ready"),"progressPath":progress_path,"parentPid":std::process::id(),"manifest":m});
+    let prepared = (|| -> Result<std::process::Child, String> {
+        for path in [&helper_path, &plan_path, &stderr_path, &stdout_path] { no_links(path)?; }
+        fs::write(&helper_path, HELPER).map_err(|e| format!("Could not write the update helper: {e}"))?;
+        fs::write(&plan_path, serde_json::to_vec(&plan).map_err(|e| e.to_string())?).map_err(|e| format!("Could not write the update installation plan: {e}"))?;
+        for path in [&result_path, &dir.join("helper-ready"), &progress_path] { remove_previous_file(path)?; }
+        let stdout = fs::File::create(&stdout_path).map_err(|e| format!("Could not open updater output log: {e}"))?;
+        let stderr = fs::File::create(&stderr_path).map_err(|e| format!("Could not open updater error log: {e}"))?;
+        let mut command = std::process::Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]).arg(&helper_path).arg("-Plan").arg(&plan_path)
+            .stdin(Stdio::null()).stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
+        #[cfg(windows)] { use std::os::windows::process::CommandExt; command.creation_flags(0x08000000); }
+        command.spawn().map_err(|e| format!("Could not start the updater: {e}. SSPI is still running. Diagnostic output: {}", stderr_path.display()))
+    })();
+    let child = prepared.map_err(|error| fail(&app, s.clone(), error))?;
     let mut helper = InstallHelper { child, handed_off: false };
     let mut watch = PreparationWatch::new(Instant::now());
     s.stage = "installing".into(); s.message = "Preparing the update; verifying staged application files…".into(); publish(&app, &s);
@@ -418,7 +527,7 @@ pub async fn install_update(app: AppHandle, state: State<'_, crate::AppState>) -
             app.exit(0); return Ok(());
         }
         match helper.child.try_wait() {
-            Ok(Some(_)) => return Err(fail(&app, s, "The updater could not prepare the installation. Check updater/last-result.json for details; SSPI is still running.".into())),
+            Ok(Some(exit)) => return Err(fail(&app, s, helper_exit_error(&result_path, &stderr_path, &exit.to_string()))),
             Err(error) => return Err(fail(&app, s, format!("The update helper could not be monitored: {error}. Nothing was installed."))),
             Ok(None) => {}
         }
@@ -439,6 +548,135 @@ pub async fn install_update(app: AppHandle, state: State<'_, crate::AppState>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn stage_test_manifest() -> Manifest {
+        Manifest { schema: 1, product: "windows".into(), channel: "development".into(), version: "2.25.7".into(), build: 20261006200540,
+            published_at: String::new(), notes: String::new(), restart: String::new(),
+            package: Package { url: format!("{BASE}/windows/development/20261006200540/update.zip"), size: 2, sha256: "c4".repeat(32), format: "zip".into() },
+            files: ["SSPI.exe", "resources/updater/build.json"].into_iter().map(|path| UpdateFile { path: path.into(), size: 1, sha256: "a1".repeat(32) }).collect() }
+    }
+    fn stage_test_root() -> PathBuf {
+        let root = crate::test_output_root().join(format!("update-stage-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap(); root
+    }
+    #[test] fn compact_stage_paths_fit_windows_powershell_with_long_usernames() {
+        let manifest = stage_test_manifest();
+        // A 41-character profile folder: the usual one holding a 32-character user name.
+        let profile = format!("C:\\{}", "u".repeat(38));
+        let root = format!("{profile}\\AppData\\Roaming\\com.simpleps5installer.gamesearch\\updater");
+        let relative = "resources\\dotnet\\shared\\Microsoft.NETCore.App\\9.0.20\\System.Runtime.InteropServices.RuntimeInformation.dll";
+        let legacy = format!("{root}\\stage-{}-{}\\files\\{relative}", manifest.build, manifest.package.sha256);
+        let compact = format!("{root}\\{}\\files\\{relative}", stage_name(&manifest));
+        assert!(legacy.len() >= 260);
+        assert!(compact.len() < 260, "{compact}");
+        assert_eq!(stage_name(&manifest), "stage-20261006200540-c4c4c4c4c4c4c4c4");
+        assert_eq!(manifest.package.sha256.len(), 64, "directory shortening must not shorten verification hashes");
+    }
+    #[test] fn legacy_stage_migration_preserves_files_manifest_and_ready_state() {
+        let root = stage_test_root(); let manifest = stage_test_manifest();
+        let legacy = root.join(format!("stage-{}-{}", manifest.build, manifest.package.sha256));
+        fs::create_dir_all(legacy.join("files")).unwrap();
+        fs::write(legacy.join("files/SSPI.exe"), b"unchanged staged bytes").unwrap();
+        save_ready(&root, &manifest, &legacy).unwrap();
+        let mut stage = legacy.clone(); compact_stage(&root, &mut stage, &manifest).unwrap();
+        assert_eq!(stage, root.join(stage_name(&manifest))); assert!(!legacy.exists());
+        assert_eq!(fs::read(stage.join("files/SSPI.exe")).unwrap(), b"unchanged staged bytes");
+        let saved: Saved = serde_json::from_slice(&fs::read(root.join("ready.json")).unwrap()).unwrap();
+        assert_eq!(saved.stage_dir, stage);
+        assert_eq!(serde_json::to_value(&saved.manifest).unwrap(), serde_json::to_value(&manifest).unwrap());
+        compact_stage(&root, &mut stage, &manifest).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn stage_migration_refuses_escape_and_existing_destination() {
+        let root = stage_test_root(); let manifest = stage_test_manifest();
+        let mut outside = root.join("outside/stage-legacy");
+        fs::create_dir_all(outside.join("files")).unwrap();
+        assert!(compact_stage(&root, &mut outside, &manifest).unwrap_err().contains("outside"));
+        let legacy = root.join("stage-legacy"); fs::create_dir_all(legacy.join("files")).unwrap();
+        save_ready(&root, &manifest, &legacy).unwrap();
+        let ready = fs::read(root.join("ready.json")).unwrap();
+        let compact = root.join(stage_name(&manifest)); fs::create_dir_all(&compact).unwrap();
+        fs::write(compact.join("keep"), b"keep").unwrap();
+        let mut stage = legacy.clone();
+        assert!(compact_stage(&root, &mut stage, &manifest).unwrap_err().contains("already exists"));
+        assert_eq!(stage, legacy); assert!(legacy.join("files").is_dir());
+        assert_eq!(fs::read(compact.join("keep")).unwrap(), b"keep");
+        assert_eq!(fs::read(root.join("ready.json")).unwrap(), ready);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn stage_migration_rolls_back_when_ready_state_cannot_be_persisted() {
+        let root = stage_test_root(); let manifest = stage_test_manifest();
+        let legacy = root.join("stage-legacy"); fs::create_dir_all(legacy.join("files")).unwrap();
+        fs::write(legacy.join("files/SSPI.exe"), b"unchanged").unwrap();
+        fs::create_dir(root.join("ready.json")).unwrap();
+        let mut stage = legacy.clone();
+        assert!(compact_stage(&root, &mut stage, &manifest).unwrap_err().contains("original update directory was restored"));
+        assert_eq!(stage, legacy); assert!(!root.join(stage_name(&manifest)).exists());
+        assert_eq!(fs::read(legacy.join("files/SSPI.exe")).unwrap(), b"unchanged");
+        assert!(root.join("ready.json").is_dir());
+        assert!(!fs::read_dir(&root).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn interrupted_stage_migration_recovers_before_pruning() {
+        let root = stage_test_root(); let manifest = stage_test_manifest();
+        let legacy = root.join(format!("stage-{}-{}", manifest.build, manifest.package.sha256));
+        fs::create_dir_all(legacy.join("files")).unwrap();
+        fs::write(legacy.join("files/SSPI.exe"), b"surviving verified bytes").unwrap();
+        save_ready(&root, &manifest, &legacy).unwrap();
+        let compact = root.join(stage_name(&manifest)); fs::rename(&legacy, &compact).unwrap();
+        let mut saved: Saved = serde_json::from_slice(&fs::read(root.join("ready.json")).unwrap()).unwrap();
+        assert_eq!(saved.stage_dir, legacy);
+        assert!(restore_saved_stage(&root, &mut saved).unwrap());
+        assert_eq!(saved.stage_dir, compact);
+        let persisted: Saved = serde_json::from_slice(&fs::read(root.join("ready.json")).unwrap()).unwrap();
+        assert_eq!(persisted.stage_dir, compact);
+        assert_eq!(serde_json::to_value(&persisted.manifest).unwrap(), serde_json::to_value(&manifest).unwrap());
+        prune_stages(&root, Some(&saved.stage_dir)).unwrap();
+        assert_eq!(fs::read(compact.join("files/SSPI.exe")).unwrap(), b"surviving verified bytes");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn stage_recovery_requires_missing_contained_legacy_and_valid_manifest() {
+        let root = stage_test_root(); let manifest = stage_test_manifest();
+        let legacy = root.join("stage-legacy"); fs::create_dir_all(&legacy).unwrap();
+        let compact = root.join(stage_name(&manifest)); fs::create_dir_all(compact.join("files")).unwrap();
+        let mut saved = Saved { manifest: manifest.clone(), stage_dir: legacy.clone() };
+        assert!(!restore_saved_stage(&root, &mut saved).unwrap(), "an existing legacy directory must not adopt another stage");
+        assert_eq!(saved.stage_dir, legacy);
+        fs::remove_dir(&legacy).unwrap(); saved.manifest.product = "another-product".into();
+        assert!(!restore_saved_stage(&root, &mut saved).unwrap());
+        saved.manifest = manifest; saved.stage_dir = root.join("outside/stage-legacy");
+        assert!(!restore_saved_stage(&root, &mut saved).unwrap());
+        assert!(!root.join("ready.json").exists()); assert!(compact.join("files").is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn stage_recovery_persistence_failure_preserves_surviving_directory() {
+        let root = stage_test_root(); let manifest = stage_test_manifest();
+        let compact = root.join(stage_name(&manifest)); fs::create_dir_all(compact.join("files")).unwrap();
+        let mut saved = Saved { manifest, stage_dir: root.join("stage-legacy") };
+        fs::create_dir(root.join("ready.json")).unwrap();
+        assert!(restore_saved_stage(&root, &mut saved).is_err(), "startup must stop before pruning when persistence fails");
+        assert!(compact.join("files").is_dir()); assert_eq!(saved.stage_dir, root.join("stage-legacy"));
+        fs::remove_dir(root.join("ready.json")).unwrap();
+        assert!(restore_saved_stage(&root, &mut saved).unwrap());
+        assert_eq!(saved.stage_dir, compact);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test] fn helper_failure_reports_current_result_or_bounded_stderr_and_exit() {
+        let root = stage_test_root(); let result = root.join("last-result.json"); let stderr = root.join("helper-stderr.log");
+        fs::write(&stderr, "PowerShell parser failure\0".repeat(400)).unwrap();
+        let error = helper_exit_error(&result, &stderr, "exit code: 1");
+        assert!(error.contains("exit code: 1") && error.contains("PowerShell parser failure") && error.contains("[truncated]"));
+        assert!(error.contains(&stderr.display().to_string()) && !error.contains('\0')); assert!(error.len() < 5000);
+        fs::write(&result, br#"{"status":"failed","message":"Update file verification failed: resources/dotnet/example.dll"}"#).unwrap();
+        let error = helper_exit_error(&result, &stderr, "exit code: 1");
+        assert!(error.contains("Update file verification failed: resources/dotnet/example.dll"));
+        assert!(error.contains(&result.display().to_string()) && !error.contains("PowerShell parser failure"));
+        remove_previous_file(&result).unwrap(); assert!(!result.exists());
+        fs::write(&result, br#"{"status":"complete","message":"stale success"}"#).unwrap();
+        assert!(!helper_exit_error(&result, &stderr, "exit code: 1").contains("stale success"));
+        fs::write(&result, b"malformed").unwrap(); fs::remove_file(&stderr).unwrap();
+        assert!(helper_exit_error(&result, &stderr, "exit code: 2").contains("No error output was recorded"));
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test] fn install_admission_blocks_jobs_and_resets_after_failure() {
         assert!(!installing());
         { let _admission = InstallAdmission::acquire().unwrap(); assert!(installing()); assert!(InstallAdmission::acquire().is_err()); }
@@ -477,6 +715,18 @@ mod tests {
         let mut m: Manifest = serde_json::from_value(serde_json::json!({"schema":1,"product":"windows","channel":"development","version":"2.23.0","build":12,"publishedAt":"", "notes":"", "restart":"", "signature":"future-field", "package":{"url":"", "size":1,"sha256":"","format":"zip","future":true},"files":[]})).unwrap();
         let s = UpdateStatus { stage:"idle".into(), current_version:"2.23.0".into(),current_build:11, channel:"development".into(),available:None,downloaded:0,total:0,message:String::new(),last_checked:0,stage_dir:None };
         assert!(newer(&m,&s)); m.build=11; assert!(!newer(&m,&s)); m.build=13; m.version="2.22.9".into(); assert!(!newer(&m,&s));
+    }
+    #[test] fn double_digit_versions_and_build_ids_order_numerically() {
+        let offer = |version: &str, build: u64| Manifest { version: version.into(), build, ..stage_test_manifest() };
+        let installed = UpdateStatus { stage: "idle".into(), current_version: "2.25.9".into(), current_build: 20261007064742, channel: "development".into(),
+            available: None, downloaded: 0, total: 0, message: String::new(), last_checked: 0, stage_dir: None };
+        assert!(version("2.25.10") > version("2.25.9") && version("2.25.10+7") == version("2.25.10"));
+        assert!(newer(&offer("2.25.10", 20261010090000), &installed));
+        assert!(!newer(&offer("2.25.10", 20261007064742), &installed), "an equal build is not newer");
+        assert!(!newer(&offer("2.25.8", 20261010090000), &installed), "no downgrade with a later build");
+        let current = UpdateStatus { current_version: "2.25.10".into(), current_build: 20261010090000, ..installed };
+        assert!(!newer(&offer("2.25.9", 20261011000000), &current));
+        assert!(newer(&offer("2.25.11", 20261011000000), &current));
     }
     #[test] fn win_c_prunes_only_obsolete_stages() {
         let root = crate::test_output_root().join(format!("win-c-update-stages-{}", uuid::Uuid::new_v4()));

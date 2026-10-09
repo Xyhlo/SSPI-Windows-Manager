@@ -20,6 +20,9 @@ use tokio::sync::{watch, Notify};
 
 /// Share of the connections the priority game gets while others download.
 const PRIORITY_SHARE: f64 = 0.9;
+/// The most connections one file gets. TorBox allows 16 per file; a larger budget goes to the
+/// other downloads.
+const FILE_CONNECTIONS: usize = 16;
 /// Weight floor so a nearly finished file still gets its fair connection.
 const MIN_WEIGHT: f64 = 8. * 1024. * 1024.;
 
@@ -240,7 +243,7 @@ impl Share {
         let max = max.max(1);
         if self.cap.swap(max, Ordering::Relaxed) != max { changed(state()); }
     }
-    fn cap(&self) -> usize { self.cap.load(Ordering::Relaxed).max(1) }
+    fn cap(&self) -> usize { self.cap.load(Ordering::Relaxed).clamp(1, FILE_CONNECTIONS) }
     fn weight(&self) -> f64 { (self.remaining.load(Ordering::Relaxed) as f64).max(MIN_WEIGHT) }
 }
 
@@ -396,6 +399,18 @@ mod tests {
         capped.limit_connections(usize::MAX);
         assert_eq!(capped.connections() + other.connections(), 16);
         assert!(capped.connections() > 3, "the split follows the remaining bytes again");
+    }
+
+    #[test]
+    fn one_file_gets_at_most_sixteen_connections() {
+        let _serial = serial();
+        configure(Limits { downloads: 4, extractions: 2, connections: 32 });
+        let first = register_download("file-cap-first", 40 << 30);
+        assert_eq!(first.connections(), 16, "a single file stays within what a debrid CDN allows");
+        let second = register_download("file-cap-second", 1 << 30);
+        assert_eq!((first.connections(), second.connections()), (16, 16));
+        set_priority(Some("file-cap-second".into()));
+        assert_eq!((first.connections(), second.connections()), (16, 16), "the priority file is held to 16 too; the rest goes to the others");
     }
 
     #[test]

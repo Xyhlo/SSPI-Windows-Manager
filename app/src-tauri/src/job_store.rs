@@ -44,9 +44,42 @@ pub(super) enum Checkpoint {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+pub(super) struct Ps5Install {
+    pub path: PathBuf,
+    pub host: String,
+    pub port: u16,
+    pub content_id: String,
+    pub remote_path: String,
+    pub attempt_id: Option<String>,
+    pub title_id: String,
+    pub version: Option<String>,
+    pub kind: String,
+    pub size: u64,
+    pub accepted: bool,
+    pub complete: bool,
+    #[serde(default)]
+    pub reconcile_pending: bool,
+}
+
+impl Ps5Install {
+    pub fn matches_reply(&self, value: &Value) -> bool {
+        value["content_id"].as_str() == Some(&self.content_id)
+            && value["path"].as_str() == Some(&self.remote_path)
+            && self.attempt_id.as_deref().is_none_or(|id| value["attempt_id"].as_str() == Some(id))
+    }
+
+    pub fn check_endpoint(&self, endpoint: &ReceiverEndpoint) -> Result<(), String> {
+        if self.host.eq_ignore_ascii_case(&endpoint.host) && self.port == endpoint.port { Ok(()) }
+        else { Err(format!("{PS5_MONITORING_ENDED} This submission belongs to {}:{}. Restore that console address before Retry.", self.host, self.port)) }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub(super) struct Record {
     #[serde(default)]
     pub ps4_delivery: Option<ps4_inbox::DeliveryState>,
+    #[serde(default)]
+    pub ps5_installs: Vec<Ps5Install>,
     #[serde(default)]
     pub package_only: bool,
     pub progress: Progress,
@@ -63,6 +96,33 @@ pub(super) struct Record {
 pub(super) struct Store {
     pub records: HashMap<String, Record>,
     pub directory: PathBuf,
+    journal: Arc<Journal>,
+}
+
+/// Snapshots are numbered under the store lock, so one written after the lock is released never
+/// replaces a newer state of the same record.
+#[derive(Default)]
+struct Journal { taken: AtomicU64, written: Mutex<HashMap<String, Arc<Mutex<u64>>>> }
+
+pub(super) struct Snapshot { journal: Arc<Journal>, directory: PathBuf, id: String, bytes: Vec<u8>, order: u64 }
+
+impl Snapshot {
+    pub fn write(self) -> Result<(), String> {
+        let slot = self.journal.written.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).entry(self.id.clone()).or_default().clone();
+        let mut written = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *written > self.order { return Ok(()); }
+        std::fs::create_dir_all(&self.directory).map_err(redact)?;
+        let temporary = self.directory.join(format!("{}.tmp", self.id));
+        let path = self.directory.join(format!("{}.json", self.id));
+        use std::io::Write;
+        let mut file = archives::retry_file_op(|| std::fs::File::create(&temporary)).map_err(redact)?;
+        file.write_all(&self.bytes).map_err(redact)?;
+        file.sync_all().map_err(redact)?;
+        drop(file);
+        archives::retry_file_op(|| std::fs::rename(&temporary, &path)).map_err(redact)?;
+        *written = self.order;
+        Ok(())
+    }
 }
 
 impl Store {
@@ -77,7 +137,12 @@ impl Store {
                 let receiver = record.request.as_ref().is_some_and(|r| ps4_transport(r) == "receiver");
                 let ps4_receiver_active = record.progress.target == "ps4" && receiver && matches!(record.progress.stage.as_str(), "uploading" | "submitting" | "installing");
                 let ps4_console_owned = record.progress.target == "ps4" && !receiver && matches!(record.progress.stage.as_str(), "handoff" | "installing");
-                if ps4_receiver_active {
+                let ps5_console_owned = record.progress.target != "ps4" && record.ps5_installs.iter().any(|install| !install.complete);
+                if ps5_console_owned && !terminal_stage(&record.progress.stage) {
+                    record.progress.stage = "monitoring-ended".into();
+                    record.progress.paused = false;
+                    record.progress.message = PS5_MONITORING_ENDED.into();
+                } else if ps4_receiver_active {
                     record.progress.stage = "monitoring-ended".into();
                     record.progress.paused = false;
                     record.progress.message = ps4_receiver::MONITORING_ENDED.into();
@@ -90,47 +155,71 @@ impl Store {
                     record.progress.paused = false;
                     record.progress.message = "Previous session stopped. Retry to continue from retained files.".into();
                 }
-                record.progress.retryable = ps4_receiver_active || ps4_console_owned || record.request.is_some() || record.checkpoint.is_some();
+                record.progress.retryable = ps4_receiver_active || ps4_console_owned || ps5_console_owned || record.request.is_some() || record.checkpoint.is_some();
                 store.records.insert(record.progress.job_id.clone(), record);
             }
         }
         store
     }
 
-    pub fn save(&self, id: &str) -> Result<(), String> {
+    pub fn save(&self, id: &str) -> Result<(), String> { self.snapshot(id)?.write() }
+
+    /// The record as it is now, to write once the caller has released the store lock.
+    pub fn snapshot(&self, id: &str) -> Result<Snapshot, String> {
         let record = self.records.get(id).ok_or("Retry record is missing")?;
         if uuid::Uuid::parse_str(id).is_err() { return Err("Invalid job identity".into()); }
-        std::fs::create_dir_all(&self.directory).map_err(redact)?;
-        let temporary = self.directory.join(format!("{id}.tmp"));
-        let path = self.directory.join(format!("{id}.json"));
-        use std::io::Write;
-        let mut file = std::fs::File::create(&temporary).map_err(redact)?;
-        file.write_all(&serde_json::to_vec(record).map_err(redact)?).map_err(redact)?;
-        file.sync_all().map_err(redact)?;
-        drop(file);
-        std::fs::rename(temporary, path).map_err(redact)
+        let bytes = serde_json::to_vec(record).map_err(redact)?;
+        Ok(Snapshot { journal: self.journal.clone(), directory: self.directory.clone(), id: id.into(), bytes,
+            order: self.journal.taken.fetch_add(1, Ordering::SeqCst) + 1 })
+    }
+
+    fn set_ps5_install(&mut self, id: &str, path: &Path, install: Option<Ps5Install>) -> Result<(), String> {
+        let record = self.records.get_mut(id).ok_or("Retry record is missing")?;
+        let previous = record.ps5_installs.clone();
+        record.ps5_installs.retain(|saved| saved.path != path);
+        if let Some(install) = install { record.ps5_installs.push(install); }
+        if let Err(error) = self.save(id) {
+            self.records.get_mut(id).unwrap().ps5_installs = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
+pub(super) fn ps5_install(app: &AppHandle, job: &str, path: &Path) -> Option<Ps5Install> {
+    record(app, job)?.ps5_installs.into_iter().find(|install| install.path == path)
+}
+
+pub(super) fn save_ps5_install(app: &AppHandle, job: &str, path: &Path, install: Option<Ps5Install>) -> Result<(), String> {
+    app.state::<AppState>().retry.lock().unwrap().set_ps5_install(job, path, install)
+}
+
+// Both save after releasing the store: `emit` waits for it while holding the job list, which
+// every download's progress loop polls.
 pub(super) fn checkpoint(app: &AppHandle, job: &str, checkpoint: Checkpoint) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut store = state.retry.lock().unwrap();
-    if let Some(record) = store.records.get_mut(job) { record.checkpoint = Some(checkpoint); store.save(job)?; }
-    Ok(())
+    let snapshot = {
+        let mut store = state.retry.lock().unwrap();
+        let Some(record) = store.records.get_mut(job) else { return Ok(()) };
+        record.checkpoint = Some(checkpoint);
+        store.snapshot(job)?
+    };
+    snapshot.write()
 }
 
 pub(super) fn downloaded(app: &AppHandle, job: &str, file: DownloadedFile) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut store = state.retry.lock().unwrap();
-    if let Some(record) = store.records.get_mut(job) {
+    let (snapshot, progress) = {
+        let mut store = state.retry.lock().unwrap();
+        let Some(record) = store.records.get_mut(job) else { return Ok(()) };
         record.downloads.retain(|existing| existing.index != file.index);
         record.downloads.push(file);
         if let Some(request) = &record.request { record.progress.components = request_components(request, &record.downloads); }
-        store.save(job)?;
-    }
-    let progress = store.records.get(job).map(|r| r.progress.clone());
-    drop(store);
-    if let Some(progress) = progress { emit(app, progress); }
+        let progress = record.progress.clone();
+        (store.snapshot(job)?, progress)
+    };
+    snapshot.write()?;
+    emit(app, progress);
     Ok(())
 }
 
@@ -250,7 +339,7 @@ pub(super) async fn queue_local(app: AppHandle, state: &AppState, path: PathBuf,
     let download_dir = PathBuf::from(&state.settings.lock().unwrap().download_dir);
     {
         let mut store = state.retry.lock().unwrap();
-        store.records.insert(job.clone(), Record { ps4_delivery: None, package_only, pairing_sealed: false, progress: Progress {
+        store.records.insert(job.clone(), Record { ps4_delivery: None, ps5_installs: vec![], package_only, pairing_sealed: false, progress: Progress {
             job_id: job.clone(), target, title: seed.name, icon: seed.icon, title_id: seed.title_id.unwrap_or_default(),
             package_kind: seed.package_kind, package_label: request.package.label.clone(), package_version: request.package.version.clone(),
             local_pkg: seed.local_pkg, stage: "failed".into(), retryable: true, ..Default::default() },
@@ -309,6 +398,15 @@ pub(super) async fn resume_checkpoint(app: &AppHandle, settings: &Settings, job:
     mut saved: Checkpoint, cancel: &mut watch::Receiver<bool>) -> Result<(), String> {
     let ps4 = validate_delivery_target(request, package_only(app, job), false)? == "ps4";
     let receiver = ps4 && ps4_transport(request) == "receiver";
+    if !ps4 && record(app, job).is_some_and(|record| !record.ps5_installs.is_empty()) {
+        let packages = match &saved {
+            Checkpoint::Package { path, .. } => vec![path.clone()],
+            Checkpoint::Extracted { paths, dump: false, .. } | Checkpoint::Local { paths } => paths.clone(),
+            _ => return Err(format!("{PS5_MONITORING_ENDED} The saved package list is unavailable; check the console before starting another install.")),
+        };
+        // Submitted packages need only their saved identity, including after local cleanup.
+        return upload_pkg_set(app, settings, &ReceiverEndpoint::ps5(settings), packages, job, request.title_id.as_deref(), cancel).await;
+    }
     loop {
         transfer_checkpoint(app, job, cancel).await?;
         match saved {
@@ -390,7 +488,10 @@ pub(super) async fn resume_checkpoint(app: &AppHandle, settings: &Settings, job:
                 if let Some(paired) = pairing_before_packaging(app, job)? {
                     return backport::run(app, settings, &app.state::<AppState>().http.clone(), &job.to_string(), &paired, cancel).await;
                 }
-                if !settings.keep_archives { archives::remove_consumed_inputs(&inputs, &paths)?; }
+                if !settings.keep_archives {
+                    let (consumed, outputs) = (inputs.clone(), paths.clone());
+                    tokio::task::spawn_blocking(move || archives::remove_consumed_inputs(&consumed, &outputs)).await.map_err(redact)??;
+                }
                 if dump {
                     let root = paths.first().ok_or("Retained dump path is missing")?;
                     let title = dump_title_id(root).or_else(|| request.title_id.clone());
@@ -518,7 +619,7 @@ pub(super) fn recover_legacy(store: &mut Store, root: &Path) {
             } else { vec![path.clone()] };
             Checkpoint::Archive { primary: path.clone(), inputs, password: None }
         } else { Checkpoint::Local { paths: vec![path.clone()] } };
-        store.records.insert(id.clone(), Record { ps4_delivery: None, package_only: false, pairing_sealed: false, progress, request: None, checkpoint: Some(saved),
+        store.records.insert(id.clone(), Record { ps4_delivery: None, ps5_installs: vec![], package_only: false, pairing_sealed: false, progress, request: None, checkpoint: Some(saved),
             downloads: vec![DownloadedFile { index: 0, path, name: String::new(), kind, complete: true }], download_dir: root.to_path_buf() });
         let _ = store.save(&id);
     }
@@ -621,7 +722,8 @@ fn cleanup_files(record: &Record, protected: &[PathBuf]) -> Result<(usize, usize
     let mut deleted = 0;
     for path in &targets {
         if pkg_server::is_served(path) { retained += 1; continue; }
-        if path.is_dir() { std::fs::remove_dir_all(path).map_err(redact)?; } else { std::fs::remove_file(path).map_err(redact)?; }
+        if path.is_dir() { archives::retry_file_op(|| std::fs::remove_dir_all(path)).map_err(redact)?; }
+        else { archives::retry_file_op(|| std::fs::remove_file(path)).map_err(redact)?; }
         deleted += 1;
         if let Some(parent) = path.parent().filter(|p| *p != root && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("archive_"))) { let _ = std::fs::remove_dir(parent); }
     }
@@ -729,17 +831,91 @@ mod tests {
         b.archive_parts.push(a.package.clone()); assert!(overlapping_delivery(&a, &b));
     }
     #[test]
+    fn a_snapshot_written_late_never_replaces_a_newer_saved_state() {
+        let (root, mut record) = cleanup_fixture(); let id = record.progress.job_id.clone();
+        record.progress.stage = "downloading".into();
+        let journal = root.join("ordered-journal"); let mut store = Store::load(journal.clone()); store.records.insert(id.clone(), record);
+        let stale = store.snapshot(&id).unwrap();
+        store.records.get_mut(&id).unwrap().progress.stage = "complete".into();
+        store.save(&id).unwrap();
+        stale.write().unwrap();
+        assert_eq!(Store::load(journal.clone()).records[&id].progress.stage, "complete");
+        store.records.get_mut(&id).unwrap().progress.stage = "failed".into();
+        let newest = store.snapshot(&id).unwrap();
+        newest.write().unwrap();
+        assert_eq!(Store::load(journal).records[&id].progress.stage, "failed");
+    }
+    #[test]
     fn legacy_records_load_and_ps4_target_survives_restart() {
         let (root, mut record) = cleanup_fixture();
         let mut legacy = serde_json::to_value(&record).unwrap(); legacy.as_object_mut().unwrap().remove("ps4_delivery");
+        legacy.as_object_mut().unwrap().remove("ps5_installs");
         legacy["progress"].as_object_mut().unwrap().remove("target");
-        let old: Record = serde_json::from_value(legacy).unwrap(); assert!(old.ps4_delivery.is_none()); assert!(old.progress.target.is_empty());
+        let old: Record = serde_json::from_value(legacy).unwrap(); assert!(old.ps4_delivery.is_none()); assert!(old.ps5_installs.is_empty()); assert!(old.progress.target.is_empty());
         let mut request = pair_request(); request.target = Some("ps4".into()); request.backport = None; request.title_id = Some("CUSA12345".into());
         record.request = Some(request); record.progress.target = "ps4".into(); record.progress.stage = "delivered".into();
         let id = record.progress.job_id.clone(); let mut store = Store::load(root.join("target-journal")); store.records.insert(id.clone(), record); store.save(&id).unwrap();
         let loaded = Store::load(root.join("target-journal")); let saved = &loaded.records[&id];
         assert_eq!(saved.progress.stage, "delivered"); assert_eq!(saved.progress.target, "ps4");
         assert_eq!(saved.request.as_ref().unwrap().target.as_deref(), Some("ps4"));
+    }
+
+    #[test]
+    fn ps5_submission_journal_survives_lost_reply_and_source_cleanup() {
+        let (root, mut record) = cleanup_fixture(); let path = root.join("retained.pkg");
+        std::fs::write(&path, b"retained package").unwrap();
+        let id = record.progress.job_id.clone(); record.progress.target = "ps5".into(); record.progress.stage = "submitting".into();
+        record.checkpoint = Some(Checkpoint::Package { path: path.clone(), dump: None, cleanup: false, backports_embedded: true, cleanup_extra: vec![] });
+        let mut install = Ps5Install { path: path.clone(), host: "127.0.0.1".into(), port: 9114,
+            content_id: "UP0000-PPSA12345_00-TEST000000000000".into(), remote_path: "/user/data/tmp/upload_unique.pkg".into(),
+            attempt_id: None, title_id: "PPSA12345".into(), version: Some("01.000.000".into()), kind: "base".into(),
+            size: 16, accepted: false, complete: false, reconcile_pending: false };
+        let journal = root.join("ps5-journal"); let mut store = Store::load(journal.clone()); store.records.insert(id.clone(), record);
+        store.set_ps5_install(&id, &path, Some(install.clone())).unwrap();
+        let pending = Store::load(journal.clone()); let saved = &pending.records[&id];
+        assert_eq!(saved.progress.stage, "monitoring-ended"); assert!(saved.progress.retryable);
+        assert_eq!(saved.progress.message, PS5_MONITORING_ENDED); assert!(!saved.ps5_installs[0].accepted);
+        assert_eq!(saved.ps5_installs[0].remote_path, install.remote_path);
+        assert!(path.is_file());
+        install.accepted = true; install.attempt_id = Some("helper-123".into());
+        store.set_ps5_install(&id, &path, Some(install.clone())).unwrap();
+        assert_eq!(Store::load(journal.clone()).records[&id].ps5_installs[0].attempt_id, install.attempt_id);
+        install.complete = true; install.reconcile_pending = true; store.set_ps5_install(&id, &path, Some(install)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let confirmed = Store::load(journal); assert!(confirmed.records[&id].ps5_installs[0].complete);
+        assert!(confirmed.records[&id].ps5_installs[0].reconcile_pending);
+        assert_eq!(confirmed.records[&id].ps5_installs[0].size, 16);
+        assert!(matches!(&confirmed.records[&id].checkpoint, Some(Checkpoint::Package { path: saved_path, .. }) if saved_path == &path));
+    }
+
+    #[test]
+    fn ps5_journal_write_failure_rolls_back_and_refusal_can_be_cleared() {
+        let (root, record) = cleanup_fixture(); let path = root.join("game.pkg"); let id = record.progress.job_id.clone();
+        let install = Ps5Install { path: path.clone(), host: "127.0.0.1".into(), port: 9114,
+            content_id: "cid".into(), remote_path: "/user/data/tmp/upload_unique.pkg".into(), attempt_id: None,
+            title_id: "PPSA12345".into(), version: None, kind: "base".into(), size: 7, accepted: false, complete: false, reconcile_pending: false };
+        let blocked = root.join("not-a-directory"); std::fs::write(&blocked, b"blocking file").unwrap();
+        let mut store = Store::load(blocked); store.records.insert(id.clone(), record);
+        assert!(store.set_ps5_install(&id, &path, Some(install.clone())).is_err());
+        assert!(store.records[&id].ps5_installs.is_empty());
+        store.directory = root.join("journal"); store.set_ps5_install(&id, &path, Some(install)).unwrap();
+        store.set_ps5_install(&id, &path, None).unwrap();
+        assert!(Store::load(store.directory.clone()).records[&id].ps5_installs.is_empty());
+    }
+
+    #[test]
+    fn ps5_recovery_uses_the_original_console_and_attempt() {
+        let (root, _) = cleanup_fixture();
+        let mut install = Ps5Install { path: root.join("game.pkg"), host: "127.0.0.1".into(), port: 9114,
+            content_id: "cid".into(), remote_path: "/user/data/tmp/upload_unique.pkg".into(), attempt_id: None,
+            title_id: "PPSA12345".into(), version: None, kind: "base".into(), size: 7, accepted: false, complete: false, reconcile_pending: false };
+        let endpoint = ReceiverEndpoint::ps5(&Settings { ps5_host: "127.0.0.1".into(), ..Settings::default() });
+        assert!(install.check_endpoint(&endpoint).is_ok());
+        install.host = "127.0.0.2".into(); assert!(install.check_endpoint(&endpoint).unwrap_err().starts_with(PS5_MONITORING_ENDED));
+        let reply = json!({"content_id":"cid", "path":install.remote_path, "attempt_id":"helper-123"});
+        assert!(install.matches_reply(&reply));
+        install.attempt_id = Some("helper-456".into()); assert!(!install.matches_reply(&reply));
+        assert!(!install.matches_reply(&json!({"content_id":"cid"})));
     }
     #[test]
     fn restart_preserves_ps4_console_handoff_as_unconfirmed_and_retryable() {
@@ -815,7 +991,7 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../Build-Output/Windows Manager/job-tests").join(Uuid::new_v4().to_string());
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("archive.rar"); std::fs::write(&path, b"retained archive").unwrap();
-        let record = Record { ps4_delivery: None, package_only: false, pairing_sealed: false, progress: Progress { job_id: Uuid::new_v4().to_string(), stage: "cancelled".into(), ..Default::default() }, request: None,
+        let record = Record { ps4_delivery: None, ps5_installs: vec![], package_only: false, pairing_sealed: false, progress: Progress { job_id: Uuid::new_v4().to_string(), stage: "cancelled".into(), ..Default::default() }, request: None,
             checkpoint: Some(Checkpoint::Archive { primary: path.clone(), inputs: vec![path.clone()], password: None }),
             downloads: vec![DownloadedFile { index: 0, complete: true, path, name: "archive.rar".into(), kind: ArtifactKind::Rar }], download_dir: root.clone() };
         (root, record)
@@ -909,7 +1085,7 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../Build-Output/Windows Manager/job-tests").join(Uuid::new_v4().to_string());
         let id = Uuid::new_v4().to_string();
         let mut store = Store::load(root.clone());
-        store.records.insert(id.clone(), Record { ps4_delivery: None, package_only: false, pairing_sealed: false, progress: Progress { job_id: id.clone(), stage: "extracting".into(), ..Default::default() }, request: None,
+        store.records.insert(id.clone(), Record { ps4_delivery: None, ps5_installs: vec![], package_only: false, pairing_sealed: false, progress: Progress { job_id: id.clone(), stage: "extracting".into(), ..Default::default() }, request: None,
             checkpoint: Some(Checkpoint::Local { paths: vec![root.join("retained.rar")] }), downloads: vec![], download_dir: root.clone() });
         store.save(&id).unwrap();
         store.save(&id).unwrap();

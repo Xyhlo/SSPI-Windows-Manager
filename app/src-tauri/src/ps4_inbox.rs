@@ -595,40 +595,39 @@ async fn cleanup_remote(session: &mut Session, root: &str, unit: &Unit, job: &st
 }
 pub(super) async fn archive_volumes(primary: &Path, inputs: &[PathBuf], password: Option<&str>, request: &DeliveryRequest) -> Option<Vec<PathBuf>> {
     if password.is_some_and(|s| !s.is_empty()) || request.archive_parts.iter().any(|p| p.archive_password.as_deref().is_some_and(|s| !s.is_empty())) { return None; }
-    let name = primary.file_name()?.to_str()?;
-    if !name.to_ascii_lowercase().ends_with(".rar") || protocol::inbox_kind(name) != Some(protocol::InboxKind::Primary) { return None; }
-    let key = protocol::set_key(name)?;
-    let mut present = std::fs::read_dir(primary.parent()?).ok()?.filter_map(Result::ok).map(|e| e.path())
-        .filter(|p| p.file_name().and_then(|s| s.to_str()).and_then(protocol::set_key).as_ref() == Some(&key)).collect::<Vec<_>>();
-    present.sort(); present.dedup();
-    let mut volumes = if inputs.is_empty() { present.clone() } else { inputs.to_vec() };
-    if !volumes.iter().any(|p| p == primary) { return None; }
-    volumes.sort(); volumes.dedup();
-    if volumes != present { return None; }
-    if volumes.iter().any(|path| !path.is_file() || path.file_name().and_then(|s| s.to_str()).is_none_or(|name|
-        protocol::set_key(name).as_ref() != Some(&key) || protocol::final_name(name, "01234567", 0).is_err())) { return None; }
-    if request.archive_parts.iter().chain(std::iter::once(&request.package))
-        .filter_map(|p| p.archive_part_count).any(|count| count as usize != volumes.len()) { return None; }
-    let mut numbers: Vec<_> = volumes.iter().filter_map(|p| p.file_name().and_then(|s| s.to_str()).and_then(rar_part_from_name)).collect();
-    if !numbers.is_empty() {
-        numbers.sort_unstable();
-        if numbers != (1..=volumes.len() as u32).collect::<Vec<_>>() { return None; }
-    }
-    // UnRAR walks all volumes without decompressing. Missing trailing volumes or encrypted entries force PC extraction.
-    let probe = primary.to_path_buf();
-    let readable = tokio::task::spawn_blocking(move || {
+    let counts: Vec<u32> = request.archive_parts.iter().chain(std::iter::once(&request.package)).filter_map(|p| p.archive_part_count).collect();
+    let (primary, inputs) = (primary.to_path_buf(), inputs.to_vec());
+    // Directory and UnRAR checks block; keep them off the async workers that downloads share.
+    tokio::task::spawn_blocking(move || {
+        let name = primary.file_name()?.to_str()?;
+        if !name.to_ascii_lowercase().ends_with(".rar") || protocol::inbox_kind(name) != Some(protocol::InboxKind::Primary) { return None; }
+        let key = protocol::set_key(name)?;
+        let mut present = std::fs::read_dir(primary.parent()?).ok()?.filter_map(Result::ok).map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|s| s.to_str()).and_then(protocol::set_key).as_ref() == Some(&key)).collect::<Vec<_>>();
+        present.sort(); present.dedup();
+        let mut volumes = if inputs.is_empty() { present.clone() } else { inputs };
+        if !volumes.iter().any(|p| p == &primary) { return None; }
+        volumes.sort(); volumes.dedup();
+        if volumes != present { return None; }
+        if volumes.iter().any(|path| !path.is_file() || path.file_name().and_then(|s| s.to_str()).is_none_or(|name|
+            protocol::set_key(name).as_ref() != Some(&key) || protocol::final_name(name, "01234567", 0).is_err())) { return None; }
+        if counts.iter().any(|count| *count as usize != volumes.len()) { return None; }
+        let mut numbers: Vec<_> = volumes.iter().filter_map(|p| p.file_name().and_then(|s| s.to_str()).and_then(rar_part_from_name)).collect();
+        if !numbers.is_empty() {
+            numbers.sort_unstable();
+            if numbers != (1..=volumes.len() as u32).collect::<Vec<_>>() { return None; }
+        }
+        // UnRAR walks all volumes without decompressing. Missing trailing volumes or encrypted entries force PC extraction.
         let _library = rar_control::library_lock(&|| Ok(())).ok()?;
-        let archive = unrar::Archive::new(&probe).open_for_listing().ok()?;
+        let archive = unrar::Archive::new(&primary).open_for_listing().ok()?;
         if archive.has_encrypted_headers() { return None; }
         let mut count = 0;
         for entry in archive {
             if entry.ok()?.is_encrypted() { return None; }
             count += 1;
         }
-        (count > 0).then_some(())
-    }).await.ok().flatten();
-    readable?;
-    Some(volumes)
+        (count > 0).then_some(volumes)
+    }).await.ok().flatten()
 }
 async fn run_units(session: &mut Session, delivery: &mut DeliveryState, context: &Context<'_>, remove: bool, retry: bool) -> Result<Outcome, Fault> {
     validate_delivery(delivery).map_err(Fault::local)?;
@@ -704,12 +703,16 @@ pub(super) async fn deliver(app: &AppHandle, settings: &Settings, job: &str, pat
     if let Some(saved) = &record.ps4_delivery { validate_delivery(saved)?; }
     let mut session = Session::connect(Endpoint::settings(settings), Timing::default()).await.map_err(|e| e.message)?;
     let mut delivery = if let Some(saved) = record.ps4_delivery { saved } else {
-        if !archive { for path in &paths { validate_pkg(path)?; } }
-        if !archive && paths.iter().any(|path| pkg_meta::read(path).is_ok_and(|meta| meta.kind == "theme")) {
-            return Err("PS4 themes install through the SSPI receiver. Switch PS4 delivery to the receiver in Settings > Consoles.".into());
-        }
-        let paths = if archive { paths } else { sort_pkgs(paths) };
-        DeliveryState { root: session.root().await.map_err(|e| e.message)?, generation: 0, units: make_units(paths, archive, job)? }
+        // Package reads block; keep them off the async workers that downloads share.
+        let job_id = job.to_string();
+        let units = tokio::task::spawn_blocking(move || {
+            if !archive { for path in &paths { validate_pkg(path)?; } }
+            if !archive && paths.iter().any(|path| pkg_meta::read(path).is_ok_and(|meta| meta.kind == "theme")) {
+                return Err("PS4 themes install through the SSPI receiver. Switch PS4 delivery to the receiver in Settings > Consoles.".to_string());
+            }
+            make_units(if archive { paths } else { sort_pkgs(paths) }, archive, &job_id)
+        }).await.map_err(|_| "The PS4 upload check stopped unexpectedly.".to_string())??;
+        DeliveryState { root: session.root().await.map_err(|e| e.message)?, generation: 0, units }
     };
     context.save(&delivery).map_err(|e| e.message)?;
     let result = run_units(&mut session, &mut delivery, &context, settings.ps4_remove_after_install, retry).await;
@@ -727,11 +730,13 @@ pub(super) async fn deliver(app: &AppHandle, settings: &Settings, job: &str, pat
                     Some(job_store::Checkpoint::Archive { inputs, .. } | job_store::Checkpoint::Extracted { inputs, .. }) => inputs.clone(),
                     _ => vec![],
                 };
-                if let Err(error) = archives::remove_consumed_inputs(&inputs, &[]) { outcome.message.push_str(&format!(" Local archives were kept: {error}")); }
+                // Deletes run on the blocking pool, never on an async worker the downloads share.
+                let removed = tokio::task::spawn_blocking(move || archives::remove_consumed_inputs(&inputs, &[])).await.map_err(redact).and_then(|result| result);
+                if let Err(error) = removed { outcome.message.push_str(&format!(" Local archives were kept: {error}")); }
             }
             if !settings.keep_packages {
                 for file in delivery.units.iter().flat_map(|u| &u.files).filter(|f| f.local.extension().is_some_and(|e| e.eq_ignore_ascii_case("pkg"))) {
-                    if let Err(error) = job_store::cleanup_installed_package(app, job, &file.local) { outcome.message.push_str(&format!(" Local package was kept: {error}")); }
+                    if let Some(error) = cleanup_delivered_package(app, job, &file.local).await { outcome.message.push_str(&format!(" Local package was kept: {error}")); }
                 }
             }
         }
@@ -1142,6 +1147,47 @@ mod tests {
         assert_eq!(rename_file(&mut session, ROOT, &delivery.units[0].files[0]).await.unwrap_err().message, INVALID_DELIVERY);
         assert!(!cleanup_remote(&mut session, ROOT, &delivery.units[0], "ftp_test").await);
         assert_eq!(server.commands(), commands);
+    }
+    /// Two stored RAR 4.x volumes, `stem.rar` and `stem.r00`, holding one split file.
+    fn rar4_pair(directory: &Path, stem: &str, data: &[u8]) -> Vec<PathBuf> {
+        fn crc32(bytes: &[u8]) -> u32 {
+            !bytes.iter().fold(!0u32, |crc, &byte| (0..8).fold(crc ^ byte as u32, |c, _| (c >> 1) ^ (0xEDB8_8320 & (c & 1).wrapping_neg())))
+        }
+        fn block(kind: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+            let mut header = vec![kind]; header.extend(flags.to_le_bytes()); header.extend((7 + body.len() as u16).to_le_bytes()); header.extend(body);
+            let mut out = (crc32(&header) as u16).to_le_bytes().to_vec(); out.extend(header); out
+        }
+        let parts: Vec<&[u8]> = data.chunks(data.len().div_ceil(2)).collect();
+        parts.iter().enumerate().map(|(index, part)| {
+            let (first, last) = (index == 0, index + 1 == parts.len());
+            let mut body = Vec::new();
+            body.extend((part.len() as u32).to_le_bytes()); body.extend((data.len() as u32).to_le_bytes()); body.push(2);
+            body.extend((if last { crc32(data) } else { crc32(part) }).to_le_bytes()); body.extend(0x5B2A_0000u32.to_le_bytes());
+            body.extend([29, 0x30]); body.extend(8u16.to_le_bytes()); body.extend(0x20u32.to_le_bytes()); body.extend(b"game.pkg");
+            let mut volume = b"Rar!\x1a\x07\x00".to_vec();
+            volume.extend(block(0x73, 0x0001 | if first { 0x0100 } else { 0 }, &[0; 6]));
+            volume.extend(block(0x74, 0x8000 | if first { 0 } else { 0x01 } | if last { 0 } else { 0x02 }, &body));
+            volume.extend_from_slice(part);
+            volume.extend(block(0x7B, if last { 0 } else { 0x0001 }, &[]));
+            let path = directory.join(if first { format!("{stem}.rar") } else { format!("{stem}.r{:02}", index - 1) });
+            std::fs::write(&path, volume).unwrap(); path
+        }).collect()
+    }
+    #[tokio::test]
+    async fn complete_unencrypted_rar_sets_are_sent_whole_and_others_are_not() {
+        let directory = local("probe.txt", b"").parent().unwrap().to_path_buf();
+        let volumes = rar4_pair(&directory, "game", &(0..64 * 1024).map(|n| (n % 251) as u8).collect::<Vec<_>>());
+        let mut sorted = volumes.clone(); sorted.sort();
+        let request: DeliveryRequest = serde_json::from_value(json!({"target":"ps4","package":Package::default(),"titleId":null})).unwrap();
+        assert_eq!(archive_volumes(&volumes[0], &[], None, &request).await, Some(sorted.clone()));
+        assert_eq!(archive_volumes(&volumes[0], &volumes, None, &request).await, Some(sorted));
+        assert_eq!(archive_volumes(&volumes[0], &[], Some("secret"), &request).await, None);
+        let counted: DeliveryRequest = serde_json::from_value(json!({"target":"ps4","package":Package { archive_part_count: Some(3), ..Default::default() },"titleId":null})).unwrap();
+        assert_eq!(archive_volumes(&volumes[0], &[], None, &counted).await, None);
+        // A missing continuation volume forces extraction on the PC.
+        std::fs::remove_file(&volumes[1]).unwrap();
+        assert_eq!(archive_volumes(&volumes[0], &[], None, &request).await, None);
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn pkg_handoff_rejects_ps5_content_identity() {

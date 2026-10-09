@@ -46,6 +46,7 @@ pub(super) async fn refresh_job_details(app: AppHandle, job_id: String) -> Resul
     let Some(saved) = job_store::record(&app, &job_id) else { return Ok(()); };
     let Some(mut request) = saved.request else { return Ok(()); };
     if saved.progress.removed { return Ok(()); }
+    let original = serde_json::to_value(&request).map_err(redact)?;
     let mut primary = vec![request.package.clone()]; primary.extend(request.archive_parts.clone());
     let mut enriched = enrich(&state.http, primary).await.into_iter(); request.package = enriched.next().unwrap(); request.archive_parts = enriched.collect();
     if let Some(backport) = &mut request.backport {
@@ -55,6 +56,8 @@ pub(super) async fn refresh_job_details(app: AppHandle, job_id: String) -> Resul
     let components = {
         let mut store = state.retry.lock().unwrap();
         let Some(record) = store.records.get_mut(&job_id).filter(|r| !r.progress.removed) else { return Ok(()); };
+        // Pairing a backport or Send to PS5 may have changed the request while sizes were read.
+        if record.request.as_ref().and_then(|current| serde_json::to_value(current).ok()) != Some(original) { return Ok(()); }
         let components = job_store::request_components(&request, &record.downloads);
         record.request = Some(request); record.progress.components = components.clone(); store.save(&job_id)?; components
     };

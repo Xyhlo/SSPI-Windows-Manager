@@ -122,7 +122,9 @@ pub(super) fn extract_measured(path: &Path, dest: &Path, password: &[u8], checkp
         let directory = header.flags & rar::RHDF_DIRECTORY != 0;
         if directory { std::fs::create_dir_all(&output).map_err(redact)?; }
         else {
-            storage::guard_bytes(dest, ((header.unp_size_high as u64) << 32) | header.unp_size as u64, "extraction")?;
+            let size = ((header.unp_size_high as u64) << 32) | header.unp_size as u64;
+            archives::fat_file_limit(dest, size, "This archive")?;
+            storage::guard_bytes(dest, size, "extraction")?;
             std::fs::create_dir_all(output.parent().ok_or("Archive output has no parent")?).map_err(redact)?;
             callback_state.output = Some(BufWriter::with_capacity(1024 * 1024,
                 std::fs::File::create(&output).map_err(|error| format!("RAR extraction: could not create output file: {}", redact(error)))?));

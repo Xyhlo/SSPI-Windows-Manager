@@ -337,8 +337,7 @@ export default function App() {
       const next = await probeAll()
       if (next?.[target]?.receiver.state === "online") void refreshLibraryRef.current(target)
     } catch (error) {
-      const loader = target === "ps4" ? `GoldHEN BinLoader on port ${port}` : `an ELF loader on port ${port}`
-      toast({ tone: "error", title: "The receiver didn't load", text: `${errorText(error)} Check that ${loader} is running on your ${name}.` })
+      toast({ tone: "error", title: "The receiver didn't load", text: errorText(error) })
     } finally {
       setLoadingReceiver(null)
     }

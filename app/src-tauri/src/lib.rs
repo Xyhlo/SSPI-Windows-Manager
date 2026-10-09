@@ -1,4 +1,5 @@
 mod rar_control;
+mod session_log;
 use job_store::resume_checkpoint;
 mod job_store;
 mod scheduler;
@@ -34,6 +35,7 @@ mod console_tools;
 mod console_diagnostics;
 mod pkg_meta;
 mod pkg_server;
+mod power;
 #[cfg(test)]
 mod ps4_fake_ftp;
 use archives::safe_extraction_path;
@@ -67,8 +69,8 @@ use url::Url;
 use uuid::Uuid;
 
 const CONFIG_NAME: &str = "settings.json";
-const RECEIVER_VERSION: &str = "1.0.14";
-const PS4_RECEIVER_VERSION: &str = "1.0.13";
+const RECEIVER_VERSION: &str = "1.0.19";
+const PS4_RECEIVER_VERSION: &str = "1.0.14";
 
 #[derive(Debug, Clone)]
 struct ReceiverEndpoint {
@@ -845,6 +847,8 @@ fn write_json_backup(path: &Path, bytes: &[u8]) -> Result<(), String> {
     result
 }
 fn startup_message(message: &str) {
+    session_log::write("startup", message);
+    session_log::flush();
     eprintln!("{message}");
     #[cfg(windows)] {
         #[link(name = "user32")]
@@ -1312,6 +1316,7 @@ fn emit(app: &AppHandle, mut p: Progress) {
         meters.insert(key, Instant::now());
     }
     let terminal = terminal_stage(&p.stage);
+    let mut journal = None;
     if let Some(state) = app.try_state::<AppState>() {
         let mut jobs = state.jobs.lock().unwrap();
         if state.retry.lock().unwrap().records.get(&p.job_id).is_some_and(|record| record.progress.removed) { return; }
@@ -1343,7 +1348,8 @@ fn emit(app: &AppHandle, mut p: Progress) {
                 p.retryable = true;
                 let persist = record.progress.stage != p.stage || record.progress.work_paths != p.work_paths || terminal;
                 record.progress = p.clone();
-                if persist { if let Err(error) = store.save(&p.job_id) { eprintln!("Retry journal: {error}"); } }
+                // Written after both locks: every download polls `jobs` while a save syncs to disk.
+                if persist { journal = Some(store.snapshot(&p.job_id)); }
             }
         }
         jobs.insert(p.job_id.clone(), p.clone());
@@ -1352,7 +1358,9 @@ fn emit(app: &AppHandle, mut p: Progress) {
             scheduler::finished(&p.job_id);
         }
     }
+    if let Some(Err(error)) = journal.map(|snapshot| snapshot.and_then(job_store::Snapshot::write)) { eprintln!("Retry journal: {error}"); }
     if p.target != "ps4" || ps4_receiver_job(app, &p.job_id) { receiver_notifications::observe(app, &p); }
+    session_log::progress(&p);
     let _ = app.emit("delivery-progress", p);
 }
 
@@ -1405,7 +1413,7 @@ fn terminal_stage(stage: &str) -> bool {
 }
 
 fn job_error_stage(error: &str) -> &'static str {
-    if error.starts_with(ps4_receiver::MONITORING_ENDED) {
+    if error.starts_with(ps4_receiver::MONITORING_ENDED) || error.starts_with(PS5_MONITORING_ENDED) {
         "monitoring-ended"
     } else if error == "cancelled" || error.ends_with(": cancelled") {
         "cancelled"
@@ -1445,20 +1453,26 @@ fn require_preflight(response: u8) -> Result<(), String> {
     }
 }
 
+fn ps5_preflight_error(error: String) -> String {
+    format!("PS5 receiver preflight failed before upload; no package bytes were sent. {error}")
+}
+
 fn accepted_submission(value: &Value) -> Result<String, String> {
-    let code = value["install_api_code"]
+    let code = (if value["submission_attempted"].as_bool() == Some(false) { value["api_code"].as_i64() } else { None })
+        .or_else(|| value["install_api_code"]
         .as_i64()
-        .or_else(|| value["api_code"].as_i64());
+        .or_else(|| value["api_code"].as_i64()));
     let content_id = value["content_id"].as_str().filter(|x| !x.is_empty());
     if code == Some(0) && value["state"].as_str() == Some("submitted") {
         Ok(content_id.unwrap_or("").to_owned())
     } else {
         let error = value["error"].as_str().unwrap_or("rejected");
-        let stage = value["stage"].as_str().filter(|stage| !stage.is_empty()).map(|stage| format!(" {stage}")).unwrap_or_default();
+        let stage = value["stage"].as_str().or_else(|| value["phase"].as_str())
+            .filter(|stage| !stage.is_empty()).map(|stage| format!(" {stage}")).unwrap_or_default();
         let code = code.unwrap_or(-1);
-        // PlayGo slot errors: the receiver already retried; a fresh receiver process clears them.
+        // Each explicit retry uses a fresh installer process.
         let hint = match code as u32 {
-            0x80B2_116F => ". PlayGo INVALID_SLOT: the PS5 installer had no free slot after three tries. Reload the receiver (Tools > Payloads), then Retry.",
+            0x80B2_116F => ". PlayGo INVALID_SLOT: the PS5 installer refused this attempt. Retry starts a fresh installer process.",
             0x80B2_100D | 0x80B2_100E => ". PlayGo is not ready. Wait for other installs on the PS5 to finish, then Retry.",
             _ => "",
         };
@@ -1510,6 +1524,65 @@ fn install_decision(value: &Value) -> Result<InstallDecision, String> {
 }
 
 const INSTALL_CONFIRM_GRACE: Duration = Duration::from_secs(10 * 60);
+const PS5_MONITORING_ENDED: &str = "PS5 installation is not confirmed. Retry resumes confirmation without submitting the package again.";
+
+fn ps5_submission_refused(value: &Value, initial_reply: bool) -> bool {
+    value["state"] == "failed" && (value["submission_attempted"].as_bool() == Some(false) || value["install_api_code"].as_i64()
+        .or_else(|| initial_reply.then(|| value["api_code"].as_i64()).flatten())
+        .is_some_and(|code| code != 0))
+}
+
+fn accept_ps5_submission(install: &mut job_store::Ps5Install, value: &Value) -> Result<(), String> {
+    let cid = accepted_submission(value)?;
+    if (!cid.is_empty() && cid != install.content_id)
+        || value["path"].as_str().is_some_and(|path| path != install.remote_path) {
+        return Err("Receiver submission response belongs to a different package or attempt".into());
+    }
+    install.accepted = true;
+    if install.matches_reply(value) { install.attempt_id = value["attempt_id"].as_str().map(str::to_owned); }
+    Ok(())
+}
+
+struct InstallActivity {
+    progress: f64,
+    statuses: Vec<String>,
+    changed: Instant,
+}
+
+impl InstallActivity {
+    fn new(now: Instant) -> Self { Self { progress: 0., statuses: vec![], changed: now } }
+    fn observe(&mut self, status: &str, progress: f64, now: Instant) {
+        let new_status = !self.statuses.iter().any(|seen| seen == status);
+        if new_status || progress > self.progress { self.changed = now; }
+        if new_status { self.statuses.push(status.to_string()); }
+        self.progress = self.progress.max(progress);
+    }
+    fn idle(&self) -> Duration { self.changed.elapsed() }
+}
+
+fn ps5_install_outcome(install: &job_store::Ps5Install, value: Option<&Value>, activity: &mut InstallActivity, now: Instant) -> InstallOutcome {
+    let idle = now.saturating_duration_since(activity.changed);
+    let mut outcome = classify_install_outcome(value, &install.content_id, false, idle);
+    if matches!(outcome, InstallOutcome::Failed(_) | InstallOutcome::Complete) && !value.is_some_and(|value| install.matches_reply(value)) {
+        outcome = if idle >= INSTALL_CONFIRM_GRACE { InstallOutcome::Unconfirmed } else { InstallOutcome::Waiting };
+    }
+    if let InstallOutcome::Installing { status, progress } = &outcome {
+        activity.observe(status, *progress, now);
+        if now.saturating_duration_since(activity.changed) >= INSTALL_CONFIRM_GRACE { outcome = InstallOutcome::Unconfirmed; }
+    }
+    outcome
+}
+
+fn install_status_detail(value: &Value) -> String {
+    let mut fields = Vec::new();
+    for key in ["stage", "phase", "error"] {
+        if let Some(text) = value[key].as_str().filter(|text| !text.is_empty()) { fields.push(format!("{key}: {text}")); }
+    }
+    for key in ["api_code", "status_api_code"] {
+        if let Some(code) = value[key].as_i64().filter(|code| *code != 0) { fields.push(format!("{key}: 0x{:08X} ({code})", code as u32)); }
+    }
+    fields.join("; ")
+}
 
 #[derive(Debug, PartialEq)]
 enum InstallOutcome {
@@ -1573,6 +1646,75 @@ async fn confirm_install_from_library(endpoint: &ReceiverEndpoint, title: &str, 
     let Ok(snapshot) = serde_json::to_value(snapshot) else { return false; };
     snapshot["entries"].as_array().is_some_and(|entries| entries.iter()
         .any(|entry| install_library_entry_matches(entry, title, cid, version, kind)))
+}
+
+fn validate_ps5_reconciliation(install: &job_store::Ps5Install) -> Result<(), String> {
+    if !install.complete || !install.reconcile_pending || install.version.as_deref().is_none_or(|version| version.trim().is_empty()) {
+        return Err("Exact-version library confirmation is required before releasing installer ownership".into());
+    }
+    for field in [install.content_id.as_str(), install.remote_path.as_str()] {
+        if field.is_empty() || field.as_bytes().contains(&0) { return Err("The saved install identity is invalid".into()); }
+    }
+    Ok(())
+}
+
+fn ps5_reconciliation_body(install: &job_store::Ps5Install) -> Result<Vec<u8>, String> {
+    validate_ps5_reconciliation(install)?;
+    let attempt = install.attempt_id.as_deref().filter(|id| !id.is_empty()).ok_or("The receiver's install attempt ID is unavailable")?;
+    let mut body = Vec::new();
+    for field in [install.content_id.as_str(), install.remote_path.as_str(), attempt] {
+        if field.is_empty() || field.as_bytes().contains(&0) { return Err("The saved install identity is invalid".into()); }
+        body.extend_from_slice(field.as_bytes()); body.push(0);
+    }
+    Ok(body)
+}
+
+async fn reconcile_ps5_install(endpoint: &ReceiverEndpoint, install: &job_store::Ps5Install, deadline: Duration) -> Result<(), String> {
+    validate_ps5_reconciliation(install)?;
+    let body = install.attempt_id.as_ref().map(|_| ps5_reconciliation_body(install)).transpose()?;
+    install.check_endpoint(endpoint)?;
+    tokio::time::timeout(deadline, async {
+        let mut config_socket = connect_receiver(endpoint, "installer recovery capabilities").await?;
+        let (code, config) = frame(&mut config_socket, 0x53, &[]).await?;
+        drop(config_socket);
+        let config: Value = serde_json::from_slice(&config).map_err(|_| "Receiver returned invalid recovery capabilities".to_string())?;
+        if !matches!(code, 1 | 3) || !config["capabilities"].as_array().is_some_and(|caps| caps.iter().any(|cap| cap == "install-reconcile-v1")) {
+            return Err("Receiver does not support releasing independently confirmed installer attempts".into());
+        }
+        let reply = if let Some(body) = body {
+            let mut socket = connect_receiver(endpoint, "installer completion acknowledgment").await?;
+            let (code, reply) = frame(&mut socket, 0x59, &body).await?;
+            drop(socket);
+            if code == 1 && reply == b"OK" { return Ok(()); }
+            reply
+        } else { b"The previous install attempt ID is unavailable".to_vec() };
+        // A fresh receiver no longer knows the old attempt. Its guarded preflight can
+        // confirm there is no owner to release without changing installation truth.
+        let mut preflight = connect_receiver(endpoint, "installer ownership check").await?;
+        let (ready, status) = frame(&mut preflight, 0x56, &[]).await?;
+        if ready == 1 { return Ok(()); }
+        Err(format!("Receiver did not release installer ownership: {}; preflight: {}", String::from_utf8_lossy(&reply), String::from_utf8_lossy(&status)))
+    }).await.map_err(|_| "Receiver installer completion acknowledgment timed out".to_string())?
+}
+
+fn apply_ps5_reconciliation(install: &mut job_store::Ps5Install, result: Result<(), String>) -> Option<String> {
+    match result {
+        Ok(()) => { install.reconcile_pending = false; None },
+        Err(error) => Some(format!("Receiver recovery is not confirmed: {error}. Reload the receiver before starting another install.")),
+    }
+}
+
+async fn reconcile_saved_ps5_install(app: &AppHandle, job: &str, endpoint: &ReceiverEndpoint, install: &mut job_store::Ps5Install) -> Option<String> {
+    if !install.reconcile_pending { return None; }
+    let result = reconcile_ps5_install(endpoint, install, Duration::from_secs(10)).await;
+    let warning = apply_ps5_reconciliation(install, result);
+    if warning.is_none() {
+        if let Err(error) = job_store::save_ps5_install(app, job, &install.path, Some(install.clone())) {
+            install.reconcile_pending = true;
+            return Some(format!("Installation is confirmed, but saving receiver recovery failed: {error}. Retry can safely repeat the acknowledgment."));
+        }
+    }
+    warning
 }
 
 fn split_ranges(total: u64, lanes: u64) -> Vec<(u64, u64)> {
@@ -1723,20 +1865,26 @@ fn free_space(path: &Path) -> Option<u64> {
 }
 
 fn rar_list_size(path: &Path, password: &[u8]) -> Result<u64, String> {
+    rar_list_sizes(path, password).map(|(total, _)| total)
+}
+
+/// Unpacked bytes of every file and of the largest one.
+fn rar_list_sizes(path: &Path, password: &[u8]) -> Result<(u64, u64), String> {
     let _library = rar_control::library_lock(&|| Ok(()))?;
     let archive = if password.is_empty() {
         unrar::Archive::new(path)
     } else {
         unrar::Archive::with_password(path, password)
     };
-    let mut total = 0u64;
+    let (mut total, mut largest) = (0u64, 0u64);
     for entry in archive.open_for_listing().map_err(|error| error.to_string())? {
         let header = entry.map_err(|error| error.to_string())?;
         if header.is_file() {
             total = total.saturating_add(header.unpacked_size);
+            largest = largest.max(header.unpacked_size);
         }
     }
-    Ok(total)
+    Ok((total, largest))
 }
 
 fn rar_extract_to(path: &Path, dest: &Path, password: &[u8]) -> Result<u64, String> {
@@ -2568,13 +2716,15 @@ fn save_settings(
     }
     fpkg::validate_compression_level(input.fpkg_compression_level)?;
     if let Some(v) = input.real_debrid_token.filter(|v| !v.trim().is_empty()) {
+        session_log::protect(&v);
         secret("real-debrid")?.set_password(&v).map_err(redact)?;
     }
     for (provider, token) in [("torbox", input.torbox_token), ("alldebrid", input.alldebrid_token)] {
-        if let Some(token) = token.filter(|t| !t.trim().is_empty()) { secret(provider)?.set_password(token.trim()).map_err(redact)?; }
+        if let Some(token) = token.filter(|t| !t.trim().is_empty()) { session_log::protect(&token); secret(provider)?.set_password(token.trim()).map_err(redact)?; }
     }
     let mut s = state.settings.lock().unwrap();
     if let Some(password) = input.ps4_ftp_password.filter(|v| !v.trim().is_empty()) {
+        session_log::protect(&password);
         secret("ps4-ftp")?.set_password(&password).map_err(redact)?;
     }
     *s = Settings {
@@ -2790,6 +2940,7 @@ async fn get_provider_hosts(state: State<'_, AppState>) -> Result<Vec<debrid::Pr
 
 #[tauri::command]
 async fn verify_provider(state: State<'_, AppState>, provider: String, token: Option<String>) -> Result<String, String> {
+    if let Some(token) = &token { session_log::protect(token); }
     debrid::verify(&state.http, &provider, token).await
 }
 
@@ -2803,6 +2954,7 @@ async fn verify_real_debrid(
             .get_password()
             .map_err(|_| "No Real-Debrid token stored".to_string())
     })?;
+    session_log::protect(&t);
     let r = state
         .http
         .get("https://api.real-debrid.com/rest/1.0/user")
@@ -3641,6 +3793,57 @@ async fn frame_io_target(stream: &mut TcpStream, cmd: u8, body: &[u8], target: &
     stream.read_exact(&mut b).await.map_err(|e| redact_delivery_error(e, target))?;
     Ok((rh[0], b))
 }
+/// UPLOAD_CHUNK fails when its link stops moving, not when a slow but moving link
+/// needs longer than one command's budget: many lanes on weak Wi-Fi can each take
+/// minutes per 8 MiB frame. Receivers time out a silent socket themselves.
+const LANE_STALL: Duration = Duration::from_secs(60);
+async fn upload_chunk(stream: &mut TcpStream, chunk: &[u8], stall: Duration, reply: Duration) -> Result<(u8, Vec<u8>), String> {
+    if chunk.len() > CHUNK {
+        return Err("frame exceeds 8 MiB".into());
+    }
+    let stalled = || format!("Receiver command 0x11 timed out: no upload progress for {} s", stall.as_secs());
+    let mut header = vec![0x11];
+    header.extend((chunk.len() as u32).to_le_bytes());
+    tokio::time::timeout(stall, stream.write_all(&header)).await.map_err(|_| stalled())?.map_err(redact)?;
+    for piece in chunk.chunks(256 * 1024) {
+        tokio::time::timeout(stall, stream.write_all(piece)).await.map_err(|_| stalled())?.map_err(redact)?;
+    }
+    // The receiver answers once the bytes still in flight are written to its disk.
+    tokio::time::timeout(reply, async {
+        let mut rh = [0; 5];
+        stream.read_exact(&mut rh).await.map_err(redact)?;
+        let n = u32::from_le_bytes(rh[1..5].try_into().unwrap()) as usize;
+        if n > CHUNK {
+            return Err("receiver frame exceeds 8 MiB".to_string());
+        }
+        let mut b = vec![0; n];
+        stream.read_exact(&mut b).await.map_err(redact)?;
+        Ok((rh[0], b))
+    })
+    .await
+    .map_err(|_| "Receiver command 0x11 timed out".to_string())?
+}
+/// Pausing keeps each lane's connection. Receivers drop a silent connection (PS4 after
+/// 30 s, PS5 after 120 s), which restarted the whole file on one lane after resume,
+/// so a paused lane sends PING, which both receivers answer on any connection.
+const PAUSED_LANE_PING: Duration = Duration::from_secs(15);
+async fn hold_paused_lane(tcp: &mut TcpStream, cancel: &watch::Receiver<bool>, paused: impl Fn() -> bool, every: Duration) -> Result<(), String> {
+    let mut quiet = Instant::now();
+    loop {
+        if *cancel.borrow() { return Err("cancelled".into()); }
+        if !paused() { return Ok(()); }
+        if quiet.elapsed() >= every {
+            let (code, body) = frame(tcp, 0x01, &[]).await?;
+            if code != 1 || body != b"SSPI" { return Err("The receiver did not answer a paused upload's keepalive".into()); }
+            quiet = Instant::now();
+        }
+        let mut changed = cancel.clone();
+        tokio::select! {
+            _ = sleep(Duration::from_millis(80)) => {},
+            closed = changed.changed() => if closed.is_err() { sleep(Duration::from_millis(80)).await; },
+        }
+    }
+}
 async fn ping(endpoint: &ReceiverEndpoint) -> Result<(), String> {
     let mut x = tokio::time::timeout(
         Duration::from_secs(10),
@@ -3845,11 +4048,14 @@ async fn send_file_once(
                 if *cancel.borrow() {
                     return Err("cancelled".to_string());
                 }
-                if let Some(app) = &app { transfer_checkpoint(app, &job, &cancel).await?; }
+                if let Some(app) = &app {
+                    let paused = || app.state::<AppState>().jobs.lock().unwrap().get(&job).is_some_and(|p| p.paused);
+                    hold_paused_lane(&mut tcp, &cancel, paused, PAUSED_LANE_PING).await?;
+                }
                 let chunk_len = remain.min(buffer.len() as u64) as usize;
                 let chunk = &mut buffer[..chunk_len];
                 f.read_exact(chunk).await.map_err(redact)?;
-                let (r, body) = frame(&mut tcp, 0x11, chunk).await?;
+                let (r, body) = upload_chunk(&mut tcp, chunk, LANE_STALL, Duration::from_secs(90)).await?;
                 if r != 1 {
                     return Err(format!(
                         "UPLOAD_CHUNK rejected: {}",
@@ -4024,6 +4230,13 @@ async fn package_and_install_dump(
         // The FPKG notes about embedding runtimes in an installed package do not apply to images.
         for warning in preflight.warnings.iter().filter(|w| !image || !(w.starts_with("Backport runtime files are embedded") || w.starts_with("ampr_emu.index is preserved"))) {
             emit(&app_control, Progress { job_id: job_control.clone(), stage: "packaging".into(), message: warning.clone(), ..Default::default() });
+        }
+        // The package or image is one file; a FAT drive refuses it only after the whole build.
+        match archives::fat_file_limit(Path::new(&package_download_dir), preflight.total_bytes, if image { "The exFAT image" } else { "This package" }) {
+            Err(error) if image && !lizard => return Err(error),
+            Err(warning) => emit(&app_control, Progress { job_id: job_control.clone(), stage: "packaging".into(),
+                message: format!("{warning} Packaging continues in case compression keeps it smaller."), ..Default::default() }),
+            Ok(()) => {}
         }
         if image {
             // The image is about the size of the dump; Lizard packs are written into staging first.
@@ -4257,6 +4470,29 @@ async fn image_request(endpoint: &ReceiverEndpoint, op: u8, name: &str) -> Resul
     Ok((code, String::from_utf8_lossy(&reply).into_owned()))
 }
 
+/// Retries a delete that Windows refuses while antivirus or indexing holds a fresh file
+/// (os errors 5, 32 and 33), waiting `first_wait`, then twice as long each time.
+fn retry_sharing_violation(mut remove: impl FnMut() -> Result<(), String>, first_wait: Duration) -> Result<(), String> {
+    let mut wait = first_wait;
+    for _ in 0..4 {
+        match remove() {
+            Err(error) if ["(os error 5)", "(os error 32)", "(os error 33)"].iter().any(|code| error.contains(code)) => {
+                std::thread::sleep(wait);
+                wait *= 2;
+            }
+            result => return result,
+        }
+    }
+    remove()
+}
+/// Deletes a delivered local package without blocking an async worker. The console delivery
+/// already succeeded, so the caller reports a remaining failure as a note, never a job failure.
+async fn cleanup_delivered_package(app: &AppHandle, job: &str, path: &Path) -> Option<String> {
+    let (app, job, path) = (app.clone(), job.to_string(), path.to_path_buf());
+    tokio::task::spawn_blocking(move || retry_sharing_violation(|| job_store::cleanup_installed_package(&app, &job, &path), Duration::from_millis(250)))
+        .await.map_err(redact).and_then(|result| result).err()
+}
+
 /// Uploads a finished image into a folder ShadowMount Plus skips, then has the receiver move it
 /// into /data/homebrew, so a scan never mounts a partial file. Returns the completion message.
 pub(crate) async fn deliver_image(app: &AppHandle, s: &Settings, path: &Path, job: &str, tx: &mut watch::Receiver<bool>) -> Result<String, String> {
@@ -4291,13 +4527,30 @@ pub(crate) async fn deliver_image(app: &AppHandle, s: &Settings, path: &Path, jo
         message: format!("Publishing {name} for ShadowMount Plus"), ..Default::default() });
     let (code, reply) = image_request(endpoint, b'p', &name).await?;
     if code != 1 { return Err(format!("The image was uploaded but could not be published: {reply}. The copy stays in {IMAGE_STAGING} on the PS5.")); }
-    if !s.keep_packages { job_store::cleanup_installed_package(app, job, path)?; }
-    Ok(format!("Image delivered to {final_path}. ShadowMount Plus mounts it on its next scan (about every 15 seconds)."))
+    let kept = if s.keep_packages { None } else { cleanup_delivered_package(app, job, path).await };
+    Ok(format!("Image delivered to {final_path}. ShadowMount Plus mounts it on its next scan (about every 15 seconds).{}",
+        kept.map(|error| format!(" The local image was kept because cleanup could not finish: {error}")).unwrap_or_default()))
 }
 
 #[cfg(test)]
 mod image_delivery_tests {
     use super::*;
+
+    #[test]
+    fn delivered_package_cleanup_waits_out_sharing_violations_only() {
+        let locked = "The process cannot access the file because it is being used by another process. (os error 32)";
+        let mut calls = 0;
+        assert!(retry_sharing_violation(|| { calls += 1; if calls < 3 { Err(locked.into()) } else { Ok(()) } }, Duration::from_millis(1)).is_ok());
+        assert_eq!(calls, 3);
+        calls = 0;
+        assert_eq!(retry_sharing_violation(|| { calls += 1; Err(locked.into()) }, Duration::from_millis(1)).unwrap_err(), locked);
+        assert_eq!(calls, 5);
+        for other in ["Cleanup refuses linked folders or files", "The system cannot find the path specified. (os error 3)"] {
+            calls = 0;
+            assert!(retry_sharing_violation(|| { calls += 1; Err(other.into()) }, Duration::from_millis(1)).is_err());
+            assert_eq!(calls, 1, "{other} is not retried");
+        }
+    }
 
     #[test]
     fn an_existing_image_is_kept_or_refused_and_space_counts_the_partial_copy() {
@@ -4819,6 +5072,10 @@ async fn upload(
         return Ok(());
     }
     let _delivery = console_delivery_slot(app, job, tx).await?;
+    if let Some(install) = job_store::ps5_install(app, job, path) {
+        install.check_endpoint(endpoint)?;
+        return monitor_ps5_install(app, s, endpoint, install, job, tx, label, announce_complete, set_offset, set_total).await;
+    }
     test_ps5(endpoint.host.clone(), endpoint.port).await?;
     let (header, _, _) = file_header(path).await?;
     // A PKG installs under the title ID inside it; catalogs list PS1/PS2 classics by their disc IDs.
@@ -4828,14 +5085,17 @@ async fn upload(
     let total = set_total.max(set_offset + n).max(1);
     let done = set_offset + n;
     let target = remote(endpoint, title);
-    let mut control = connect_receiver(endpoint, "install preflight").await?;
-    let (preflight, body) = frame(&mut control, 0x56, &[]).await?;
+    emit(app, Progress { job_id: job.into(), stage: "uploading".into(), bytes_done: set_offset, bytes_total: total,
+        message: "Checking PS5 receiver storage before uploading the package".into(), ..Default::default() });
+    let mut control = install_cancellable(tx, connect_receiver(endpoint, "receiver preflight")).await?.map_err(ps5_preflight_error)?;
+    let (preflight, body) = install_cancellable(tx, frame(&mut control, 0x56, &[])).await?.map_err(ps5_preflight_error)?;
     require_preflight(preflight).map_err(|error| {
-        format!(
+        ps5_preflight_error(format!(
             "{error}: {}",
             String::from_utf8_lossy(&body)
-        )
+        ))
     })?;
+    drop(control);
     send_file(
         app,
         s,
@@ -4869,65 +5129,124 @@ async fn upload(
             ..Default::default()
         },
     );
-    let mut submit = connect_receiver(endpoint, "install submission").await?;
-    if *tx.borrow() { return Err("cancelled".into()); }
-    let (_frame_code, v) = frame(&mut submit, 0x50, target.as_bytes()).await?;
-    let parsed: Value = serde_json::from_slice(&v).map_err(|_| {
-        format!(
-            "Install submission failed: {}",
-            String::from_utf8_lossy(&v)
-        )
-    })?;
-    let mut cid = accepted_submission(&parsed)?;
-    if cid.is_empty() {
-        cid = pkg_content_id(path).unwrap_or_default();
-    }
-    // F3: a blind poll can never observe anything — fail fast with the package named.
-    if cid.is_empty() {
-        return Err(format!(
-            "Install submission returned no content ID for {label}; refusing blind poll. Package: {target}"
-        ));
-    }
-    let label = format!("{label} [{cid}]");
+    let cid = pkg_content_id(path).filter(|cid| !cid.is_empty())
+        .ok_or_else(|| format!("Cannot read a content ID for {label}; no install was submitted. Package: {}", path.display()))?;
     let metadata = pkg_meta::read(path).ok();
     let install_title = cid.split(|c: char| !c.is_ascii_alphanumeric()).find(|id| title_id(id))
         .or(title).unwrap_or("");
-    let version = metadata.as_ref().and_then(|meta| meta.version.as_deref());
-    let kind = metadata.as_ref().map(|meta| meta.kind.as_str()).unwrap_or_else(|| pkg_role_label(path));
-    let mut last_answer = Instant::now();
+    let mut install = job_store::Ps5Install {
+        path: path.to_path_buf(), host: endpoint.host.clone(), port: endpoint.port,
+        title_id: install_title.into(), version: metadata.as_ref().and_then(|meta| meta.version.clone()),
+        kind: metadata.as_ref().map(|meta| meta.kind.clone()).unwrap_or_else(|| pkg_role_label(path).into()),
+        content_id: cid, remote_path: target.clone(), attempt_id: None, size: n, accepted: false, complete: false, reconcile_pending: false,
+    };
+    let mut submit = connect_receiver(endpoint, "install submission").await?;
+    if *tx.borrow() { return Err("cancelled".into()); }
+    // Persist before sending: a lost reply or process exit must never trigger a second submission.
+    job_store::save_ps5_install(app, job, path, Some(install.clone()))?;
+    let reply = frame(&mut submit, 0x50, target.as_bytes()).await;
+    drop(submit);
+    let detail = match reply {
+        Ok((_code, body)) => match serde_json::from_slice::<Value>(&body) {
+            Ok(parsed) if ps5_submission_refused(&parsed, true)
+                && parsed["path"].as_str().is_none_or(|path| path == install.remote_path) => {
+                job_store::save_ps5_install(app, job, path, None)
+                    .map_err(|error| format!("{PS5_MONITORING_ENDED} Could not save refusal: {error}"))?;
+                return Err(accepted_submission(&parsed).unwrap_err());
+            }
+            Ok(parsed) => {
+                let prior_attempt = install.attempt_id.clone();
+                if install.matches_reply(&parsed) { install.attempt_id = parsed["attempt_id"].as_str().map(str::to_owned); }
+                let accepted = accept_ps5_submission(&mut install, &parsed).is_ok();
+                if accepted || install.attempt_id != prior_attempt {
+                    job_store::save_ps5_install(app, job, path, Some(install.clone()))
+                        .map_err(|error| format!("{PS5_MONITORING_ENDED} Could not save acceptance: {error}"))?;
+                }
+                if accepted { None } else { Some(format!("Receiver did not confirm submission: {}", String::from_utf8_lossy(&body))) }
+            },
+            Err(_) => Some(format!("Receiver returned an invalid submission response: {}", String::from_utf8_lossy(&body))),
+        },
+        Err(error) => Some(error),
+    };
+    if let Some(detail) = detail {
+        emit(app, Progress { job_id: job.into(), stage: "installing".into(), bytes_done: done, bytes_total: total,
+            message: format!("Submission response is uncertain; checking the existing attempt. {detail}"), ..Default::default() });
+    }
+    monitor_ps5_install(app, s, endpoint, install, job, tx, label, announce_complete, set_offset, set_total).await
+}
+
+async fn monitor_ps5_install(
+    app: &AppHandle, s: &Settings, endpoint: &ReceiverEndpoint, mut install: job_store::Ps5Install,
+    job: &str, tx: &mut watch::Receiver<bool>, label: &str, announce_complete: bool, set_offset: u64, set_total: u64,
+) -> Result<(), String> {
+    let path = install.path.clone();
+    let cid = install.content_id.clone();
+    let label = format!("{label} [{cid}]");
+    let done = set_offset + install.size;
+    let total = set_total.max(done).max(1);
+    if install.complete {
+        let mut message = format!("{label} installation was already confirmed");
+        if let Some(warning) = reconcile_saved_ps5_install(app, job, endpoint, &mut install).await { message.push_str(&format!(". {warning}")); }
+        return finish_pkg_install(app, job, done, total, &message, announce_complete);
+    }
+    let mut activity = InstallActivity::new(Instant::now());
     let mut last_library_check = None::<Instant>;
     let mut receiver_lost = false;
     let mut last_progress = 0.;
+    let mut last_detail = String::new();
+    emit(app, Progress { job_id: job.into(), stage: "installing".into(), bytes_done: done, bytes_total: total,
+        message: format!("Checking the existing installation of {label}"), ..Default::default() });
     loop {
         install_cancellable(tx, sleep(Duration::from_secs(2))).await?;
-        let remaining = INSTALL_CONFIRM_GRACE.saturating_sub(last_answer.elapsed());
+        let remaining = INSTALL_CONFIRM_GRACE.saturating_sub(activity.idle());
         let poll = async {
             let mut socket = connect_receiver(endpoint, "install status").await?;
             frame(&mut socket, 0x51, cid.as_bytes()).await
         };
         let reply = install_cancellable(tx, tokio::time::timeout(remaining.min(Duration::from_secs(15)), poll)).await?;
         let (answered, parsed) = match reply {
-            Ok(Ok((_code, body))) => (true, serde_json::from_slice::<Value>(&body).ok()),
-            _ => (false, None),
+            Ok(Ok((_code, body))) => match serde_json::from_slice::<Value>(&body) {
+                Ok(value) => { let detail = install_status_detail(&value); if !detail.is_empty() { last_detail = detail; } (true, Some(value)) },
+                Err(_) => { last_detail = format!("Invalid status response: {}", String::from_utf8_lossy(&body)); (true, None) },
+            },
+            Ok(Err(error)) => { last_detail = error; (false, None) },
+            Err(_) => { last_detail = "Receiver install status timed out".into(); (false, None) },
         };
         receiver_lost |= !answered;
-        let mut outcome = classify_install_outcome(parsed.as_ref(), &cid, false, last_answer.elapsed());
+        if let Some(value) = parsed.as_ref().filter(|value| install.matches_reply(value)) {
+            if ps5_submission_refused(value, false) {
+                job_store::save_ps5_install(app, job, &path, None)
+                    .map_err(|error| format!("{PS5_MONITORING_ENDED} Could not save refusal: {error}"))?;
+                return Err(accepted_submission(value).unwrap_err());
+            }
+            if install.attempt_id.is_none() && value["attempt_id"].is_string() {
+                install.attempt_id = value["attempt_id"].as_str().map(str::to_owned);
+                install.accepted |= value["submission_accepted"].as_bool() == Some(true);
+                job_store::save_ps5_install(app, job, &path, Some(install.clone()))
+                    .map_err(|error| format!("{PS5_MONITORING_ENDED} Could not save attempt identity: {error}"))?;
+            }
+        }
+        let mut outcome = ps5_install_outcome(&install, parsed.as_ref(), &mut activity, Instant::now());
         if matches!(outcome, InstallOutcome::Waiting | InstallOutcome::Unconfirmed) {
             emit(app, Progress {
                 job_id: job.into(), stage: "installing".into(), progress: last_progress,
                 bytes_done: done, bytes_total: total,
                 message: if !answered {
-                    format!("{} receiver stopped answering after AppInst accepted {label}. Reload it in Tools > Payloads so SSPI can confirm the install.", endpoint.console)
+                    format!("{} receiver stopped answering while checking {label}. Reload it in Tools > Payloads so SSPI can confirm the install.", endpoint.console)
                 } else {
-                    format!("AppInst accepted {label}; install status is unavailable. Checking the console's library for confirmation.")
+                    format!("{label}: installation has not been confirmed. Checking the console's library.")
                 }, ..Default::default()
             });
             if last_library_check.is_none_or(|checked| checked.elapsed() >= Duration::from_secs(30)) {
                 last_library_check = Some(Instant::now());
-                let remaining = INSTALL_CONFIRM_GRACE.saturating_sub(last_answer.elapsed());
-                let confirmed = install_cancellable(tx, tokio::time::timeout(remaining.min(Duration::from_secs(30)),
-                    confirm_install_from_library(endpoint, install_title, &cid, version, kind))).await?.unwrap_or(false);
-                outcome = classify_install_outcome(parsed.as_ref(), &cid, confirmed, last_answer.elapsed());
+                let remaining = INSTALL_CONFIRM_GRACE.saturating_sub(activity.idle());
+                // Content IDs survive package updates; an old installed version cannot confirm a lost submission.
+                let confirmed = if let Some(version) = install.version.as_deref().filter(|version| !version.trim().is_empty()) {
+                    install_cancellable(tx, tokio::time::timeout(remaining.min(Duration::from_secs(30)),
+                        confirm_install_from_library(endpoint, &install.title_id, &cid, Some(version), &install.kind))).await?.unwrap_or(false)
+                } else { false };
+                if confirmed { outcome = InstallOutcome::LibraryConfirmed; }
+                else if activity.idle() >= INSTALL_CONFIRM_GRACE { outcome = InstallOutcome::Unconfirmed; }
             }
         }
         match outcome {
@@ -4935,8 +5254,15 @@ async fn upload(
                 let from_library = outcome == InstallOutcome::LibraryConfirmed;
                 let mut message = if from_library { format!("{label} installation confirmed from the console's library") }
                     else { format!("{label} installation confirmed") };
-                if !s.keep_packages && job_store::cleanup_installed_package(app, job, path).is_err() {
-                    message.push_str(". The local package was kept because cleanup could not finish");
+                install.complete = true;
+                install.reconcile_pending = from_library;
+                job_store::save_ps5_install(app, job, &path, Some(install.clone()))
+                    .map_err(|error| format!("{PS5_MONITORING_ENDED} Could not save confirmation: {error}"))?;
+                if let Some(warning) = reconcile_saved_ps5_install(app, job, endpoint, &mut install).await { message.push_str(&format!(". {warning}")); }
+                if !s.keep_packages {
+                    if let Some(error) = cleanup_delivered_package(app, job, &path).await {
+                        message.push_str(&format!(". The local package was kept because cleanup could not finish: {error}"));
+                    }
                 }
                 // Report each package's confirmation even when a set has more packages to install.
                 if !announce_complete {
@@ -4946,17 +5272,21 @@ async fn upload(
                 return finish_pkg_install(app, job, done, total, &message, announce_complete);
             }
             InstallOutcome::Installing { status, progress } => {
-                last_answer = Instant::now();
                 last_progress = progress.min(0.99);
                 emit(app, Progress {
                     job_id: job.into(), stage: "installing".into(), progress: last_progress,
                     bytes_done: done, bytes_total: total, message: format!("{label}: {status}"), ..Default::default()
                 });
             }
-            InstallOutcome::Failed(error) => return Err(error),
+            InstallOutcome::Failed(error) => {
+                job_store::save_ps5_install(app, job, &path, None)
+                    .map_err(|error| format!("{PS5_MONITORING_ENDED} Could not save failure: {error}"))?;
+                return Err(error);
+            }
             InstallOutcome::Unconfirmed => return Err(format!(
-                "AppInst accepted {label}, but {} SSPI could not confirm the result within 10 minutes. The install may have finished; check the {} home screen.",
-                if receiver_lost { "the receiver stopped answering and" } else { "install status remained unavailable and" }, endpoint.console)),
+                "{PS5_MONITORING_ENDED} {label}: {} for 10 minutes. Check the {} home screen. The saved package is retained.{}",
+                if receiver_lost { "the receiver stopped answering or made no progress" } else { "no installation progress was confirmed" }, endpoint.console,
+                if last_detail.is_empty() { String::new() } else { format!(" Last status: {last_detail}") })),
             InstallOutcome::Waiting => {},
         }
     }
@@ -4978,7 +5308,7 @@ async fn upload_pkg_set(
     let count = packages.len();
     let set_total: u64 = packages
         .iter()
-        .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .map(|p| job_store::ps5_install(app, job, p).map(|install| install.size).unwrap_or_else(|| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)))
         .sum::<u64>()
         .max(1);
     let mut set_offset = 0u64;
@@ -5004,7 +5334,8 @@ async fn upload_pkg_set(
             set_total,
         )
         .await?;
-        set_offset += std::fs::metadata(package).map(|m| m.len()).unwrap_or(0);
+        set_offset += job_store::ps5_install(app, job, package).map(|install| install.size)
+            .unwrap_or_else(|| std::fs::metadata(package).map(|m| m.len()).unwrap_or(0));
     }
     Ok(())
 }
@@ -5245,15 +5576,21 @@ async fn download_delivery_inputs(app2: &AppHandle, s: &Settings, http: &Client,
                 let message = format!("Downloading {} · part {}/{}", package.label, index + 1, parts.len());
                 let context = downloader::Context { http, app: app2, job: job2, cancel: rx, message: &message,
                     title: &job_title, icon: &job_icon, set_done, set_total };
-                let fetched = match downloader::fetch(&context, &url, &part_path, rd_size.or(package.expected_size).unwrap_or(0)).await {
-                    // An unlocked link can expire while the game waits for a slot or downloads for
-                    // hours: unlock it once more and continue from the completed pieces.
-                    Err(error) if needs_unlock && downloader::link_expired(&error) => {
-                        (url, rd_name, rd_size) = unlock_part(app2, s, http, job2, request, &package.url, index, parts.len(), rx).await?;
-                        downloader::fetch(&context, &url, &part_path, rd_size.or(package.expected_size).unwrap_or(0)).await
-                    }
-                    result => result,
-                };
+                let size_hint = |size: Option<u64>| size.or(package.expected_size).unwrap_or(0);
+                let mut fetched = downloader::fetch(&context, &url, &part_path, size_hint(rd_size)).await;
+                // An unlocked link can expire while the game waits for a slot or downloads for
+                // hours, and a provider's server can stop sending: unlock it again (or try a
+                // direct link once more) and continue from the completed pieces, for as long as
+                // each new attempt gets more of them through.
+                let (mut renewals, mut before) = (0, 0);
+                while fetched.as_ref().is_err_and(|error| downloader::stalled(error) || needs_unlock && downloader::link_expired(error)) {
+                    let kept = downloader::resumed_bytes(&part_path);
+                    if !downloader::renew_link(renewals, before, kept) { break; }
+                    if let Err(error) = &fetched { session_log::write("download", &format!("Part {} continues with a new attempt after: {error}", index + 1)); }
+                    (renewals, before) = (renewals + 1, kept);
+                    if needs_unlock { (url, rd_name, rd_size) = unlock_part(app2, s, http, job2, request, &package.url, index, parts.len(), rx).await?; }
+                    fetched = downloader::fetch(&context, &url, &part_path, size_hint(rd_size)).await;
+                }
                 let (header, content_type, disposition) = fetched?;
                 let name = rd_name
                     .or(disposition)
@@ -5402,7 +5739,7 @@ async fn queue_delivery(app: AppHandle, state: &AppState, mut request: DeliveryR
             return Err("This game already has an active transfer. Open Downloads to manage it. Use one Install with backport transfer to combine the base and backport.".into());
         }
         if !store.records.contains_key(&job) {
-            store.records.insert(job.clone(), job_store::Record { ps4_delivery: None, package_only, pairing_sealed: false, progress: Progress { job_id: job.clone(), target: target.clone(), ..Default::default() },
+            store.records.insert(job.clone(), job_store::Record { ps4_delivery: None, ps5_installs: vec![], package_only, pairing_sealed: false, progress: Progress { job_id: job.clone(), target: target.clone(), ..Default::default() },
                 request: Some(request.clone()), checkpoint: None, downloads: vec![], download_dir: PathBuf::from(&s.download_dir) });
         }
         if let Some(record) = store.records.get_mut(&job) { record.pairing_sealed = false; record.package_only = package_only; }
@@ -5447,7 +5784,7 @@ async fn queue_delivery(app: AppHandle, state: &AppState, mut request: DeliveryR
                 ..Default::default()
             },
         );
-        let res = async {
+        let res = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
             transfer_checkpoint(&app2, &job2, &rx).await?;
             if target == "ps4" && !receiver && resume.as_ref().is_some_and(|r| r.ps4_delivery.is_some()) {
                 return ps4_inbox::deliver(&app2, &s, &job2, vec![], false, &rx).await;
@@ -5517,8 +5854,10 @@ async fn queue_delivery(app: AppHandle, state: &AppState, mut request: DeliveryR
                 return resume_checkpoint(&app2, &s, &job2, &request, checkpoint, &mut rx).await;
             }
             Err("Downloaded file has unknown package magic".into())
-        }
-        .await;
+        }))
+        .await
+        // A panic must still end the job; otherwise it stays active and blocks updates until restart.
+        .unwrap_or_else(|_| Err("This transfer stopped after an internal error. Retry continues from the retained files; the diagnostic log has details.".into()));
         if let Err(e) = res {
             let stage = job_error_stage(&e);
             emit(
@@ -5577,6 +5916,7 @@ fn pause_job(app: AppHandle, state: State<AppState>, job_id: String, paused: boo
         job.clone()
     };
     scheduler::set_paused(&job_id, paused);
+    session_log::progress(&event);
     let _ = app.emit("delivery-progress", event);
     Ok(())
 }
@@ -5593,17 +5933,16 @@ fn set_job_priority(app: AppHandle, state: State<AppState>, job_id: String, prio
             (p.priority != want).then(|| { p.priority = want; p.clone() })
         }).collect()
     };
-    {
+    let saves: Vec<_> = {
         let mut store = state.retry.lock().unwrap();
-        for p in &changed {
-            if let Some(record) = store.records.get_mut(&p.job_id) {
-                record.progress.priority = p.priority;
-                if let Err(error) = store.save(&p.job_id) { eprintln!("Retry journal: {error}"); }
-            }
-        }
-    }
+        changed.iter().filter_map(|p| {
+            store.records.get_mut(&p.job_id)?.progress.priority = p.priority;
+            Some(store.snapshot(&p.job_id))
+        }).collect()
+    };
+    for save in saves { if let Err(error) = save.and_then(job_store::Snapshot::write) { eprintln!("Retry journal: {error}"); } }
     scheduler::set_priority(priority.then_some(job_id));
-    for p in changed { let _ = app.emit("delivery-progress", p); }
+    for p in changed { session_log::progress(&p); let _ = app.emit("delivery-progress", p); }
     Ok(())
 }
 
@@ -6041,8 +6380,15 @@ pub fn run() {
         Ok(None) => return,
         Err(error) => { startup_message(&format!("SSPI could not acquire its instance lock: {error}")); return; }
     };
+    session_log::initialize();
+    match tauri::webview_version() {
+        Ok(version) => session_log::write("windows-runtime", &format!("WebView2 {version}; architecture {}", std::env::consts::ARCH)),
+        Err(error) => session_log::write("windows-runtime", &format!("WebView2 unavailable: {error}")),
+    }
     if let Err(error) = updater::recover_if_needed() {
         let message = format!("SSPI could not restore an interrupted update.\n\n{error}\n\nYour settings and downloads have not been removed.");
+        session_log::write("update-recovery", &message);
+        session_log::flush();
         eprintln!("{message}");
         #[cfg(windows)]
         {
@@ -6060,8 +6406,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle().clone();
-            if let Err(error) = updater::initialize(&handle) { eprintln!("Update startup: {error}"); }
-            if let Err(error) = package_sources::migrate_bundled(&handle) { eprintln!("Source migration: {error}"); }
+            if let Err(error) = updater::initialize(&handle) { session_log::write("update-startup", &error); eprintln!("Update startup: {error}"); }
+            if let Err(error) = package_sources::migrate_bundled(&handle) { session_log::write("source-migration", &error); eprintln!("Source migration: {error}"); }
             let launch_args: Vec<String> = std::env::args().collect();
             for pair in launch_args.windows(2).filter(|pair| pair[0] == "--import-source") {
                 package_sources::install_from_path(&handle, &pair[1]).map_err(std::io::Error::other)?;
@@ -6091,6 +6437,8 @@ pub fn run() {
                     .build()?,
             });
             payload_autostart::start(handle.clone());
+            power::keep_awake_while_working(handle.clone());
+            std::thread::spawn(session_log::protect_saved_secrets);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -6163,6 +6511,7 @@ pub fn run() {
             job_store::retry_job,
             job_store::remove_job,
             reveal_path,
+            session_log::show_session_log,
             package_details::inspect_package_sizes,
             package_details::refresh_job_details,
             storage::delivery_space,
@@ -6184,9 +6533,16 @@ pub fn run() {
             payloads::send_payload,
         ])
         .build(tauri::generate_context!())
-        .expect("Tauri error")
+        .unwrap_or_else(|error| {
+            let mut message = format!("SSPI could not open its window.\n\n{error}\n\nRun the full SSPI Windows installer to repair missing WebView2 components. Keep the resources folder beside SSPI.exe when using the portable download.");
+            if let Some(path) = session_log::location() { message.push_str(&format!("\n\nDiagnostic log: {path}")); }
+            startup_message(&message);
+            std::process::exit(1);
+        })
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
+                session_log::write("shutdown", "SSPI Windows Manager exited");
+                session_log::flush();
                 if let Some(state) = app.try_state::<AppState>() {
                     if let Ok(store) = state.retry.lock() { cleanup_local_imports(app, &store); }
                 }
@@ -6341,6 +6697,82 @@ mod tests {
     }
 
     #[test]
+    fn paused_lane_keeps_its_receiver_connection_alive() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            // A receiver answers PING on a lane connection and keeps the lane.
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut pings = 0;
+                loop {
+                    let mut header = [0; 5];
+                    if stream.read_exact(&mut header).await.is_err() { return pings; }
+                    assert_eq!(header, [1, 0, 0, 0, 0]);
+                    pings += 1;
+                    stream.write_all(&[1, 4, 0, 0, 0]).await.unwrap();
+                    stream.write_all(b"SSPI").await.unwrap();
+                }
+            });
+            let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let paused = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let resume = paused.clone();
+            tokio::spawn(async move { sleep(Duration::from_millis(900)).await; resume.store(false, Ordering::Relaxed); });
+            let (_cancel_tx, cancel) = watch::channel(false);
+            hold_paused_lane(&mut tcp, &cancel, || paused.load(Ordering::Relaxed), Duration::from_millis(100)).await.unwrap();
+            // Cancelling a paused lane ends it without another request.
+            let (cancel_tx, cancel) = watch::channel(false);
+            tokio::spawn(async move { sleep(Duration::from_millis(50)).await; cancel_tx.send(true).unwrap(); });
+            assert_eq!(hold_paused_lane(&mut tcp, &cancel, || true, Duration::from_secs(60)).await.unwrap_err(), "cancelled");
+            drop(tcp);
+            let pings = server.await.unwrap();
+            assert!((3..=10).contains(&pings), "{pings} keepalive pings");
+        });
+    }
+
+    #[test]
+    fn upload_chunk_times_out_on_a_stall_not_on_a_slow_link() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let chunk = vec![0x5a_u8; 2 * 1024 * 1024];
+            let expected = chunk.len();
+            // The first lane drains slowly but steadily; the second stops reading.
+            let server = tokio::spawn(async move {
+                let (mut slow, _) = listener.accept().await.unwrap();
+                let mut header = [0; 5];
+                slow.read_exact(&mut header).await.unwrap();
+                assert_eq!(header[0], 0x11);
+                assert_eq!(u32::from_le_bytes(header[1..].try_into().unwrap()) as usize, expected);
+                let mut piece = vec![0; 256 * 1024];
+                for _ in 0..expected / piece.len() {
+                    slow.read_exact(&mut piece).await.unwrap();
+                    sleep(Duration::from_millis(150)).await;
+                }
+                slow.write_all(&[1, 2, 0, 0, 0]).await.unwrap();
+                slow.write_all(b"OK").await.unwrap();
+                let (stalled, _) = listener.accept().await.unwrap();
+                sleep(Duration::from_secs(5)).await;
+                drop((slow, stalled));
+            });
+            let started = Instant::now();
+            let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let (code, body) = upload_chunk(&mut tcp, &chunk, Duration::from_millis(800), Duration::from_secs(5)).await.unwrap();
+            assert_eq!((code, body.as_slice()), (1, &b"OK"[..]));
+            assert!(started.elapsed() > Duration::from_millis(800), "the slow lane outlasted one stall window");
+            let started = Instant::now();
+            let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let big = vec![0x5a_u8; CHUNK];
+            let error = upload_chunk(&mut tcp, &big, Duration::from_millis(300), Duration::from_millis(300)).await.unwrap_err();
+            assert!(error.contains("0x11 timed out") && retryable_upload_error(&error), "{error}");
+            assert!(started.elapsed() < Duration::from_secs(3));
+            server.abort();
+        });
+    }
+
+    #[test]
     fn incomplete_backport_is_rejected_before_upload() {
         let work = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../Build-Output/Windows Manager/work");
         std::fs::create_dir_all(&work).unwrap();
@@ -6442,7 +6874,7 @@ mod tests {
         .is_err());
         assert_eq!(
             accepted_submission(&json!({"api_code":-2135813777,"install_api_code":-2135813777,"state":"failed","error":"AppInst rejected PKG"})).unwrap_err(),
-            "Install submission failed: AppInst rejected PKG (code 0x80B2116F, -2135813777). PlayGo INVALID_SLOT: the PS5 installer had no free slot after three tries. Reload the receiver (Tools > Payloads), then Retry."
+            "Install submission failed: AppInst rejected PKG (code 0x80B2116F, -2135813777). PlayGo INVALID_SLOT: the PS5 installer refused this attempt. Retry starts a fresh installer process."
         );
         let installing_in_error_frame = json!({
             "api_code":-99,
@@ -6536,6 +6968,217 @@ mod tests {
         assert_eq!(classify_install_outcome(Some(&completed), cid, false, INSTALL_CONFIRM_GRACE), InstallOutcome::Complete);
         let failed = json!({"state":"failed", "status":"error", "status_api_code":0, "error_code":-7, "content_id":cid});
         assert!(matches!(classify_install_outcome(Some(&failed), cid, true, Duration::ZERO), InstallOutcome::Failed(_)));
+    }
+
+    fn ps5_install_fixture() -> job_store::Ps5Install {
+        job_store::Ps5Install { path: PathBuf::from("retained.pkg"), host: "127.0.0.1".into(), port: 9114,
+            content_id: "UP0000-PPSA12345_00-TEST000000000000".into(), remote_path: "/user/data/tmp/upload_unique.pkg".into(),
+            attempt_id: Some("helper-123".into()), title_id: "PPSA12345".into(), version: Some("01.000.000".into()),
+            kind: "base".into(), size: 4096, accepted: true, complete: false, reconcile_pending: false }
+    }
+
+    #[test]
+    fn ps5_submission_only_releases_certain_refusals() {
+        for value in [json!({"state":"failed", "install_api_code":-2135813777}),
+            json!({"state":"failed", "submission_attempted":false, "install_api_code":0})] {
+            assert!(ps5_submission_refused(&value, true));
+            assert!(ps5_submission_refused(&value, false));
+        }
+        for value in [json!({}), json!({"state":"unconfirmed", "api_code":-36, "submission_attempted":true}),
+            json!({"state":"submitted", "install_api_code":0, "api_code":-7}),
+            json!({"state":"failed", "status_api_code":-7}),
+            json!({"state":"failed", "install_api_code":0, "submission_attempted":true})] {
+            assert!(!ps5_submission_refused(&value, true));
+            assert!(!ps5_submission_refused(&value, false));
+        }
+        let legacy = json!({"state":"failed", "api_code":-7});
+        assert!(ps5_submission_refused(&legacy, true));
+        assert!(!ps5_submission_refused(&legacy, false));
+        let preload = json!({"state":"failed", "submission_attempted":false, "install_api_code":0, "api_code":-7,
+            "phase":"appinst_load", "error":"module load failed"});
+        let error = accepted_submission(&preload).unwrap_err();
+        assert!(error.contains("module load failed appinst_load")); assert!(error.contains("0xFFFFFFF9, -7"));
+    }
+
+    #[test]
+    fn ps5_submission_acceptance_keeps_the_original_attempt() {
+        let mut install = ps5_install_fixture(); install.accepted = false; install.attempt_id = None;
+        let mut value = json!({"state":"submitted", "install_api_code":0, "content_id":install.content_id,
+            "path":"/user/data/tmp/upload_another.pkg", "attempt_id":"another-helper"});
+        assert!(accept_ps5_submission(&mut install, &value).is_err());
+        assert!(!install.accepted); assert!(install.attempt_id.is_none());
+        value["path"] = json!(install.remote_path);
+        accept_ps5_submission(&mut install, &value).unwrap();
+        assert!(install.accepted); assert_eq!(install.attempt_id.as_deref(), Some("another-helper"));
+    }
+
+    #[test]
+    fn ps5_reconciliation_requires_saved_exact_version_proof_and_keeps_completion_on_failure() {
+        let mut install = ps5_install_fixture();
+        assert!(ps5_reconciliation_body(&install).is_err());
+        install.complete = true; assert!(ps5_reconciliation_body(&install).is_err());
+        install.reconcile_pending = true;
+        assert_eq!(ps5_reconciliation_body(&install).unwrap(),
+            format!("{}\0{}\0helper-123\0", install.content_id, install.remote_path).as_bytes());
+        let warning = apply_ps5_reconciliation(&mut install, Err("helper still active".into())).unwrap();
+        assert!(warning.contains("helper still active")); assert!(warning.contains("Reload the receiver"));
+        assert!(install.complete && install.reconcile_pending);
+        install.version = None; assert!(ps5_reconciliation_body(&install).is_err());
+        install.version = Some("01.000.000".into()); install.attempt_id = None;
+        assert!(ps5_reconciliation_body(&install).is_err());
+        install.attempt_id = Some("bad\0attempt".into()); assert!(ps5_reconciliation_body(&install).is_err());
+    }
+
+    async fn ps5_reconciliation_fixture() -> (tokio::net::TcpListener, ReceiverEndpoint, job_store::Ps5Install) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = ReceiverEndpoint::ps5(&Settings { ps5_host: "127.0.0.1".into(), ps5_port: listener.local_addr().unwrap().port(), ..Settings::default() });
+        let mut install = ps5_install_fixture(); install.port = endpoint.port; install.complete = true; install.reconcile_pending = true;
+        (listener, endpoint, install)
+    }
+
+    async fn ps5_reconciliation_request(listener: &tokio::net::TcpListener, command: u8, expected: &[u8], reply: Option<(u8, &[u8])>) {
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await.unwrap().unwrap();
+        let mut header = [0; 5]; socket.read_exact(&mut header).await.unwrap(); assert_eq!(header[0], command);
+        let size = u32::from_le_bytes(header[1..].try_into().unwrap()) as usize;
+        assert_eq!(size, expected.len());
+        let mut body = vec![0; size]; socket.read_exact(&mut body).await.unwrap(); assert_eq!(body, expected);
+        if let Some((code, body)) = reply {
+            let mut header = vec![code]; header.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            socket.write_all(&header).await.unwrap(); socket.write_all(body).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ps5_reconciliation_lost_ack_retries_only_the_same_confirmation() {
+        let (listener, endpoint, mut install) = ps5_reconciliation_fixture().await;
+        let body = ps5_reconciliation_body(&install).unwrap();
+        let peer = tokio::spawn(async move {
+            for reply in [None, Some((1, b"OK".as_slice()))] {
+                ps5_reconciliation_request(&listener, 0x53, &[], Some((3, br#"{"capabilities":["install-reconcile-v1"]}"#))).await;
+                ps5_reconciliation_request(&listener, 0x59, &body, reply).await;
+            }
+            assert!(tokio::time::timeout(Duration::from_millis(30), listener.accept()).await.is_err());
+        });
+        let first = reconcile_ps5_install(&endpoint, &install, Duration::from_secs(2)).await;
+        assert!(apply_ps5_reconciliation(&mut install, first).is_some()); assert!(install.complete && install.reconcile_pending);
+        // Retry after journal recovery has the identical attempt and never submits 0x50.
+        let mut restored: job_store::Ps5Install = serde_json::from_slice(&serde_json::to_vec(&install).unwrap()).unwrap();
+        let second = reconcile_ps5_install(&endpoint, &restored, Duration::from_secs(2)).await;
+        assert!(apply_ps5_reconciliation(&mut restored, second).is_none()); assert!(restored.complete && !restored.reconcile_pending);
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ps5_reconciliation_old_receiver_never_receives_the_optional_command() {
+        let (listener, endpoint, mut install) = ps5_reconciliation_fixture().await;
+        let peer = tokio::spawn(async move {
+            ps5_reconciliation_request(&listener, 0x53, &[], Some((3, br#"{"capabilities":["installed-library-v1"]}"#))).await;
+            assert!(tokio::time::timeout(Duration::from_millis(60), listener.accept()).await.is_err());
+        });
+        let result = reconcile_ps5_install(&endpoint, &install, Duration::from_secs(2)).await;
+        let warning = apply_ps5_reconciliation(&mut install, result).unwrap();
+        assert!(warning.contains("does not support")); assert!(install.complete && install.reconcile_pending);
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ps5_reconciliation_uses_guarded_preflight_after_a_receiver_restart() {
+        for ready in [false, true] {
+            let (listener, endpoint, mut install) = ps5_reconciliation_fixture().await;
+            let body = ps5_reconciliation_body(&install).unwrap();
+            let peer = tokio::spawn(async move {
+                ps5_reconciliation_request(&listener, 0x53, &[], Some((3, br#"{"capabilities":["install-reconcile-v1"]}"#))).await;
+                ps5_reconciliation_request(&listener, 0x59, &body, Some((2, b"unknown or busy attempt"))).await;
+                ps5_reconciliation_request(&listener, 0x56, &[], Some(if ready { (1, b"OK") } else { (2, b"receiver still holds an ambiguous attempt") })).await;
+            });
+            let result = reconcile_ps5_install(&endpoint, &install, Duration::from_secs(2)).await;
+            let warning = apply_ps5_reconciliation(&mut install, result);
+            assert_eq!(warning.is_none(), ready); assert!(install.complete); assert_eq!(install.reconcile_pending, !ready);
+            peer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ps5_reconciliation_missing_attempt_checks_only_capable_guarded_preflight() {
+        for (capable, ready) in [(true, true), (true, false), (false, true)] {
+            let (listener, endpoint, mut install) = ps5_reconciliation_fixture().await;
+            install.attempt_id = None;
+            let peer = tokio::spawn(async move {
+                let capabilities: &[u8] = if capable { br#"{"capabilities":["install-reconcile-v1"]}"# }
+                    else { br#"{"capabilities":["installed-library-v1"]}"# };
+                ps5_reconciliation_request(&listener, 0x53, &[], Some((3, capabilities))).await;
+                if capable {
+                    ps5_reconciliation_request(&listener, 0x56, &[], Some(if ready { (1, b"OK") }
+                        else { (2, b"receiver still holds an ambiguous attempt") })).await;
+                }
+                // There is never enough identity for 0x59, and older preflight is not an ownership proof.
+                assert!(tokio::time::timeout(Duration::from_millis(30), listener.accept()).await.is_err());
+            });
+            let result = reconcile_ps5_install(&endpoint, &install, Duration::from_secs(2)).await;
+            let warning = apply_ps5_reconciliation(&mut install, result);
+            assert_eq!(warning.is_none(), capable && ready); assert!(install.complete);
+            assert_eq!(install.reconcile_pending, !(capable && ready));
+            peer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ps5_reconciliation_timeout_preserves_known_installation() {
+        let (listener, endpoint, mut install) = ps5_reconciliation_fixture().await;
+        let peer = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap(); std::future::pending::<()>().await;
+        });
+        let result = reconcile_ps5_install(&endpoint, &install, Duration::from_millis(60)).await;
+        let warning = apply_ps5_reconciliation(&mut install, result).unwrap();
+        assert!(warning.contains("timed out")); assert!(install.complete && install.reconcile_pending);
+        peer.abort();
+    }
+
+    #[test]
+    fn ps5_status_failure_must_match_the_saved_attempt() {
+        let install = ps5_install_fixture(); let now = Instant::now();
+        let failure = json!({"content_id":install.content_id, "path":install.remote_path, "attempt_id":install.attempt_id,
+            "state":"failed", "status":"error", "status_api_code":0, "error_code":-7});
+        let mut activity = InstallActivity::new(now);
+        assert!(matches!(ps5_install_outcome(&install, Some(&failure), &mut activity, now), InstallOutcome::Failed(_)));
+        for field in ["path", "attempt_id", "content_id"] {
+            let mut stale = failure.clone(); stale[field] = json!("another attempt");
+            assert_eq!(ps5_install_outcome(&install, Some(&stale), &mut activity, now), InstallOutcome::Waiting);
+            assert_eq!(ps5_install_outcome(&install, Some(&stale), &mut activity, now + INSTALL_CONFIRM_GRACE), InstallOutcome::Unconfirmed);
+        }
+        let legacy = json!({"content_id":install.content_id, "state":"failed", "error_code":-7});
+        assert_eq!(ps5_install_outcome(&install, Some(&legacy), &mut activity, now), InstallOutcome::Waiting);
+        let complete = json!({"content_id":install.content_id, "state":"complete", "status":"installed", "status_api_code":0});
+        assert_eq!(ps5_install_outcome(&install, Some(&complete), &mut activity, now), InstallOutcome::Waiting);
+        let mut correlated = complete; correlated["path"] = json!(install.remote_path); correlated["attempt_id"] = json!(install.attempt_id);
+        assert_eq!(ps5_install_outcome(&install, Some(&correlated), &mut activity, now), InstallOutcome::Complete);
+    }
+
+    #[test]
+    fn ps5_monitoring_requires_progress_not_repeated_replies() {
+        let install = ps5_install_fixture(); let now = Instant::now(); let mut activity = InstallActivity::new(now);
+        let mut status = json!({"content_id":install.content_id, "state":"installing", "status":"transferring", "status_api_code":0, "progress":20});
+        assert!(matches!(ps5_install_outcome(&install, Some(&status), &mut activity, now), InstallOutcome::Installing { .. }));
+        assert!(matches!(ps5_install_outcome(&install, Some(&status), &mut activity, now + Duration::from_secs(599)), InstallOutcome::Installing { .. }));
+        assert_eq!(ps5_install_outcome(&install, Some(&status), &mut activity, now + INSTALL_CONFIRM_GRACE), InstallOutcome::Unconfirmed);
+        status["progress"] = json!(21);
+        assert!(matches!(ps5_install_outcome(&install, Some(&status), &mut activity, now + INSTALL_CONFIRM_GRACE), InstallOutcome::Installing { .. }));
+        status["status"] = json!("installing");
+        ps5_install_outcome(&install, Some(&status), &mut activity, now + Duration::from_secs(700));
+        status["status"] = json!("transferring"); status["progress"] = json!(20);
+        assert_eq!(ps5_install_outcome(&install, Some(&status), &mut activity, now + Duration::from_secs(1300)), InstallOutcome::Unconfirmed);
+        assert_eq!(job_error_stage(&format!("{PS5_MONITORING_ENDED} receiver unavailable")), "monitoring-ended");
+        assert_eq!(job_error_stage("Install submission failed"), "failed");
+    }
+
+    #[test]
+    fn ps5_status_diagnostics_keep_native_module_errors() {
+        let detail = install_status_detail(&json!({"state":"unconfirmed", "stage":"appinst_load", "error":"libSceAppInstUtil load failed", "status_api_code":-1}));
+        assert!(detail.contains("appinst_load")); assert!(detail.contains("libSceAppInstUtil load failed"));
+        assert!(detail.contains("0xFFFFFFFF (-1)"));
+        let preflight = ps5_preflight_error("Receiver command 0x56 timed out".into());
+        assert!(preflight.contains("before upload; no package bytes were sent"));
+        assert!(preflight.contains("0x56 timed out"));
     }
 
     #[test]

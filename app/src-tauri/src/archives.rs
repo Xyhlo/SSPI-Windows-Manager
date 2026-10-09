@@ -155,6 +155,56 @@ pub(super) fn staging_dir_for_set(download_dir: &Path, archive_set: Option<&str>
     }
 }
 
+/// The file system of the volume holding `path` ("NTFS", "exFAT", "FAT32"), when Windows reports it.
+pub(super) fn file_system(path: &Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetVolumePathNameW(file: *const u16, volume: *mut u16, length: u32) -> i32;
+            fn GetVolumeInformationW(root: *const u16, name: *mut u16, name_size: u32, serial: *mut u32,
+                component: *mut u32, flags: *mut u32, system: *mut u16, system_size: u32) -> i32;
+        }
+        let mut existing = path;
+        while !existing.exists() { existing = existing.parent()?; }
+        let wide: Vec<u16> = existing.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut root = vec![0u16; wide.len().max(4) + 1];
+        if unsafe { GetVolumePathNameW(wide.as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 { return None; }
+        let mut system = [0u16; 32];
+        use std::ptr::null_mut;
+        if unsafe { GetVolumeInformationW(root.as_ptr(), null_mut(), 0, null_mut(), null_mut(), null_mut(), system.as_mut_ptr(), system.len() as u32) } == 0 { return None; }
+        let end = system.iter().position(|c| *c == 0).unwrap_or(system.len());
+        Some(String::from_utf16_lossy(&system[..end]))
+    }
+    #[cfg(not(windows))]
+    { let _ = path; None }
+}
+
+/// FAT volumes (often USB drives prepared for a console) cannot store a file over 4 GiB - 1 byte.
+pub(super) fn fat_file_limit(dest: &Path, size: u64, what: &str) -> Result<(), String> {
+    if size <= u32::MAX as u64 { return Ok(()); }
+    match file_system(dest) {
+        Some(system) if system.to_ascii_uppercase().starts_with("FAT") => Err(format!(
+            "{what} needs a {:.2} GiB file, but {} is on a {system} drive, which cannot store files of 4 GiB or more. Choose a folder on an NTFS or exFAT drive in Settings, then Retry; retained files are kept.",
+            size as f64 / 1_073_741_824., dest.display())),
+        _ => Ok(()),
+    }
+}
+
+/// Antivirus, indexing and sync clients briefly open new files. Access, sharing and lock
+/// violations are retried with backoff (about 0.3 s in all) before they are reported.
+pub(super) fn retry_file_op<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut delay = Duration::from_millis(20);
+    for _ in 0..4 {
+        match op() {
+            Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 33)) => { std::thread::sleep(delay); delay *= 2; }
+            result => return result,
+        }
+    }
+    op()
+}
+
 /// Creates (or verifies) a destination without ever falling back elsewhere.
 /// Errors name the role + path and point at Settings so an unavailable drive
 /// is reported instead of silently landing on the system volume.
@@ -355,6 +405,7 @@ fn extract_zip_tree_controlled(source: &Path, dest: &Path, report: &dyn Fn(Extra
         speed_bps: 0.,
     });
     let mut total = 0u64;
+    let mut largest = 0u64;
     let mut files_total = 0u64;
     let mut names = std::collections::HashSet::new();
     for i in 0..zip.len() {
@@ -387,8 +438,10 @@ fn extract_zip_tree_controlled(source: &Path, dest: &Path, report: &dyn Fn(Extra
         total = total
             .checked_add(entry.size())
             .ok_or_else(|| phase_error(ExtractionPhase::Inspection, source, "ZIP expanded size overflow"))?;
+        largest = largest.max(entry.size());
         files_total += 1;
     }
+    fat_file_limit(dest, largest, "This archive").map_err(|error| phase_error(ExtractionPhase::Inspection, source, error))?;
     if files_total == 0 {
         return Err(phase_error(
             ExtractionPhase::Inspection,
@@ -539,8 +592,11 @@ pub(super) fn extract_content_controlled(
             ArtifactKind::Rar => {
                 let first = rar_first_volume(source);
                 let listed = if first.is_file() { first.as_path() } else { source };
-                let size = archive_passwords(password).into_iter().find_map(|p| rar_list_size(listed, p).ok());
-                if let (Some(size), Some(free)) = (size, free_space(cache)) {
+                let sizes = archive_passwords(password).into_iter().find_map(|p| rar_list_sizes(listed, p).ok());
+                if let Some((_, largest)) = sizes {
+                    fat_file_limit(cache, largest, "This archive").map_err(|error| phase_error(ExtractionPhase::Inspection, source, error))?;
+                }
+                if let (Some((size, _)), Some(free)) = (sizes, free_space(cache)) {
                     if free < size.saturating_add(128 * 1024 * 1024) {
                         return Err(phase_error(
                             ExtractionPhase::Inspection,
@@ -644,7 +700,7 @@ pub(super) fn remove_consumed_inputs(
         if !path.is_file() {
             continue;
         }
-        if let Err(error) = std::fs::remove_file(path) {
+        if let Err(error) = retry_file_op(|| std::fs::remove_file(path)) {
             failures.push(format!("{} ({})", path.display(), redact(error)));
         }
     }
@@ -680,6 +736,32 @@ pub(super) fn remove_consumed_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_briefly_held_archive_is_still_released() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = crate::test_output_root().join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        let part = root.join("held.rar"); std::fs::write(&part, b"held").unwrap();
+        // No sharing at all, like a scanner that has just opened the new file.
+        let holder = std::fs::OpenOptions::new().read(true).share_mode(0).open(&part).unwrap();
+        let release = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(60)); drop(holder); });
+        remove_consumed_inputs(&[part.clone()], &[]).unwrap();
+        release.join().unwrap();
+        assert!(!part.exists());
+        let busy = root.join("busy.rar"); std::fs::write(&busy, b"busy").unwrap();
+        let _held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&busy).unwrap();
+        assert!(remove_consumed_inputs(&[busy.clone()], &[]).unwrap_err().starts_with("cleanup:"));
+        assert!(busy.exists());
+    }
+    #[test]
+    fn volume_file_system_is_read_and_large_files_pass_outside_fat() {
+        let root = crate::test_output_root();
+        let system = file_system(&root.join("not-created-yet").join("child")).expect("file system of the test volume");
+        assert!(!system.is_empty());
+        assert!(fat_file_limit(&root, u32::MAX as u64, "This archive").is_ok());
+        let large = fat_file_limit(&root, 5 << 30, "This archive");
+        assert_eq!(large.is_err(), system.to_ascii_uppercase().starts_with("FAT"), "{system}: {large:?}");
+    }
     #[test]
     fn consumed_archive_prunes_empty_owned_folder_but_keeps_other_parts() {
         let root = crate::test_output_root().join(Uuid::new_v4().to_string());

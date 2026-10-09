@@ -225,7 +225,8 @@ fn read_fih(file: &mut File, fih: &[u8], file_size: u64) -> Result<PkgMeta, Stri
     file.seek(SeekFrom::Start(base)).and_then(|_| file.read_exact(&mut header)).map_err(|_| "PS5 package CNT is truncated".to_string())?;
     if &header[..4] != b"\x7fCNT" { return Err("PS5 package has no CNT header".into()); }
     let content_id = std::str::from_utf8(&header[0x40..0x40 + 36]).map_err(|_| "PKG content ID is invalid".to_string())?.to_string();
-    let title_id = content_id.get(7..16).filter(|id| content_id.len() == 36 && (id[..4].eq_ignore_ascii_case("PPSA") || id[..4].eq_ignore_ascii_case("CUSA")) && id[4..].bytes().all(|b| b.is_ascii_digit()))
+    // A corrupt header can hold multibyte text; slicing it by bytes would panic.
+    let title_id = content_id.get(7..16).filter(|id| content_id.len() == 36 && id.is_ascii() && (id[..4].eq_ignore_ascii_case("PPSA") || id[..4].eq_ignore_ascii_case("CUSA")) && id[4..].bytes().all(|b| b.is_ascii_digit()))
         .map(str::to_ascii_uppercase).ok_or_else(|| "PKG content ID is invalid".to_string())?;
     let entry_count = be_u32(&header, 0x10) as usize;
     let table_offset = base + be_u32(&header, 0x18) as u64;
@@ -624,6 +625,26 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+#[cfg(test)]
+mod fih_header_tests {
+    #[test]
+    fn multibyte_text_in_a_content_id_is_rejected_without_a_panic() {
+        let mut bytes = vec![0u8; 2 * super::HEADER_SIZE];
+        bytes[..4].copy_from_slice(b"\x7fFIH");
+        bytes[0x58..0x60].copy_from_slice(&(super::HEADER_SIZE as u64).to_le_bytes());
+        let cnt = super::HEADER_SIZE;
+        bytes[cnt..cnt + 4].copy_from_slice(b"\x7fCNT");
+        // "PPSé" places the second byte of é where the title-ID digits start.
+        let id = "UP0000-PPS\u{e9}12345_00-ABCDEFGHIJKLMNO";
+        assert_eq!(id.len(), 36);
+        bytes[cnt + 0x40..cnt + 0x40 + 36].copy_from_slice(id.as_bytes());
+        let path = crate::test_output_root().join(format!("sspi-fih-multibyte-{}.pkg", uuid::Uuid::new_v4()));
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(super::read(&path).unwrap_err(), "PKG content ID is invalid");
+        std::fs::remove_file(path).unwrap();
     }
 }
 

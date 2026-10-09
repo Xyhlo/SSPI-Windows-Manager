@@ -8,7 +8,7 @@ use std::{
 };
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Semaphore,
     time::{timeout, Duration},
@@ -17,8 +17,17 @@ use tokio::{
 const MAX_CONNECTIONS: usize = 32;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const STREAM_BUFFER_BYTES: usize = 1024 * 1024;
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// BGFT can stop reading a body while it prepares or verifies on its own disk. SSPI PS4's
+// console-tested server allows 90 s without progress; every accepted byte restarts it.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(90);
+// Over capacity, a connection waits this long for a slot before it is answered 503.
+const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
+const CLOSE_DRAIN: Duration = Duration::from_secs(2);
+const LIMITS: Limits = Limits { connections: MAX_CONNECTIONS, queue: QUEUE_TIMEOUT };
+
+#[derive(Clone, Copy)]
+struct Limits { connections: usize, queue: Duration }
 
 #[derive(Debug, Clone)]
 pub(super) struct Served {
@@ -63,13 +72,21 @@ impl FileIdentity {
         Ok(Self { length: metadata.len(), modified: metadata.modified()? })
     }
 }
+#[derive(Debug, PartialEq, Eq)]
+enum Source { Same, Changed, Unavailable }
 impl Registered {
-    fn matches(&self, metadata: Option<&std::fs::Metadata>) -> bool {
-        let same = metadata.and_then(|m| FileIdentity::read(m).ok()) == Some(self.identity);
+    // A changed or deleted source is refused for good. One that can't be opened right now
+    // (a sharing violation, a network share hiccup) is retried by the client instead.
+    fn check(&self, metadata: std::io::Result<std::fs::Metadata>) -> Source {
+        let same = match metadata {
+            Ok(metadata) => FileIdentity::read(&metadata).ok() == Some(self.identity),
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound && !self.changed.load(Ordering::Relaxed) => return Source::Unavailable,
+            Err(_) => false,
+        };
         if !same && !self.changed.swap(true, Ordering::Relaxed) {
             eprintln!("PS4 PKG source changed or disappeared; refusing to serve stale package data.");
         }
-        same && !self.changed.load(Ordering::Relaxed)
+        if same && !self.changed.load(Ordering::Relaxed) { Source::Same } else { Source::Changed }
     }
 }
 
@@ -96,9 +113,7 @@ enum ParsedRange {
 struct Request {
     method: String,
     target: String,
-    version: String,
     range: Option<String>,
-    connection: Option<String>,
 }
 
 static STATE: OnceLock<Mutex<ServerState>> = OnceLock::new();
@@ -128,7 +143,7 @@ pub(super) async fn ensure_started(port: u16) -> Result<(), String> {
             if !state.tokens.is_empty() {
                 return Err(format!("PKG server is already bound to port {bound_port} while packages are registered"));
             }
-            return Err(format!("PKG server is already bound to port {bound_port}"));
+            return Err(format!("The PC download port is still {bound_port}. Restart SSPI to use port {port}."));
         }
     }
 
@@ -138,7 +153,10 @@ pub(super) async fn ensure_started(port: u16) -> Result<(), String> {
         let mut state = lock_state();
         state.port = Some(port);
     }
-    tokio::spawn(accept_loop(listener));
+    tokio::spawn(async move {
+        let _lifetime = ServerLifetime;
+        accept_loop(listener, LIMITS).await
+    });
     Ok(())
 }
 
@@ -214,9 +232,10 @@ struct ServerLifetime;
 impl Drop for ServerLifetime {
     fn drop(&mut self) { lock_state().port = None; }
 }
-async fn accept_loop(listener: TcpListener) {
-    let _lifetime = ServerLifetime;
-    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+async fn accept_loop(listener: TcpListener, limits: Limits) {
+    let permits = Arc::new(Semaphore::new(limits.connections));
+    // Connections waiting for a slot, or for their 503, are bounded separately.
+    let queued = Arc::new(Semaphore::new(limits.connections));
     loop {
         let (mut stream, _) = match listener.accept().await {
             Ok(connection) => connection,
@@ -226,40 +245,63 @@ async fn accept_loop(listener: TcpListener) {
                 continue;
             }
         };
-        match permits.clone().try_acquire_owned() {
-            Ok(permit) => {
-                tokio::spawn(async move {
+        if let Ok(permit) = permits.clone().try_acquire_owned() {
+            tokio::spawn(async move {
+                let _permit = permit;
+                serve_connection(&mut stream).await;
+            });
+            continue;
+        }
+        let Ok(waiting) = queued.clone().try_acquire_owned() else { continue; };
+        let permits = permits.clone();
+        tokio::spawn(async move {
+            match timeout(limits.queue, permits.acquire_owned()).await {
+                Ok(Ok(permit)) => {
+                    drop(waiting);
                     let _permit = permit;
                     serve_connection(&mut stream).await;
-                });
+                }
+                _ => {
+                    // Read the request first so the reply isn't lost to a reset.
+                    let _ = read_request_with_timeout(&mut stream, &mut Vec::new(), CLOSE_DRAIN).await;
+                    let _ = send_bytes(&mut stream, 503, "Retry-After: 1\r\n", &[], 0, false).await;
+                    finish(&mut stream).await;
+                }
             }
-            Err(_) => {
-                let _ = send_bytes(&mut stream, 503, "", &[], 0, false, true).await;
-            }
-        }
+        });
     }
 }
 
+// One response per connection, as SSPI PS4's console-tested BGFT server does: a pooled
+// connection can't go stale while BGFT pauses, and idle connections never hold a slot.
 async fn serve_connection(stream: &mut TcpStream) {
     let mut pending = Vec::with_capacity(1024);
-    loop {
-        let request = match read_request(stream, &mut pending).await {
-            Ok(Some(request)) => request,
-            Ok(None) => return,
-            Err(()) => {
-                let _ = send_bytes(stream, 400, "", &[], 0, false, true).await;
-                return;
-            }
-        };
-        let close = request_close(&request);
-        if handle_request(stream, request, close).await {
-            return;
-        }
+    match read_request(stream, &mut pending).await {
+        Ok(Some(request)) => handle_request(stream, request).await,
+        Ok(None) => {}
+        Err(()) => { let _ = send_bytes(stream, 400, "", &[], 0, false).await; }
     }
+    finish(stream).await;
+}
+
+// FIN first, then a bounded drain, so unread request bytes can't turn the close into a
+// reset that discards the end of the response.
+async fn finish(stream: &mut TcpStream) {
+    let _ = stream.shutdown().await;
+    let _ = timeout(CLOSE_DRAIN, async {
+        let mut sink = [0u8; 4096];
+        let mut drained = 0;
+        while drained < 64 * 1024 {
+            match stream.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => drained += read,
+            }
+        }
+    }).await;
 }
 
 async fn read_request(stream: &mut TcpStream, pending: &mut Vec<u8>) -> Result<Option<Request>, ()> {
-    read_request_with_timeout(stream, pending, IDLE_TIMEOUT).await
+    read_request_with_timeout(stream, pending, REQUEST_TIMEOUT).await
 }
 
 async fn read_request_with_timeout(stream: &mut TcpStream, pending: &mut Vec<u8>, duration: Duration) -> Result<Option<Request>, ()> {
@@ -292,7 +334,8 @@ fn header_end(bytes: &[u8]) -> Option<usize> {
 }
 
 fn parse_request(header: &[u8]) -> Result<Request, ()> {
-    let text = std::str::from_utf8(header).map_err(|_| ())?;
+    // Only the request line and Range are used; other header values may carry any octets.
+    let text = String::from_utf8_lossy(header);
     let mut lines = text.split("\r\n");
     let mut first = lines.next().ok_or(())?.split_whitespace();
     let method = first.next().ok_or(())?;
@@ -303,101 +346,74 @@ fn parse_request(header: &[u8]) -> Result<Request, ()> {
     }
 
     let mut range: Option<String> = None;
-    let mut connection: Option<String> = None;
-    let mut _host = None;
     for line in lines {
         if line.is_empty() {
             continue;
         }
         let (name, value) = line.split_once(':').ok_or(())?;
-        if name.is_empty() || name.bytes().any(|byte| !byte.is_ascii_alphanumeric() && byte != b'-') {
+        // RFC 7230 token characters, so names such as X_Name are accepted.
+        if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)) {
             return Err(());
         }
-        let value = value.trim();
         if name.eq_ignore_ascii_case("Range") {
+            let value = value.trim();
             range = Some(match range {
                 Some(previous) => format!("{previous},{value}"),
                 None => value.to_string(),
             });
-        } else if name.eq_ignore_ascii_case("Connection") {
-            connection = Some(match connection {
-                Some(previous) => format!("{previous},{value}"),
-                None => value.to_string(),
-            });
-        } else if name.eq_ignore_ascii_case("Host") {
-            _host = Some(value.to_string());
         }
     }
-    Ok(Request { method: method.to_string(), target: target.to_string(), version: version.to_string(), range, connection })
+    Ok(Request { method: method.to_string(), target: target.to_string(), range })
 }
 
-fn request_close(request: &Request) -> bool {
-    let connection = request.connection.as_deref().unwrap_or("");
-    let has = |wanted: &str| connection.split(',').any(|part| part.trim().eq_ignore_ascii_case(wanted));
-    if has("close") {
-        true
-    } else if request.version == "HTTP/1.0" {
-        !has("keep-alive")
-    } else {
-        false
+async fn source_ready(stream: &mut TcpStream, entry: &Registered, metadata: std::io::Result<std::fs::Metadata>, head: bool) -> bool {
+    match entry.check(metadata) {
+        Source::Same => true,
+        Source::Changed => { let _ = send_bytes(stream, 409, "Cache-Control: no-store\r\n", &[], 0, head).await; false }
+        Source::Unavailable => { let _ = send_bytes(stream, 503, "Retry-After: 5\r\nCache-Control: no-store\r\n", &[], 0, head).await; false }
     }
 }
 
-async fn handle_request(stream: &mut TcpStream, request: Request, close: bool) -> bool {
+async fn handle_request(stream: &mut TcpStream, request: Request) {
     let route = parse_route(&request.target);
     let registered = route.and_then(|(_, token)| lock_state().tokens.get(token).cloned());
-    if request.method != "GET" && request.method != "HEAD" {
+    let head = request.method == "HEAD";
+    if request.method != "GET" && !head {
         if let Some(entry) = registered.as_ref() {
             touch_request(entry);
         }
-        let _ = send_bytes(stream, 405, "Allow: GET, HEAD\r\n", &[], 0, false, true).await;
-        return true;
+        let _ = send_bytes(stream, 405, "Allow: GET, HEAD\r\n", &[], 0, false).await;
+        return;
     }
 
-    let Some((kind, _)) = route else {
-        let _ = send_bytes(stream, 404, "", &[], 0, request.method == "HEAD", close).await;
-        return close;
-    };
-    let Some(entry) = registered else {
-        let _ = send_bytes(stream, 404, "", &[], 0, request.method == "HEAD", close).await;
-        return close;
+    let (Some((kind, _)), Some(entry)) = (route, registered) else {
+        let _ = send_bytes(stream, 404, "", &[], 0, head).await;
+        return;
     };
     touch_request(&entry);
 
     if matches!(kind, RouteKind::Manifest | RouteKind::Package)
-        && !entry.matches(tokio::fs::metadata(&entry.path).await.ok().as_ref()) {
-        let _ = send_bytes(stream, 409, "Cache-Control: no-store\r\n", &[], 0, request.method == "HEAD", true).await;
-        return true;
+        && !source_ready(stream, &entry, tokio::fs::metadata(&entry.path).await, head).await {
+        return;
     }
 
     match kind {
         RouteKind::Manifest => {
-            let body = pkg_meta::manifest_json(&entry.meta, &entry.package_url);
-            let body = body.into_bytes();
+            let body = pkg_meta::manifest_json(&entry.meta, &entry.package_url).into_bytes();
             let extra = "Content-Type: application/json\r\nCache-Control: no-store\r\n";
-            if send_bytes(stream, 200, extra, &body, body.len() as u64, request.method == "HEAD", close).await.is_err() {
-                return true;
-            }
-            if request.method != "HEAD" {
+            if send_bytes(stream, 200, extra, &body, body.len() as u64, head).await.is_ok() && !head {
                 add_sent(&entry, body.len() as u64);
             }
-            close
         }
-        RouteKind::Package => {
-            serve_package(stream, &entry, request.range.as_deref(), request.method == "HEAD", close).await
-        }
+        RouteKind::Package => serve_package(stream, &entry, request.range.as_deref(), head).await,
         RouteKind::Icon => {
             let Some(icon) = entry.icon.as_ref() else {
-                let _ = send_bytes(stream, 404, "", &[], 0, request.method == "HEAD", close).await;
-                return close;
+                let _ = send_bytes(stream, 404, "", &[], 0, head).await;
+                return;
             };
-            if send_bytes(stream, 200, "Content-Type: image/png\r\n", icon, icon.len() as u64, request.method == "HEAD", close).await.is_err() {
-                return true;
-            }
-            if request.method != "HEAD" {
+            if send_bytes(stream, 200, "Content-Type: image/png\r\n", icon, icon.len() as u64, head).await.is_ok() && !head {
                 add_sent(&entry, icon.len() as u64);
             }
-            close
         }
     }
 }
@@ -435,62 +451,56 @@ fn add_sent(entry: &Registered, bytes: u64) {
     activity.bytes_sent = activity.bytes_sent.saturating_add(bytes);
 }
 
-async fn serve_package(stream: &mut TcpStream, entry: &Registered, range: Option<&str>, head: bool, close: bool) -> bool {
+async fn serve_package(stream: &mut TcpStream, entry: &Registered, range: Option<&str>, head: bool) {
     let file_size = entry.meta.file_size;
     let (status, start, body_size, content_range) = match parse_range(range, file_size) {
         ParsedRange::Full => (200, 0, file_size, None),
         ParsedRange::Partial { start, end } => (206, start, end - start + 1, Some(format!("Content-Range: bytes {start}-{end}/{file_size}\r\n"))),
         ParsedRange::Unsatisfiable => {
             let extra = format!("Content-Range: bytes */{file_size}\r\nAccept-Ranges: bytes\r\n");
-            let _ = send_bytes(stream, 416, &extra, &[], 0, head, close).await;
-            return close;
+            let _ = send_bytes(stream, 416, &extra, &[], 0, head).await;
+            return;
         }
     };
+    let mut extra = String::from("Accept-Ranges: bytes\r\nContent-Type: application/octet-stream\r\nCache-Control: no-transform\r\n");
+    if let Some(content_range) = content_range { extra.push_str(&content_range); }
     if head {
-        let mut extra = String::from("Accept-Ranges: bytes\r\nContent-Type: application/octet-stream\r\nCache-Control: no-transform\r\n");
-        if let Some(content_range) = content_range { extra.push_str(&content_range); }
-        let _ = send_headers(stream, status, &extra, body_size, close).await;
-        return close;
+        let _ = send_headers(stream, status, &extra, body_size).await;
+        return;
     }
 
     let mut file = match File::open(&entry.path).await {
         Ok(file) => file,
-        Err(_) => {
-            entry.matches(None);
-            let _ = send_bytes(stream, 409, "Cache-Control: no-store\r\n", &[], 0, false, true).await;
-            return true;
+        Err(error) => {
+            source_ready(stream, entry, Err(error), false).await;
+            return;
         }
     };
-    if !entry.matches(file.metadata().await.ok().as_ref()) {
-        let _ = send_bytes(stream, 409, "Cache-Control: no-store\r\n", &[], 0, false, true).await;
-        return true;
+    if !source_ready(stream, entry, file.metadata().await, false).await {
+        return;
     }
     if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
-        let _ = send_bytes(stream, 503, "Retry-After: 1\r\n", &[], 0, false, close).await;
-        return close;
+        let _ = send_bytes(stream, 503, "Retry-After: 1\r\n", &[], 0, false).await;
+        return;
     }
-
-    let mut extra = String::from("Accept-Ranges: bytes\r\nContent-Type: application/octet-stream\r\nCache-Control: no-transform\r\n");
-    if let Some(content_range) = content_range { extra.push_str(&content_range); }
-    if send_headers(stream, status, &extra, body_size, close).await.is_err() {
-        return true;
+    if send_headers(stream, status, &extra, body_size).await.is_err() {
+        return;
     }
 
     let mut remaining = body_size;
-    let mut buffer = vec![0u8; STREAM_BUFFER_BYTES];
+    let mut buffer = vec![0u8; body_size.min(STREAM_BUFFER_BYTES as u64) as usize];
     while remaining > 0 {
         let wanted = remaining.min(buffer.len() as u64) as usize;
         let read = match file.read(&mut buffer[..wanted]).await {
             Ok(read) if read > 0 => read,
-            _ => return true,
+            _ => return,
         };
         if write_response(stream, &buffer[..read], WRITE_TIMEOUT).await.is_err() {
-            return true;
+            return;
         }
         add_sent(entry, read as u64);
         remaining -= read as u64;
     }
-    close
 }
 
 fn parse_range(header: Option<&str>, length: u64) -> ParsedRange {
@@ -540,16 +550,15 @@ async fn send_bytes(
     body: &[u8],
     content_length: u64,
     head: bool,
-    close: bool,
 ) -> tokio::io::Result<()> {
-    send_headers(stream, status, extra, content_length, close).await?;
+    send_headers(stream, status, extra, content_length).await?;
     if !head && !body.is_empty() {
         write_response(stream, body, WRITE_TIMEOUT).await?;
     }
     Ok(())
 }
 
-async fn send_headers(stream: &mut TcpStream, status: u16, extra: &str, content_length: u64, close: bool) -> tokio::io::Result<()> {
+async fn send_headers(stream: &mut TcpStream, status: u16, extra: &str, content_length: u64) -> tokio::io::Result<()> {
     let reason = match status {
         200 => "OK",
         206 => "Partial Content",
@@ -561,17 +570,23 @@ async fn send_headers(stream: &mut TcpStream, status: u16, extra: &str, content_
         503 => "Service Unavailable",
         _ => "Error",
     };
-    let connection = if close { "close" } else { "keep-alive" };
     let headers = format!(
-        "HTTP/1.1 {status} {reason}\r\n{extra}Content-Length: {content_length}\r\nConnection: {connection}\r\n\r\n"
+        "HTTP/1.1 {status} {reason}\r\n{extra}Content-Length: {content_length}\r\nConnection: close\r\n\r\n"
     );
     write_response(stream, headers.as_bytes(), WRITE_TIMEOUT).await
 }
 
-async fn write_response(stream: &mut TcpStream, bytes: &[u8], idle: Duration) -> tokio::io::Result<()> {
-    for chunk in bytes.chunks(STREAM_BUFFER_BYTES) {
-        timeout(idle, stream.write_all(chunk)).await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "PKG response write stalled"))??;
+// `idle` bounds each wait for the peer to accept more bytes, not the whole body: a slow
+// but steady reader keeps its connection, one that accepts nothing for `idle` loses it.
+async fn write_response<W: AsyncWrite + Unpin>(stream: &mut W, bytes: &[u8], idle: Duration) -> tokio::io::Result<()> {
+    let mut written = 0;
+    while written < bytes.len() {
+        match timeout(idle, stream.write(&bytes[written..])).await {
+            Ok(Ok(0)) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(Ok(count)) => written += count,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "PKG response write stalled")),
+        }
     }
     Ok(())
 }
@@ -695,7 +710,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_round_trips_ranges_keepalive_icons_and_activity() {
+    async fn http_round_trips_ranges_icons_closes_and_activity() {
         let port = start_server().await;
         let (path, pkg) = test_package();
         let token = Uuid::new_v4().simple().to_string();
@@ -732,15 +747,15 @@ mod tests {
         let post = request(&format!("{prefix}.pkg"), "POST", None).await;
         assert_eq!(post.status, 405);
 
-        let mut keepalive = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        keepalive.write_all(format!("GET {prefix}.pkg.json HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n").as_bytes()).await.unwrap();
-        let manifest = read_response(&mut keepalive, false).await;
+        // A keep-alive request still gets one response and an orderly close, never a reset.
+        let mut reused = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        reused.write_all(format!("GET {prefix}.pkg.json HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\nX_Client-Tag: a.b\r\n\r\n").as_bytes()).await.unwrap();
+        let manifest = read_response(&mut reused, false).await;
         assert_eq!(manifest.status, 200);
+        assert!(manifest.headers.contains("Connection: close"));
         assert!(String::from_utf8_lossy(&manifest.body).contains(&served.package_url));
-        keepalive.write_all(format!("GET {prefix}.pkg HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
-        let second = read_response(&mut keepalive, false).await;
-        assert_eq!(second.status, 200);
-        assert_eq!(second.body, pkg);
+        let mut rest = Vec::new();
+        assert_eq!(timeout(Duration::from_secs(5), reused.read_to_end(&mut rest)).await.unwrap().unwrap(), 0);
 
         let icon_response = request(&format!("/icon/{token}.png"), "GET", None).await;
         assert_eq!(icon_response.status, 200);
@@ -748,8 +763,126 @@ mod tests {
         assert_eq!(icon_response.body, icon);
 
         let activity = activity(&token).unwrap();
-        assert!(activity.requests >= 9, "requests={}", activity.requests);
-        assert!(activity.bytes_sent >= (pkg.len() as u64) * 2 + icon.len() as u64);
+        assert!(activity.requests >= 8, "requests={}", activity.requests);
+        assert!(activity.bytes_sent >= pkg.len() as u64 + icon.len() as u64);
+        unregister(&token);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn pipelined_request_cannot_reset_away_the_first_response() {
+        let port = start_server().await;
+        let (path, pkg) = test_package();
+        let token = Uuid::new_v4().simple().to_string();
+        register(&token, &path, None, IpAddr::V4(Ipv4Addr::LOCALHOST), port).unwrap();
+        let get = format!("GET /pkg/{token}.pkg HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(format!("{get}{get}").as_bytes()).await.unwrap();
+        // Let the server close while the second request is still unread.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let response = read_response(&mut stream, false).await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, pkg);
+        let mut rest = Vec::new();
+        assert_eq!(timeout(Duration::from_secs(5), stream.read_to_end(&mut rest)).await.unwrap().unwrap(), 0);
+        unregister(&token);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn slow_steady_reader_keeps_its_response() {
+        // The reader takes 8 KiB about every 10-16 ms, so draining the MiB takes at least
+        // two budgets while no single wait comes close to one. A write may time out only
+        // if the reader really paused for a whole budget; when the machine itself stalls
+        // that long, the attempt proves nothing and is repeated.
+        let budget = Duration::from_millis(500);
+        let body: Vec<u8> = (0..1024 * 1024).map(|n| (n % 251) as u8).collect();
+        for _ in 0..3 {
+            // A bounded pipe accepts partial writes, as a full TCP send buffer does on most stacks.
+            let (mut writer, mut reader) = tokio::io::duplex(8 * 1024);
+            let read = tokio::spawn(async move {
+                let (mut received, mut chunk, mut longest, mut last) = (Vec::new(), vec![0u8; 8 * 1024], Duration::ZERO, Instant::now());
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let count = reader.read(&mut chunk).await.unwrap();
+                    longest = longest.max(last.elapsed());
+                    last = Instant::now();
+                    if count == 0 { return (received, longest); }
+                    received.extend_from_slice(&chunk[..count]);
+                }
+            });
+            let started = Instant::now();
+            let written = write_response(&mut writer, &body, budget).await;
+            let elapsed = started.elapsed();
+            drop(writer);
+            let (received, longest) = read.await.unwrap();
+            if longest + Duration::from_millis(50) >= budget { continue; }
+            written.unwrap();
+            assert_eq!(received, body);
+            assert!(elapsed > budget, "the reader did not apply backpressure");
+            return;
+        }
+        eprintln!("skipping: the machine stalled for a whole write budget in every attempt");
+    }
+
+    async fn private_server(limits: Limits) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(accept_loop(listener, limits));
+        port
+    }
+
+    #[tokio::test]
+    async fn full_server_queues_a_connection_then_answers_a_readable_503() {
+        let (path, pkg) = test_package();
+        let token = Uuid::new_v4().simple().to_string();
+        register(&token, &path, None, IpAddr::V4(Ipv4Addr::LOCALHOST), 9).unwrap();
+        let get = format!("GET /pkg/{token}.pkg HTTP/1.1\r\nHost: localhost\r\nRange: bytes=0-63\r\n\r\n");
+
+        // A free slot is handed to the waiting connection.
+        let port = private_server(Limits { connections: 1, queue: Duration::from_secs(5) }).await;
+        let holder = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut waiting = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        waiting.write_all(get.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(holder);
+        let served = timeout(Duration::from_secs(5), read_response(&mut waiting, false)).await.unwrap();
+        assert_eq!(served.status, 206);
+        assert_eq!(served.body, pkg[..64]);
+
+        // Without one, the client gets a readable 503 and an orderly close.
+        let port = private_server(Limits { connections: 1, queue: Duration::from_millis(200) }).await;
+        let _holder = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut refused = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        refused.write_all(get.as_bytes()).await.unwrap();
+        let busy = timeout(Duration::from_secs(5), read_response(&mut refused, false)).await.unwrap();
+        assert_eq!(busy.status, 503);
+        assert!(busy.headers.contains("Retry-After: 1") && busy.headers.contains("Connection: close"));
+        let mut rest = Vec::new();
+        assert_eq!(timeout(Duration::from_secs(5), refused.read_to_end(&mut rest)).await.unwrap().unwrap(), 0);
+        unregister(&token);
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn locked_source_is_retried_instead_of_refused_for_good() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let port = start_server().await;
+        let (path, pkg) = test_package();
+        let token = Uuid::new_v4().simple().to_string();
+        register(&token, &path, None, IpAddr::V4(Ipv4Addr::LOCALHOST), port).unwrap();
+        let lock = fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        let busy = request(&format!("/pkg/{token}.pkg"), "GET", Some("bytes=0-63")).await;
+        assert_eq!(busy.status, 503);
+        assert!(busy.headers.contains("Retry-After"));
+        drop(lock);
+        let served = request(&format!("/pkg/{token}.pkg"), "GET", Some("bytes=0-63")).await;
+        assert_eq!(served.status, 206);
+        assert_eq!(served.body, pkg[..64]);
+        assert!(!lock_state().tokens[&token].changed.load(Ordering::Relaxed));
         unregister(&token);
         let _ = fs::remove_file(path);
     }
