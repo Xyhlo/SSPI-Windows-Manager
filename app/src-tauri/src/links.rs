@@ -1,6 +1,6 @@
 //! Pasted download links and debrid account files, queued as ordinary downloads.
 //!
-//! Links come from pasted text (hoster pages, direct files, personal debrid links) or from the
+//! Links come from pasted text (hoster pages, direct files, personal debrid links, magnets) or from the
 //! debrid file browser (`cloud.rs`). Each becomes a [`DeliveryRequest`]; hoster and debrid links
 //! are unlocked by the existing provider pipeline when the download starts, so Retry can renew them.
 
@@ -39,7 +39,7 @@ pub(super) struct LinkItem {
 
 fn url_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
-    PATTERN.get_or_init(|| Regex::new(r#"(?i)https?://[^\s<>"']+"#).unwrap())
+    PATTERN.get_or_init(|| Regex::new(r#"(?i)(?:https?://|magnet:\?)[^\s<>"']+"#).unwrap())
 }
 
 fn clean(value: &str) -> String {
@@ -128,6 +128,15 @@ pub(super) fn extract(text: &str) -> Result<Vec<LinkItem>, String> {
     let mut items = Vec::new();
     for found in url_pattern().find_iter(text) {
         let value = clean(found.as_str());
+        if super::magnet::is_magnet(&value) {
+            // One torrent, however its trackers or name are written.
+            let Some(hash) = super::magnet::info_hash(&value) else { continue };
+            if !seen.insert(format!("btih:{hash}")) { continue; }
+            let name = super::magnet::display_name(&value).unwrap_or_else(|| format!("Torrent {}", &hash[..8]));
+            items.push(item_for(&value, &name, "", None));
+            if items.len() >= MAX_LINKS { break; }
+            continue;
+        }
         let Ok(url) = reqwest::Url::parse(&value) else { continue };
         if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() || url.host_str().is_none() { continue; }
         let path = url.path().to_ascii_lowercase();
@@ -154,12 +163,24 @@ pub(super) fn item_for(url: &str, name: &str, provider: &str, size: Option<u64>)
         else if host.ends_with("torbox.app") { "torbox".into() }
         else { String::new() };
     let direct = provider.is_empty() && ARCHIVES.iter().any(|ext| reqwest::Url::parse(url).is_ok_and(|u| u.path().to_ascii_lowercase().ends_with(ext)));
-    let (set, part) = volume(name).map(|(set, part)| (set, Some(part))).unwrap_or_default();
+    let (set, part) = if super::magnet::is_magnet(url) { Default::default() } else { volume(name).map(|(set, part)| (set, Some(part))).unwrap_or_default() };
     LinkItem { url: url.to_string(), name: name.to_string(), title_id, title, kind: guess_kind(name).into(), provider, size, direct, set, part }
 }
 
 fn package_for(item: &LinkItem, label: &str) -> Package {
     let lower = item.name.to_ascii_lowercase();
+    if super::magnet::is_magnet(&item.url) {
+        // The name is the torrent's, not a file in it: the torrent must hold one package file.
+        return Package {
+            kind: if matches!(item.kind.as_str(), "base" | "update" | "dlc" | "backport") { item.kind.clone() } else { "base".into() },
+            label: label.to_string(),
+            url: item.url.clone(),
+            access_type: "HosterLanding".into(),
+            hoster: "torrent".into(),
+            expected_size: item.size,
+            ..Default::default()
+        };
+    }
     Package {
         kind: if matches!(item.kind.as_str(), "base" | "update" | "dlc" | "backport") { item.kind.clone() } else { "base".into() },
         label: label.to_string(),
@@ -178,8 +199,13 @@ fn package_for(item: &LinkItem, label: &str) -> Package {
 pub(super) fn requests(items: &[LinkItem], as_set: bool, active: &str) -> Result<Vec<DeliveryRequest>, String> {
     if items.is_empty() { return Err("Choose at least one link".into()); }
     for item in items {
-        let url = reqwest::Url::parse(&item.url).map_err(|_| format!("Invalid link: {}", item.url))?;
-        if !matches!(url.scheme(), "http" | "https") { return Err(format!("Only http and https links can be downloaded: {}", item.url)); }
+        if super::magnet::is_magnet(&item.url) {
+            if !super::magnet::valid(&item.url) { return Err(format!("Magnet link needs one BitTorrent info hash: {}", item.url)); }
+            if as_set && items.len() > 1 { return Err("A magnet link cannot be part of an archive set".into()); }
+        } else {
+            let url = reqwest::Url::parse(&item.url).map_err(|_| format!("Invalid link: {}", item.url))?;
+            if !matches!(url.scheme(), "http" | "https") { return Err(format!("Only http, https and magnet links can be downloaded: {}", item.url)); }
+        }
         if !item.title_id.is_empty() && !super::title_id(&item.title_id) { return Err(format!("{} is not a supported PS4, PS5, or PS2 classic title ID", item.title_id)); }
     }
     let target = |id: &str| -> Option<String> {
@@ -236,7 +262,7 @@ mod tests {
         let text = r#"Mirror 1: https://hoster.example/?abc123&amp;af=1, also <a href="https://www.mediafire.com/file/x1/Game-CUSA01234.part1.rar/file">p1</a>
             https://www.mediafire.com/file/x2/Game-CUSA01234.part2.rar/file
             https://example.com/files/Some%20Game%20PPSA01234%20v1.02.pkg). And again https://hoster.example/?abc123&amp;af=1
-            magnet & torrent: https://site/x.torrent  ftp://nope/file.pkg  https://user:pw@host/file.pkg"#;
+            torrent: https://site/x.torrent  ftp://nope/file.pkg  https://user:pw@host/file.pkg magnet:?dn=no-hash"#;
         let links = extract(text).unwrap();
         let urls: Vec<_> = links.iter().map(|l| l.url.as_str()).collect();
         assert_eq!(urls, [
@@ -249,6 +275,22 @@ mod tests {
         assert_eq!((links[1].set.as_str(), links[1].part, links[2].part), ("game-cusa01234", Some(1), Some(2)));
         assert!(links[3].direct && links[3].title_id == "PPSA01234" && links[3].title == "Some Game");
         assert!(!links[0].direct && links[0].set.is_empty());
+    }
+
+    #[test]
+    fn magnets_are_queued_once_per_torrent() {
+        let hash = "dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c";
+        let text = format!("magnet:?xt=urn:btih:{hash}&amp;dn=Game+CUSA01234.part1.rar, again magnet:?dn=x&xt=urn:btih:{}&tr=udp%3A%2F%2Ft", hash.to_uppercase());
+        let links = extract(&text).unwrap();
+        assert_eq!(links.len(), 1);
+        let link = &links[0];
+        assert_eq!(link.url, format!("magnet:?xt=urn:btih:{hash}&dn=Game+CUSA01234.part1.rar"));
+        assert_eq!((link.name.as_str(), link.title_id.as_str()), ("Game CUSA01234.part1.rar", "CUSA01234"));
+        assert!(!link.direct && link.provider.is_empty() && link.set.is_empty() && link.part.is_none());
+        let request = &requests(&links, false, "ps5").unwrap()[0];
+        assert_eq!(request.package.archive_file_name, None);
+        assert_eq!(request.target.as_deref(), Some("ps4"));
+        assert!(requests(&[link.clone(), item_for("https://cdn.example/a.part2.rar", "a.part2.rar", "", None)], true, "ps5").is_err());
     }
 
     #[test]

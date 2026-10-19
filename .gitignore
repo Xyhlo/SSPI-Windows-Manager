@@ -69,6 +69,7 @@
 !/app/src-tauri/src/backport.rs
 !/app/src/lib/package-selection.ts
 !/app/src-tauri/src/debrid.rs
+!/app/src-tauri/src/magnet.rs
 !/app/src-tauri/src/package_details.rs
 !/app/src/lib/providers.ts
 !/app/src/components/ProviderContext.tsx

@@ -53,7 +53,7 @@ pub(super) fn validate_request(request: &DeliveryRequest) -> Result<(), String> 
     if request.title_id.as_deref().is_none_or(|id| !id.starts_with("PPSA") || !title_id(id)) {
         return Err("Combined packaging requires a PS5 title ID".into());
     }
-    if request.package.url == backport.package.url { return Err("Base and backport cannot be the same download".into()); }
+    if super::download_identity(&request.package) == super::download_identity(&backport.package) { return Err("Base and backport cannot be the same download".into()); }
     ensure_versions(&request.package.version, &backport.package.version)?;
     delivery_parts(&overlay_request(request))?;
     Ok(())

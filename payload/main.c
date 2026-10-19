@@ -863,8 +863,13 @@ static bool valid_image_name(const char *name) {
     size_t n = strlen(name);
     if (n < 7 || n > 200 || name[0] == '.' || strstr(name, "..")) return false;
     for (size_t i = 0; i < n; ++i) if (name[i] < 0x21 || name[i] > 0x7e || name[i] == '/' || name[i] == '\\') return false;
-    const char *ext = name + n - 6;
-    return (ext[0] == '.') && (ext[1] | 32) == 'e' && (ext[2] | 32) == 'x' && (ext[3] | 32) == 'f' && (ext[4] | 32) == 'a' && (ext[5] | 32) == 't';
+    /* The image types ShadowMount Plus mounts. */
+    static const char *const types[] = { ".exfat", ".ffpkg", ".ffpfs", ".ffpfsc" };
+    for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); ++t) {
+        size_t len = strlen(types[t]);
+        if (n > len && !strcasecmp(name + n - len, types[t])) return true;
+    }
+    return false;
 }
 static int handle_image(int fd, const uint8_t *body, uint32_t size) {
     if (!body || size < 2 || memchr(body, 0, size)) return text_reply(fd, RESP_ERROR, "invalid image request");

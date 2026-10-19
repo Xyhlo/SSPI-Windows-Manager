@@ -612,6 +612,7 @@ pub(super) fn extract_content_controlled(
         }
         if let Some(content) = extracted_from_dir(&dest) { return Ok(content); }
         let mut nested_packages = Vec::new();
+        let mut nested_images = Vec::new();
         for inner in nested_rar_volumes(&dest) {
             let mut header = [0u8; 8];
             let mut file = std::fs::File::open(&inner)
@@ -632,13 +633,15 @@ pub(super) fn extract_content_controlled(
                 })? {
                 ExtractedContent::Dump(root) => return Ok(ExtractedContent::Dump(root)),
                 ExtractedContent::Pkgs(mut pkgs) => nested_packages.append(&mut pkgs),
+                ExtractedContent::Images(mut images) => nested_images.append(&mut images),
             }
         }
         if !nested_packages.is_empty() { return Ok(ExtractedContent::Pkgs(nested_packages)); }
+        if !nested_images.is_empty() { return Ok(ExtractedContent::Images(nested_images)); }
         Err(phase_error(
             ExtractionPhase::Finalization,
             &dest,
-            format!("Archive has no valid PKG or PS5 dump (eboot.bin + sce_sys): {}", extract_listing(&dest)),
+            format!("Archive has no valid PKG, PS5 dump (eboot.bin + sce_sys) or ShadowMount image: {}", extract_listing(&dest)),
         ))
     })();
     // Failure removes only this attempt's partial outputs. The source archive
@@ -665,7 +668,7 @@ pub(super) fn extract_content_controlled(
 /// inputs. Extracted outputs are always kept for upload retries.
 pub(super) fn extracted_outputs(content: &ExtractedContent) -> Vec<PathBuf> {
     match content {
-        ExtractedContent::Pkgs(pkgs) => pkgs.clone(),
+        ExtractedContent::Pkgs(pkgs) | ExtractedContent::Images(pkgs) => pkgs.clone(),
         ExtractedContent::Dump(root) => vec![root.clone()],
     }
 }

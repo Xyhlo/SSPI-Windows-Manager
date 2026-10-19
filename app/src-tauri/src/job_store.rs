@@ -238,7 +238,7 @@ fn reusable_base(record: &Record) -> bool {
 }
 
 fn same_backport(a: &BackportInput, b: &BackportInput) -> bool {
-    a.package.url == b.package.url || (a.package.label.eq_ignore_ascii_case(&b.package.label)
+    super::download_identity(&a.package) == super::download_identity(&b.package) || (a.package.label.eq_ignore_ascii_case(&b.package.label)
         && a.package.version == b.package.version && a.package.firmware == b.package.firmware)
 }
 
@@ -417,7 +417,7 @@ pub(super) async fn resume_checkpoint(app: &AppHandle, settings: &Settings, job:
                     validate_delivery_target(request, package_only(app, job), true)?;
                     let root = find_dump_root(primary).ok_or("Retained folder is not a complete game dump")?;
                     saved = Checkpoint::Extracted { paths: vec![root], dump: true, inputs: vec![] };
-                } else if primary.extension().is_some_and(|x| x.eq_ignore_ascii_case("exfat")) {
+                } else if shadow_image_extension(primary).is_some() {
                     saved = Checkpoint::Package { path: primary.clone(), dump: None, cleanup: false, backports_embedded: true, cleanup_extra: vec![] };
                 } else if fpkg::package_magic(&read_magic_sync(primary).unwrap_or([0; 8])) {
                     saved = Checkpoint::Extracted { paths, dump: false, inputs: vec![] };
@@ -479,18 +479,33 @@ pub(super) async fn resume_checkpoint(app: &AppHandle, settings: &Settings, job:
                 checkpoint(app, job, saved.clone())?;
             },
             Checkpoint::Extracted { paths, dump, inputs } => {
+                let images = !dump && !paths.is_empty() && paths.iter().all(|p| shadow_image_extension(p).is_some());
+                if images && ps4 { return Err("ShadowMount images are for the PS5. Choose the PS5 as the target, then retry.".into()); }
                 if ps4 {
                     validate_delivery_target(request, false, dump)?;
                     return if receiver { ps4_receiver::deliver(app, settings, job, paths, cancel).await }
                         else { ps4_inbox::deliver(app, settings, job, sort_pkgs(paths), false, cancel).await };
                 }
-                if paths.iter().any(|p| !p.exists()) { return Err("Retained extracted files are missing. Restore them or start a new download.".into()); }
+                // Images are deleted locally one by one as they reach the console.
+                if paths.iter().any(|p| !p.exists()) && !(images && paths.iter().any(|p| p.exists())) { return Err("Retained extracted files are missing. Restore them or start a new download.".into()); }
                 if let Some(paired) = pairing_before_packaging(app, job)? {
                     return backport::run(app, settings, &app.state::<AppState>().http.clone(), &job.to_string(), &paired, cancel).await;
                 }
                 if !settings.keep_archives {
                     let (consumed, outputs) = (inputs.clone(), paths.clone());
                     tokio::task::spawn_blocking(move || archives::remove_consumed_inputs(&consumed, &outputs)).await.map_err(redact)??;
+                }
+                if images {
+                    if package_only(app, job) {
+                        let list = paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
+                        emit(app, Progress { job_id: job.into(), stage: "complete".into(), progress: 1.,
+                            message: format!("ShadowMount image ready: {list}"), ..Default::default() });
+                        return Ok(());
+                    }
+                    let mut delivered = Vec::new();
+                    for path in paths.iter().filter(|p| p.exists()) { delivered.push(deliver_image(app, settings, path, job, cancel).await?); }
+                    emit(app, Progress { job_id: job.into(), stage: "complete".into(), progress: 1., message: delivered.join(" "), ..Default::default() });
+                    return Ok(());
                 }
                 if dump {
                     let root = paths.first().ok_or("Retained dump path is missing")?;
@@ -504,8 +519,8 @@ pub(super) async fn resume_checkpoint(app: &AppHandle, settings: &Settings, job:
                 return upload_pkg_set(app, settings, &ReceiverEndpoint::ps5(settings), paths, job, request.title_id.as_deref(), cancel).await;
             },
             Checkpoint::Package { path, dump, cleanup, backports_embedded, cleanup_extra } => {
-                if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("exfat")) {
-                    if ps4 { return Err("ShadowMount exFAT images are for the PS5. Choose the PS5 as the target, then retry.".into()); }
+                if shadow_image_extension(&path).is_some() {
+                    if ps4 { return Err("ShadowMount images are for the PS5. Choose the PS5 as the target, then retry.".into()); }
                     if !path.is_file() {
                         if let Some(root) = dump.as_ref().filter(|root| root.is_dir()) {
                             return package_and_install_dump(app, settings, root, job, request.title_id.as_deref(),
@@ -774,8 +789,8 @@ pub(super) async fn remove_job(app: AppHandle, job_id: String, delete_files: boo
 }
 
 pub(super) fn overlapping_delivery(a: &DeliveryRequest, b: &DeliveryRequest) -> bool {
-    let a_urls = std::iter::once(&a.package).chain(a.archive_parts.iter()).map(|part| part.url.trim()).filter(|url| !url.is_empty());
-    if a_urls.into_iter().any(|url| std::iter::once(&b.package).chain(b.archive_parts.iter()).any(|part| part.url.trim() == url)) {
+    let a_urls = std::iter::once(&a.package).chain(a.archive_parts.iter()).map(super::download_identity).filter(|url| !url.is_empty());
+    if a_urls.into_iter().any(|url| std::iter::once(&b.package).chain(b.archive_parts.iter()).any(|part| super::download_identity(part) == url)) {
         return true;
     }
     a.package.kind == "base" && b.package.kind == "base"

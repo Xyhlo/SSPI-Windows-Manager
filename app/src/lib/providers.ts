@@ -19,10 +19,15 @@ export function hostState(url: string, inventory: ProviderHosts): "supported" | 
   return unavailable && unavailable >= supported ? "unavailable" : supported ? "supported" : "unknown"
 }
 
+export const isMagnet = (url: string) => /^magnet:\?/i.test(url.trim())
+
+// Every connected provider fetches torrents, so a magnet needs no host inventory.
 export function compatibleProviders(candidate: PackageCandidate, inventories: ProviderHosts[], selected = "") {
-  return inventories.filter(item => (!selected || item.provider === selected) && hostState(candidate.url, item) === "supported").map(item => item.provider)
+  return inventories.filter(item => (!selected || item.provider === selected) &&
+    (isMagnet(candidate.url) ? item.enabled && item.configured : hostState(candidate.url, item) === "supported")).map(item => item.provider)
 }
 export function directCandidate(candidate: PackageCandidate) {
+  if (isMagnet(candidate.url)) return false
   const access = candidate.accessType?.toLowerCase()
   if (access && access !== "unknown") return access === "direct"
   try { return new URL(candidate.url).pathname.toLowerCase().endsWith(".pkg") } catch { return false }

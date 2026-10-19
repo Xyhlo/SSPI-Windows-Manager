@@ -18,6 +18,7 @@ mod links;
 mod cloud;
 mod backport;
 mod debrid;
+mod magnet;
 mod package_details;
 mod static_catalog;
 mod discovery;
@@ -1424,6 +1425,15 @@ fn job_error_stage(error: &str) -> &'static str {
     }
 }
 
+/// What identifies one download: its URL, plus the file name for a magnet, whose torrent can
+/// hold many packages.
+fn download_identity(package: &Package) -> String {
+    match package.archive_file_name.as_deref().filter(|name| !name.is_empty()) {
+        Some(name) if magnet::is_magnet(&package.url) => format!("{}#{name}", package.url.trim()),
+        _ => package.url.trim().to_string(),
+    }
+}
+
 fn download_key(url: &str, title: Option<&str>, kind: &str) -> String {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in url
@@ -1730,7 +1740,7 @@ fn split_ranges(total: u64, lanes: u64) -> Vec<(u64, u64)> {
 fn extract_zip_pkgs(source: &Path, cache: &Path) -> Result<Vec<PathBuf>, String> {
     match extract_any_archive(source, cache, ArtifactKind::Zip, |_,_,_|{})? {
         ExtractedContent::Pkgs(pkgs) => Ok(pkgs),
-        ExtractedContent::Dump(_) => Err("Expected PKGs".into()),
+        ExtractedContent::Dump(_) | ExtractedContent::Images(_) => Err("Expected PKGs".into()),
     }
 }
 
@@ -1741,6 +1751,54 @@ enum ArtifactKind {
     Rar,
     SevenZ,
     Unknown,
+}
+
+/// Disk image types ShadowMount Plus mounts from /data/homebrew.
+const SHADOW_IMAGE_EXTENSIONS: [&str; 4] = ["exfat", "ffpkg", "ffpfs", "ffpfsc"];
+
+fn shadow_image_extension(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?;
+    SHADOW_IMAGE_EXTENSIONS.into_iter().find(|known| ext.eq_ignore_ascii_case(known))
+}
+
+/// Whether the file holds the file system its image extension names: an exFAT boot sector,
+/// a PFS header (magic 20130315) or a UFS2 superblock (magic 0x19540119 at 64 KiB + 1372).
+fn shadow_image_matches(path: &Path, ext: &str) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let (offset, expected): (u64, &[u8]) = match ext {
+        "exfat" => (3, b"EXFAT"),
+        "ffpfs" | "ffpfsc" => (8, &20130315u32.to_le_bytes()),
+        "ffpkg" => (65536 + 1372, &0x19540119u32.to_le_bytes()),
+        _ => return false,
+    };
+    let mut found = vec![0; expected.len()];
+    file.seek(SeekFrom::Start(offset)).is_ok() && file.read_exact(&mut found).is_ok() && found == expected
+}
+
+/// A name the receiver accepts: printable ASCII without slashes or spaces, no leading dot.
+fn console_image_name(name: &str) -> String {
+    let mut clean: String = name.chars().map(|c| if c.is_ascii_graphic() && c != '/' && c != '\\' { c } else { '_' }).collect();
+    while clean.contains("..") { clean = clean.replace("..", "."); }
+    if clean.starts_with('.') { clean.replace_range(..1, "_"); }
+    clean
+}
+
+/// The console file name for a downloaded image, in the `PPSA12345-v01.000.exfat` form SSPI
+/// uses for images it builds. None when the download is not the image its catalog name says.
+fn prebuilt_image_name(path: &Path, request: &DeliveryRequest) -> Option<String> {
+    let wanted = request.package.archive_file_name.as_deref().unwrap_or_default();
+    let ext = shadow_image_extension(Path::new(wanted)).or_else(|| shadow_image_matches(path, "exfat").then_some("exfat"))?;
+    if !shadow_image_matches(path, ext) { return None; }
+    let title = request.title_id.clone().filter(|id| title_id(id))
+        .or_else(|| wanted.split(|c: char| !c.is_ascii_alphanumeric()).find(|part| title_id(part)).map(str::to_string));
+    let version = request.package.version.trim();
+    let version = (!version.is_empty() && version.bytes().all(|b| b.is_ascii_digit() || b == b'.')).then_some(version);
+    Some(match (title, version) {
+        (Some(title), Some(version)) => format!("{title}-v{version}.{ext}"),
+        (Some(title), None) => format!("{title}.{ext}"),
+        (None, _) => format!("image-{}.{ext}", download_key(&download_identity(&request.package), None, &request.package.kind)),
+    })
 }
 
 fn artifact_kind(header: &[u8], name: &str, content_type: &str) -> ArtifactKind {
@@ -2279,6 +2337,8 @@ fn shadowmount_dir(title: Option<&str>, kind: &str) -> Result<String, String> {
 enum ExtractedContent {
     Pkgs(Vec<PathBuf>),
     Dump(PathBuf),
+    /// ShadowMount images, renamed to names the receiver accepts.
+    Images(Vec<PathBuf>),
 }
 
 fn extracted_from_dir(dest: &Path) -> Option<ExtractedContent> {
@@ -2286,11 +2346,31 @@ fn extracted_from_dir(dest: &Path) -> Option<ExtractedContent> {
         return Some(ExtractedContent::Dump(root));
     }
     let pkgs = collect_extracted_pkgs(dest).unwrap_or_default();
-    if pkgs.is_empty() {
-        None
-    } else {
-        Some(ExtractedContent::Pkgs(pkgs))
+    if !pkgs.is_empty() {
+        return Some(ExtractedContent::Pkgs(pkgs));
     }
+    let images = collect_extracted_images(dest);
+    (!images.is_empty()).then_some(ExtractedContent::Images(images))
+}
+
+/// ShadowMount images under `root` whose contents match their extension.
+fn collect_extracted_images(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if path.is_dir() { stack.push(path); continue; }
+            let Some(ext) = shadow_image_extension(&path) else { continue };
+            if !shadow_image_matches(&path, ext) { continue; }
+            let name = path.file_name().and_then(|n| n.to_str()).map(console_image_name)
+                .unwrap_or_else(|| format!("image.{ext}"));
+            let renamed = path.with_file_name(&name);
+            if renamed == path || (!renamed.exists() && std::fs::rename(&path, &renamed).is_ok()) { found.push(renamed); }
+        }
+    }
+    found.sort();
+    found
 }
 
 fn nested_rar_volumes(root: &Path) -> Vec<PathBuf> {
@@ -4498,14 +4578,17 @@ async fn cleanup_delivered_package(app: &AppHandle, job: &str, path: &Path) -> O
 pub(crate) async fn deliver_image(app: &AppHandle, s: &Settings, path: &Path, job: &str, tx: &mut watch::Receiver<bool>) -> Result<String, String> {
     let endpoint = &ReceiverEndpoint::ps5(s);
     let name = path.file_name().and_then(|n| n.to_str())
-        .filter(|n| n.len() <= 200 && n.bytes().all(|b| b.is_ascii_graphic()) && n.to_ascii_lowercase().ends_with(".exfat") && !n.starts_with('.'))
-        .ok_or("The image file name must be ASCII without spaces and end in .exfat")?.to_string();
+        .filter(|n| n.len() <= 200 && n.bytes().all(|b| b.is_ascii_graphic()) && shadow_image_extension(Path::new(n)).is_some() && !n.starts_with('.'))
+        .ok_or("The image file name must be ASCII without spaces and end in .exfat, .ffpkg, .ffpfs or .ffpfsc")?.to_string();
+    let exfat = shadow_image_extension(path) == Some("exfat");
     let size = fs::metadata(path).await.map_err(redact)?.len();
     let _delivery = console_delivery_slot(app, job, tx).await?;
     test_ps5(endpoint.host.clone(), endpoint.port).await?;
     let (code, reply) = image_request(endpoint, b's', &name).await?;
     if code != 3 {
-        return Err(if reply.contains("unsupported") { "Reload the SSPI receiver ELF on the PS5; the running receiver cannot deliver ShadowMount images.".into() } else { format!("Image status failed: {reply}") });
+        return Err(if reply.contains("unsupported") || (!exfat && reply.contains("name rejected")) {
+            format!("Reload the SSPI receiver ELF on the PS5; the running receiver cannot deliver this ShadowMount image ({name}).")
+        } else { format!("Image status failed: {reply}") });
     }
     let status: Value = serde_json::from_str(&reply).map_err(|_| format!("Image status failed: {reply}"))?;
     match image_upload_plan(&status, &name, size) {
@@ -4535,6 +4618,29 @@ pub(crate) async fn deliver_image(app: &AppHandle, s: &Settings, path: &Path, jo
 #[cfg(test)]
 mod image_delivery_tests {
     use super::*;
+
+    #[test]
+    fn extracted_images_need_matching_contents_and_get_console_names() {
+        let root = std::env::temp_dir().join(format!("sspi-images-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("inner")).unwrap();
+        let mut exfat = vec![0u8; 512];
+        exfat[3..8].copy_from_slice(b"EXFAT");
+        std::fs::write(root.join("inner/[SITE] Game v1.00.exfat"), &exfat).unwrap();
+        let mut pfs = vec![0u8; 64];
+        pfs[8..12].copy_from_slice(&20130315u32.to_le_bytes());
+        std::fs::write(root.join("PPSA33016.FFPFSC"), &pfs).unwrap();
+        let mut ufs = vec![0u8; 65536 + 2048];
+        ufs[65536 + 1372..65536 + 1376].copy_from_slice(&0x19540119u32.to_le_bytes());
+        std::fs::write(root.join("DLC.ffpkg"), &ufs).unwrap();
+        std::fs::write(root.join("fake.ffpfs"), [0u8; 64]).unwrap();
+        std::fs::write(root.join(".hidden..exfat"), &exfat).unwrap();
+        let Some(ExtractedContent::Images(images)) = extracted_from_dir(&root) else { panic!("expected images") };
+        let names: Vec<_> = images.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["DLC.ffpkg", "PPSA33016.FFPFSC", "_hidden.exfat", "[SITE]_Game_v1.00.exfat"]);
+        assert!(images.iter().all(|p| p.is_file()));
+        assert!(root.join("fake.ffpfs").is_file(), "a file that is not a PFS image is left alone");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn delivered_package_cleanup_waits_out_sharing_violations_only() {
@@ -5463,17 +5569,18 @@ fn validate_download_range(existing: u64, content_range: &str) -> Result<(), Str
     Ok(())
 }
 
-/// Unlocks hoster link `index` of `count` through the debrid service: its direct URL, name and size.
-async fn unlock_part(app: &AppHandle, s: &Settings, http: &Client, job: &str, request: &DeliveryRequest, link: &str, index: usize, count: usize, cancel: &watch::Receiver<bool>) -> Result<(String, Option<String>, Option<u64>), String> {
+/// Unlocks hoster link (or magnet) `index` of `count` through the debrid service: its direct URL, name and size.
+async fn unlock_part(app: &AppHandle, s: &Settings, http: &Client, job: &str, request: &DeliveryRequest, package: &Package, index: usize, count: usize, cancel: &watch::Receiver<bool>) -> Result<(String, Option<String>, Option<u64>), String> {
     if *cancel.borrow() { return Err("cancelled".into()); }
     let (title, icon) = (request.title_name.clone().unwrap_or_default(), request.icon.clone());
+    let what = if magnet::is_magnet(&package.url) { "Adding torrent" } else { "Unlocking hoster link" };
     emit(app, Progress {
         job_id: job.into(), stage: "unlocking".into(), progress: index as f64 / count.max(1) as f64,
-        message: format!("Unlocking hoster link {}/{}", index + 1, count), title: title.clone(), icon: icon.clone(), ..Default::default()
+        message: format!("{what} {}/{}", index + 1, count), title: title.clone(), icon: icon.clone(), ..Default::default()
     });
     let provider_progress = |preparation: Option<debrid::PreparationProgress>| {
         let message = preparation.as_ref().map(|p| format!("{} · file {}/{}", p.state, index + 1, count))
-            .unwrap_or_else(|| format!("Unlocking hoster link {}/{}", index + 1, count));
+            .unwrap_or_else(|| format!("{what} {}/{}", index + 1, count));
         emit(app, Progress {
             job_id: job.into(), stage: "unlocking".into(), message,
             provider_preparation: preparation,
@@ -5481,8 +5588,16 @@ async fn unlock_part(app: &AppHandle, s: &Settings, http: &Client, job: &str, re
         });
     };
     let mut cancelled = cancel.clone();
+    let link = package.url.as_str();
+    let preferred = request.provider.as_deref();
     tokio::select! {
-        result = debrid::resolve(http, s, link, request.provider.as_deref(), &provider_progress) => result,
+        result = async {
+            if magnet::is_magnet(link) {
+                debrid::resolve_magnet(http, s, link, package.archive_file_name.as_deref(), package.expected_size, preferred, &provider_progress).await
+            } else {
+                debrid::resolve(http, s, link, preferred, &provider_progress).await
+            }
+        } => result,
         _ = cancelled.changed() => Err("cancelled".into()),
     }
 }
@@ -5536,23 +5651,24 @@ async fn download_delivery_inputs(app2: &AppHandle, s: &Settings, http: &Client,
                 }
                 let access_type = package.access_type.to_ascii_lowercase();
                 let mut url = package.url.clone();
-                let needs_unlock = match access_type.as_str() {
+                // A magnet always goes through a provider, whatever access type its source gave it.
+                let needs_unlock = magnet::is_magnet(&url) || match access_type.as_str() {
                     "direct" => false,
                     "hosterlanding" | "hoster-landing" => true,
                     _ => !direct_package(&url),
                 };
                 if needs_unlock && debrid::enabled(s).is_empty() {
-                    return Err(
-                        "This source returned a hoster link. Enable and configure Real-Debrid, TorBox, or AllDebrid in Settings before installing."
-                            .into(),
-                    );
+                    let link = if magnet::is_magnet(&url) { "magnet" } else { "hoster" };
+                    return Err(format!(
+                        "This source returned a {link} link. Enable and configure Real-Debrid, TorBox, or AllDebrid in Settings before installing."
+                    ));
                 }
                 let (mut rd_name, mut rd_size) = (None, None);
                 if needs_unlock {
-                    (url, rd_name, rd_size) = unlock_part(app2, s, http, job2, request, &package.url, index, parts.len(), rx).await?;
+                    (url, rd_name, rd_size) = unlock_part(app2, s, http, job2, request, package, index, parts.len(), rx).await?;
                 }
                 let file_key = download_key(
-                    &package.url,
+                    &download_identity(package),
                     request.title_id.as_deref(),
                     &package.kind,
                 );
@@ -5588,7 +5704,7 @@ async fn download_delivery_inputs(app2: &AppHandle, s: &Settings, http: &Client,
                     if !downloader::renew_link(renewals, before, kept) { break; }
                     if let Err(error) = &fetched { session_log::write("download", &format!("Part {} continues with a new attempt after: {error}", index + 1)); }
                     (renewals, before) = (renewals + 1, kept);
-                    if needs_unlock { (url, rd_name, rd_size) = unlock_part(app2, s, http, job2, request, &package.url, index, parts.len(), rx).await?; }
+                    if needs_unlock { (url, rd_name, rd_size) = unlock_part(app2, s, http, job2, request, package, index, parts.len(), rx).await?; }
                     fetched = downloader::fetch(&context, &url, &part_path, size_hint(rd_size)).await;
                 }
                 let (header, content_type, disposition) = fetched?;
@@ -5820,7 +5936,7 @@ async fn queue_delivery(app: AppHandle, state: &AppState, mut request: DeliveryR
                 let final_path = dir.join(format!(
                     "download_{}.pkg",
                     download_key(
-                        &request.package.url,
+                        &download_identity(&request.package),
                         request.title_id.as_deref(),
                         &request.package.kind
                     )
@@ -5852,6 +5968,21 @@ async fn queue_delivery(app: AppHandle, state: &AppState, mut request: DeliveryR
                 let checkpoint = job_store::Checkpoint::Archive { primary, inputs: consumed_inputs, password: request.package.archive_password.clone() };
                 job_store::checkpoint(&app2, &job2, checkpoint.clone())?;
                 return resume_checkpoint(&app2, &s, &job2, &request, checkpoint, &mut rx).await;
+            }
+            if let Some(name) = prebuilt_image_name(&primary, &request) {
+                // A prebuilt ShadowMount image goes to the console as is, like one SSPI built.
+                let key = download_key(&download_identity(&request.package), request.title_id.as_deref(), &request.package.kind);
+                let image_dir = dir.join(format!("image_{key}"));
+                fs::create_dir_all(&image_dir).await.map_err(redact)?;
+                let final_path = image_dir.join(name);
+                fs::rename(&primary, &final_path).await.map_err(redact)?;
+                let checkpoint = job_store::Checkpoint::Package { path: final_path, dump: None, cleanup: false, backports_embedded: true, cleanup_extra: vec![] };
+                job_store::checkpoint(&app2, &job2, checkpoint.clone())?;
+                return resume_checkpoint(&app2, &s, &job2, &request, checkpoint, &mut rx).await;
+            }
+            let wanted = request.package.archive_file_name.as_deref().unwrap_or_default();
+            if let Some(ext) = shadow_image_extension(Path::new(wanted)) {
+                return Err(format!("The download should be the .{ext} image {wanted}, but its contents are not a .{ext} file system. The download is kept at {}.", primary.display()));
             }
             Err("Downloaded file has unknown package magic".into())
         }))
@@ -6010,6 +6141,7 @@ async fn scan_local_packages(app: AppHandle, path: String) -> Result<Vec<LocalPa
                 ExtractedContent::Pkgs(packages) => tokio::task::spawn_blocking(move || {
                     packages.iter().enumerate().map(|(i, pkg)| local_package_from_path(pkg, i + 1)).collect()
                 }).await.map_err(redact)?,
+                ExtractedContent::Images(_) => return Err("This archive holds ShadowMount images. Install them from a package source or Downloads.".into()),
                 ExtractedContent::Dump(root) => {
                     let name = root.file_name().unwrap_or_default().to_string_lossy().into_owned();
                     vec![LocalPackage {

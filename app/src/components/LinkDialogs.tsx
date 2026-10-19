@@ -4,6 +4,7 @@ import * as RD from "@radix-ui/react-dialog"
 import { invoke } from "@tauri-apps/api/core"
 import { useEffect, useMemo, useState, type ReactNode } from "react"
 import { errorText, fmtBytes, plural } from "@/lib/format"
+import { isMagnet } from "@/lib/providers"
 import type { Settings } from "@/types"
 import { Icon } from "./Icon"
 import { toast } from "./toasts"
@@ -35,7 +36,7 @@ function Shell({ open, onClose, title, description, children }: { open: boolean;
 /** Links whose names say they are volumes of one archive are downloaded together by default. */
 const oneSet = (items: LinkItem[]) => items.length > 1 && items.every(item => item.set && item.set === items[0].set)
 
-function hostOf(url: string) { try { return new URL(url).host } catch { return url } }
+function hostOf(url: string) { if (isMagnet(url)) return "Torrent"; try { return new URL(url).host } catch { return url } }
 
 /** Selected links as rows with an editable title ID and kind. */
 function LinkRows({ items, picked, setPicked, setItems, busy }: {
@@ -113,7 +114,7 @@ export function PasteLinksDialog({ open, onClose }: { open: boolean; onClose: ()
     <Shell open={open} onClose={onClose} title="Paste download links" description="Paste links or a whole page of text. Hoster links download through your connected debrid service; direct links download as they are.">
       <div className="dialog-body">
         <textarea className="link-text" aria-label="Download links" rows={items.length ? 3 : 7} value={text} disabled={busy}
-          placeholder="https://… one or more links, in any text" onChange={event => setText(event.target.value)} />
+          placeholder="https://… or magnet:?… one or more links, in any text" onChange={event => setText(event.target.value)} />
         <div className="row link-find">
           <button type="button" className="btn sm" disabled={busy} onClick={() => void paste()}><Icon name="copy" />Paste from clipboard</button>
           <button type="button" className="btn sm" disabled={!text.trim() || busy} onClick={() => void find()}><Icon name="link" />Find links</button>
